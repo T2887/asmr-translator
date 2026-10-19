@@ -72,7 +72,7 @@ pub enum Msg {
     /// 用户从资源管理器拖了东西进来
     Dropped(DroppedData),
     /// 设备检测完成，payload 是给界面直接显示的文本
-    DeviceDetected(String, bool, f64, bool, String, bool),
+    DeviceDetected(String, bool, f64, bool, String, String),
     /// 切换运行模式
     SetModeFull,
     SetModeLite,
@@ -190,10 +190,10 @@ pub struct AppUi {
     /// 设备状态显示文本。初值是「检测中…」，
     /// 后台问完 torch 之后由 Msg::DeviceDetected 换成真实结果。
     device_status: String,
-    /// 显卡/核显型号原文（给副标题用）。空串表示没测出来。
-    device_name: String,
-    /// 当前是不是在走 CUDA。false 时副标题写 Vulkan（有 Vulkan 的话）。
-    uses_cuda: bool,
+    /// CUDA 卡名（torch 报的）。空串表示没测到 CUDA。
+    cuda_name: String,
+    /// Vulkan 设备名（显示适配器枚举）。空串表示没有 Vulkan 设备。
+    vulkan_name: String,
     /// 本机有没有可用的 CUDA。detect_device() 检测完置位。
     ///
     /// 用途：没有 N 卡时会回退到 CPU，而 CPU 跑人声分离要慢 30~100 倍
@@ -1700,8 +1700,8 @@ impl Component for AppUi {
         // 后台问一次 CUDA。torch 首次导入要 2~3 秒，不能卡在界面线程里，
         // 所以走 spawn_background，回来时发 Msg::DeviceDetected。
         context.spawn_background(|_token| {
-            let (text, is_gpu, vram, has_vulkan, name, uses_cuda) = pipeline::detect_device();
-            Msg::DeviceDetected(text, is_gpu, vram, has_vulkan, name, uses_cuda)
+            let (text, is_gpu, vram, has_vulkan, cuda_name, vulkan_name) = pipeline::detect_device();
+            Msg::DeviceDetected(text, is_gpu, vram, has_vulkan, cuda_name, vulkan_name)
         });
 
         // 窗口居中的逻辑【不在这里】。
@@ -1776,8 +1776,8 @@ impl Component for AppUi {
             copy_to_video: std::env::var("ASMR_NO_COPY").is_err(),
             force_redo: false,
             device_status: "检测中…".to_string(),
-            device_name: String::new(),
-            uses_cuda: false,
+            cuda_name: String::new(),
+            vulkan_name: String::new(),
             has_gpu: true,
             has_vulkan: false,
             mode: pipeline::RunMode::Full,
@@ -2257,10 +2257,10 @@ impl Component for AppUi {
                 });
             }
 
-            Msg::DeviceDetected(text, is_gpu, vram_gb, has_vulkan, name, uses_cuda) => {
+            Msg::DeviceDetected(text, is_gpu, vram_gb, has_vulkan, cuda_name, vulkan_name) => {
                 self.device_status = text;
-                self.device_name = name;
-                self.uses_cuda = uses_cuda;
+                self.cuda_name = cuda_name;
+                self.vulkan_name = vulkan_name;
                 self.has_gpu = is_gpu;
                 self.vram_gb = vram_gb;
                 self.has_vulkan = has_vulkan;
@@ -2878,20 +2878,27 @@ impl Component for AppUi {
             let total = self.files.len();
             let mut parts: Vec<String> = vec!["本地转写".to_string(), "离线翻译".to_string()];
             // 加速这一段：型号 + 后端，两者都齐了才写。
-            //   CUDA     → "RTX 5070 CUDA 加速中"
-            //   兼容模式 → "UHD Graphics 630 Vulkan 加速中"
-            //   纯 CPU   → 这段整个不出现
-            if !self.device_name.is_empty() {
-                let accel = if self.uses_cuda {
-                    "CUDA"
-                } else if self.has_vulkan {
-                    "Vulkan"
-                } else {
-                    ""
-                };
-                if !accel.is_empty() {
-                    parts.push(format!("{} {accel} 加速中", short_device(&self.device_name)));
-                }
+            //
+            // 后端跟着【当前选中的模式】走，不是跟着检测结果走：
+            //   · 全量 / 精简 → CUDA     （torch 跑，卡名用 torch 报的）
+            //   · 兼容模式    → Vulkan   （llama.cpp 跑，卡名用显示适配器名）
+            // 用户在界面上把模式切到兼容模式，哪怕这台机器 CUDA 好好的，
+            // 模型也确实是跑在 Vulkan 上的 —— 副标题必须跟着变
+            // （用户实测反馈：切了兼容模式，标题还写着 CUDA）。
+            let compat = self.mode == pipeline::RunMode::Compat;
+            let (name, accel) = if compat {
+                (
+                    self.vulkan_name.as_str(),
+                    if self.has_vulkan { "Vulkan" } else { "" },
+                )
+            } else {
+                (
+                    self.cuda_name.as_str(),
+                    if self.cuda_name.is_empty() { "" } else { "CUDA" },
+                )
+            };
+            if !name.is_empty() && !accel.is_empty() {
+                parts.push(format!("{} {accel} 加速中", short_device(name)));
             }
             if total > 0 {
                 let idx = if self.running {
