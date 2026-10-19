@@ -14,6 +14,7 @@
 import glob
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -62,6 +63,56 @@ def free_port():
     port = s.getsockname()[1]
     s.close()
     return port
+
+
+def pick_device():
+    """优先独显（但要留足显存安全空间），显存不够就退核显，最后 CPU。
+
+    安全空间规则（v1.21）：
+      · 独显：空闲显存 ≥ 3 GB 才用。1.5B 模型约 1.5 GB（权重 + 上下文），
+        留 1.5 GB 余量，避免把用户其他程序挤掉（显存不足会触发驱动重置）。
+      · 核显：共享系统内存，要求 ≥ 3 GB 空闲。
+      · 都不满足 → CPU。
+    """
+    DISCRETE_MIN_FREE_MIB = 3 * 1024
+    INTEGRATED_MIN_FREE_MIB = 3 * 1024
+
+    try:
+        out = subprocess.run(
+            [LLAMA, "--list-devices"],
+            capture_output=True, text=True, timeout=60, cwd=".",
+        )
+        devices = []
+        for line in out.stdout.splitlines():
+            t = line.strip()
+            if not t.startswith("Vulkan"):
+                continue
+            idx, rest = t.split(":", 1)
+            name = rest.split("(")[0].strip()
+            m = re.search(r"\((\d+) MiB,\s*(\d+) MiB free\)", rest)
+            total = int(m.group(1)) if m else 0
+            free = int(m.group(2)) if m else 0
+            devices.append((idx, name, total, free))
+    except Exception:
+        devices = []
+
+    if not devices:
+        return "none", "CPU"
+
+    def integrated(name: str) -> bool:
+        low = name.lower()
+        return any(k in low for k in ("uhd graphics", "iris", "vega", "radeon(tm) graphics"))
+
+    # 1) 独显：空闲显存够才用
+    for idx, name, _total, free in devices:
+        if not integrated(name) and free >= DISCRETE_MIN_FREE_MIB:
+            return idx, name
+    # 2) 核显：共享内存够才用
+    for idx, name, _total, free in devices:
+        if integrated(name) and free >= INTEGRATED_MIN_FREE_MIB:
+            return idx, name
+    # 3) CPU
+    return "none", "CPU"
 
 
 def wait_health(port, timeout=120):
@@ -136,10 +187,12 @@ def main():
         sys.exit(1)
 
     port = free_port()
-    print(f"启动内置 llama.cpp（CPU，端口 {port}）...", flush=True)
+    dev, dev_name = pick_device()
+    print(f"[设备] 翻译使用：{dev_name}（{dev}）", flush=True)
+    print(f"启动内置 llama.cpp（端口 {port}）...", flush=True)
     proc = subprocess.Popen(
         [LLAMA, "--model", MODEL, "--host", "127.0.0.1", "--port", str(port),
-         "--device", "none", "-c", "4096", "-np", "1", "--no-webui",
+         "--device", dev, "-c", "4096", "-np", "1", "--no-webui",
          "--log-verbosity", "0"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=".",
     )

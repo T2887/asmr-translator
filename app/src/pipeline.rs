@@ -72,7 +72,7 @@ pub const STAGES_COMPAT: [(usize, &str, &str); 4] = [
     (1, "app/a_提取音频.py", "第1步 提取音频"),
     (2, "app/light_asr.py", "第2步 语音转写"),
     (3, "app/light_translate.py", "第3步 翻译"),
-    (4, "app/e_字幕整理.py", "第4步 字幕整理"),
+    (4, "rust:tidy", "第4步 字幕整理"),
 ];
 
 /// 按模式取阶段表。
@@ -88,6 +88,7 @@ pub fn stages(mode: RunMode) -> &'static [(usize, &'static str, &'static str)] {
 // 实测 12 分钟视频分离 65s→9.45s（省 85%），30 分钟音声 122s→52s（省 57%）。
 
 use crate::config;
+use crate::srt;
 
 /// 检测本机有哪些 Vulkan 设备（AMD/Intel 核显或独显）。
 ///
@@ -230,40 +231,12 @@ except Exception:
 /// 失败也【不阻断收尾】：字幕本身是好的，只是没整理。宁可报告
 /// 「整理失败」让字幕原样落地，也不要因此丢掉已经跑了几十分钟的结果。
 pub fn tidy_subtitles() -> Vec<String> {
-    let script = "app/e_字幕整理.py";
-    let full = std::path::Path::new(config::work_dir()).join(script);
-    if !full.is_file() {
-        return vec![format!("[整理] 找不到 {script}，跳过（字幕保持原样）")];
-    }
-
-    let sink: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let sink2 = Arc::clone(&sink);
-
-    let code = backend::run_script(
-        &config::python_exe(),
-        config::work_dir(),
-        script,
-        move |line| {
-            // 机器通道（@@EV@@）不进日志，否则用户会看到一屏协议行。
-            if line.starts_with("@@EV@@ ") {
-                return;
-            }
-            if let Ok(mut v) = sink2.lock() {
-                v.push(line.to_string());
-            }
-        },
-    )
-    .unwrap_or(-1);
-
-    let mut lines = match Arc::try_unwrap(sink) {
-        Ok(m) => m.into_inner().unwrap_or_default(),
-        Err(e) => e.lock().map(|v| v.clone()).unwrap_or_default(),
-    };
-    if code != 0 {
-        lines.push(format!("[整理] 退出码 {code}，字幕保持原样（不影响收尾）"));
-    } else {
-        lines.push("[整理] 字幕时间轴整理完成".to_string());
-    }
+    // v1.21：字幕整理改为纯 Rust（srt.rs），不再 spawn Python。
+    // 逻辑与 e_字幕整理.py 一致：时长上限 + 不压下一句 + 最少 0.4 秒 + 词表。
+    let app_dir = std::path::Path::new(config::work_dir()).join("app");
+    let asr_dir = config::dir_asr();
+    let mut lines = srt::tidy_dir(std::path::Path::new(&asr_dir), &app_dir);
+    lines.push("[整理] 字幕时间轴整理完成（Rust）".to_string());
     lines
 }
 
@@ -668,6 +641,29 @@ pub fn run_stage(
 ) -> StageResult {
     let (_, script, _) = stages(mode)[stage - 1];
     let marker = ready_marker(mode, stage);
+
+    // ★ 纯 Rust 阶段（不 spawn Python）：v1.21 起字幕整理走这里。
+    //   日志行直接产出，进度/ETA 不参与（整理只要几十毫秒）。
+    if let Some(kind) = script.strip_prefix("rust:") {
+        let lines = match kind {
+            "tidy" => {
+                let app_dir = std::path::Path::new(config::work_dir()).join("app");
+                let asr_dir = config::dir_asr();
+                srt::tidy_dir(std::path::Path::new(&asr_dir), &app_dir)
+            }
+            _ => vec![format!("[阶段] 未知的 Rust 阶段：{kind}")],
+        };
+        if let Some(last) = lines.last() {
+            if let Ok(mut l) = latest.lock() {
+                *l = last.clone();
+            }
+        }
+        return StageResult {
+            stage,
+            code: 0,
+            lines,
+        };
+    }
     let ready2 = Arc::clone(&ready);
 
     // on_line 是 Fn（不是 FnMut），用 Arc<Mutex<..>> 收集

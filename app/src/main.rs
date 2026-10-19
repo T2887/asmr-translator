@@ -14,6 +14,7 @@
 mod backend;
 mod config;
 mod pipeline;
+mod srt;
 mod ui;
 
 use windows_reactor::*;
