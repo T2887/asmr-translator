@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    name: 编译与测试 (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            app/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('app/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # kill_current_really_kills_the_child 这个测试会真的拉起一个
+      # Python 子进程然后把它杀掉。没有 python.exe 时它会以
+      # "子进程没能启动，测试前提不成立" 失败 —— 不是代码 bug，是环境缺失。
+      - name: 安装 Python（测试需要）
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 编译
+        working-directory: app
+        run: cargo build --release --verbose
+
+      - name: 运行测试
+        working-directory: app
+        run: cargo test --verbose
+        env:
+          # 测试里的 python_exe() 会先找工作目录下的 env\python.exe，
+          # 找不到就读这个环境变量。CI 里没有 env\，所以显式指定。
+          ASMR_PYTHON: ${{ env.pythonLocation }}\python.exe
+
+      - name: 检查格式化
+        working-directory: app
+        run: cargo fmt --check
+        continue-on-error: true
+
+      # clippy 的警告不阻塞合并，只是提示。
+      - name: Clippy
+        working-directory: app
+        run: cargo clippy --all-targets
+        continue-on-error: true

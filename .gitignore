@@ -1,0 +1,68 @@
+# ── 编译产物 ──
+app/target/
+*.exe
+*.pdb
+
+# ── 运行环境（5.3 GB）──
+env/
+package/ASMR自动翻译工具（Rust版）/env/
+
+# ── 模型权重（体积大、许可独立）──
+model/
+package/ASMR自动翻译工具（Rust版）/model/
+package/ASMR自动翻译工具（Rust版）/llama/
+*.ckpt
+*.onnx
+*.safetensors
+*.bin
+*.gguf
+
+# ── 运行时输入清单 / 临时目录 ──
+package/ASMR自动翻译工具（Rust版）/_input.txt
+package/ASMR自动翻译工具（Rust版）/_tmp/
+
+# ── 运行时产生的中间文件和日志 ──
+0pre/
+1audio/
+2vad/
+3asr/
+_running/
+_运行日志*.txt
+_file_queue.txt
+_hold*/
+_hold_light/
+
+# ── 打包产物（安装包 / 分卷 / 压缩包）──
+方案B/
+package/方案B/
+*.zip
+*.7z
+*.iss.bak*
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ── 编辑器 / 系统 ──
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ── 测试与实验残留 ──
+_lab*/
+_test_*.py
+_measure_*.py
+_patch_*.py
+_*.png
+_*.log
+
+# ── 备份文件 ──
+*.bak
+*.bak-*
+*.bak-v*
