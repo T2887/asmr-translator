@@ -66,3 +66,6 @@ _*.log
 *.bak
 *.bak-*
 *.bak-v*
+
+# ── 图标预览图（由 tools/make_icon.py --preview 生成）──
+tools/preview/
