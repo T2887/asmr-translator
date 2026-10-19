@@ -510,26 +510,37 @@ impl AppUi {
     ///   文件重新处理了一次（每个要 15~30 分钟）。
     ///
     ///   更可靠的做法是【直接看产物在不在】：
-    ///     ① 视频旁边有 <名字>.chs.srt        → 已经做完了
-    ///     ② 或者 3asr\<名字>.srt 存在        → 已经做完了
+    ///     ① 视频旁边有 <名字>.chs.srt             → 已经做完了
+    ///     ② 或者视频目录（或其上一级）的 3asr\<名字>.srt → 已经做完了
     ///   产物是事实，索引只是记录。记录会丢，事实不会。
+    ///
+    /// ⚠️ ② 曾经查的是 `config::dir_asr()`，也就是【程序自己所在目录】下的
+    ///    3asr。那是致命的跨盘误判：音频库在 L:\、程序在 D:\，拿 D 盘的
+    ///    中间产物去判断 L 盘的文件，只会得到噪声（实测列表里出现"中间几行
+    ///    莫名打勾、前面几行没有"的错乱）。3asr 是跟着【视频】走的，
+    ///    不跟着程序走。
     fn has_subtitle(video_path: &str) -> bool {
         let p = std::path::Path::new(video_path);
         let Some(stem) = p.file_stem().map(|s| s.to_string_lossy().to_string()) else {
             return false;
         };
+        let Some(dir) = p.parent() else {
+            return false;
+        };
 
         // ① 视频旁边
-        if let Some(dir) = p.parent() {
-            if dir.join(format!("{stem}.chs.srt")).is_file() {
-                return true;
-            }
+        if dir.join(format!("{stem}.chs.srt")).is_file() {
+            return true;
         }
 
-        // ② 3asr\ 目录
-        let asr = std::path::PathBuf::from(config::dir_asr());
-        if asr.join(format!("{stem}.srt")).is_file() {
+        // ② 视频目录、以及它上一级目录下的 3asr\
+        if dir.join("3asr").join(format!("{stem}.srt")).is_file() {
             return true;
+        }
+        if let Some(up) = dir.parent() {
+            if up.join("3asr").join(format!("{stem}.srt")).is_file() {
+                return true;
+            }
         }
 
         false
@@ -2929,7 +2940,15 @@ impl Component for AppUi {
                 //   · 已处理完（已有字幕产物）→ 路径淡化 + 后面打勾
                 //   · 正在处理（current_idx）→ 整行浅橙底 + 序号变橙 + 墨色字
                 //   · 排队中 → 正常次要色
-                let done = Self::has_subtitle(f);
+                // 「已完成」= 索引说它做过了，或者磁盘上真有产物。
+                //
+                //   只看磁盘会有观感问题：队列是从第 66 个恢复的，说明前 65 个
+                //   都跑过；但那些字幕可能已经被搬走/改名，磁盘查不到 —— 于是
+                //   列表出现"后面的打勾、前面的没勾"的错乱。用户第一反应就是
+                //   "排序有问题"（实测反馈）。
+                //   队列索引是那一次运行的既定事实，让它参与判定：
+                //   `i < current_idx` 一律算完成，这样勾必然是连续的一段。
+                let done = i < self.current_idx || Self::has_subtitle(f);
                 let is_current = self.running && i == self.current_idx;
 
                 let name_color = if is_current {
