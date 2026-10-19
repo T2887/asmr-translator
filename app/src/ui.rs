@@ -32,11 +32,11 @@ use crate::pipeline::{self, StageResult};
 //  2026-10-20：6 → 5。Claude 暖色版把卡片内边距从 12 加到 16、行距从
 //    8 加到 12，日志卡矮了约 12px，第 6 行（最新一行！）被裁掉半截。
 //    与其压字号不如少一行 —— 反正「导出完整日志」还在，完整内容不会丢。
-const LOG_SLOTS: usize = 5;
+const LOG_SLOTS: usize = 8;
 
 /// 翻译预览区显示的槽位数。
 //  ★ 和 LOG_SLOTS 同理，同步减到 8 保持两栏高度接近。
-const PREVIEW_SLOTS: usize = 6;
+const PREVIEW_SLOTS: usize = 8;
 
 /// 界面里能显示的最大行数（超过就只留最近的）
 const LOG_KEEP: usize = 500;
@@ -1504,6 +1504,37 @@ fn pill_button(
 /// 按钮中间一看就是"两套控件"，统一之后整个界面只有一种按钮形状。
 fn tap_button(label: &str, on_click: Callback<()>) -> View {
     pill_button(label, false, CARD, CARD_LINE, INK2, true, on_click)
+}
+
+/// 自绘模态层：半透明遮罩 + 居中纸白卡片。
+///
+/// ContentDialog 没有 theme/background API，深色模式下会在米色界面上糊一块
+/// 深灰卡片，所以三个提示框全部改成自绘 —— 底色、边框、按钮都用本项目色板。
+fn modal_overlay(title: &str, body: View, actions: View) -> View {
+    let card = Border::new()
+        .background(CARD)
+        .border_brush(CARD_LINE)
+        .border_thickness(1.0)
+        .corner_radius(20.0)
+        .padding(24.0)
+        .max_width(540.0)
+        .horizontal_alignment(HorizontalAlignment::Center)
+        .vertical_alignment(VerticalAlignment::Center)
+        .content(StackPanel::new().spacing(16.0).children((
+            TextBlock::new()
+                .text(title)
+                .font_size(18.0)
+                .font_weight(FontWeight::SEMI_BOLD)
+                .foreground(INK),
+            body,
+            actions,
+        )));
+
+    Border::new()
+        .grid_row(0)
+        .grid_column(0)
+        .background(Color::argb(120, 31, 30, 29))
+        .content(card)
 }
 
 fn mode_chip(label: &str, selected: bool, enabled: bool, on_click: Callback<()>) -> View {
@@ -3340,6 +3371,8 @@ impl Component for AppUi {
                 TextBlock::new().text(pv[3].clone()).font_size(13.0).foreground(INK),
                 TextBlock::new().text(pv[4].clone()).font_size(13.0).foreground(INK),
                 TextBlock::new().text(pv[5].clone()).font_size(13.0).foreground(INK),
+                TextBlock::new().text(pv[6].clone()).font_size(13.0).foreground(INK),
+                TextBlock::new().text(pv[7].clone()).font_size(13.0).foreground(INK),
                 TextBlock::new().text(pv_tail).font_size(11.0).foreground(INK3),
             ))),
         2, 1, 1, 1,
@@ -3380,10 +3413,14 @@ impl Component for AppUi {
                     TextBlock::new().text(slots[2].clone()).font_size(12.0).foreground(INK2),
                     TextBlock::new().text(slots[3].clone()).font_size(12.0).foreground(INK2),
                     TextBlock::new().text(slots[4].clone()).font_size(12.0).foreground(INK2),
+                    TextBlock::new().text(slots[5].clone()).font_size(12.0).foreground(INK2),
+                    TextBlock::new().text(slots[6].clone()).font_size(12.0).foreground(INK2),
+                    TextBlock::new().text(slots[7].clone()).font_size(12.0).foreground(INK2),
                     // 注意：这里的槽位下标是【写死的】，数量和 LOG_SLOTS 必须一致。
-                    //   刚从 6 改成 5 时忘了删掉第 6 个，程序一启动就
+                    //   早先从 6 改成 5 时忘了删掉第 6 个，程序一启动就
                     //   `index out of bounds: the len is 5 but the index is 5`
                     //   直接 panic 退出 —— 改槽位数时先回来核对这里。
+                    //   现在（8 行）同理：slot 个数改了，这里多一行少一行都会炸。
                 ))),
             )),
         3, 0, 1, 1,
@@ -3577,6 +3614,8 @@ impl Component for AppUi {
             .children((buttons, footer_status));
 
         let main_area = Grid::new()
+            .grid_row(0)
+            .grid_column(0)
             .width(body_w)
             .height(body_h)
             .rows([GridLength::STAR, GridLength::Auto])
@@ -3595,87 +3634,116 @@ impl Component for AppUi {
         //   风格也和其余界面一致。
         //
         // 为什么内容分行写而不是一段话：这样每行都短，宽度不会撑得过宽。
-        let no_file_dialog = ContentDialog::new()
-            .title("没有可处理的文件")
-            .primary_button_text("好")
-            .is_open(self.show_no_file_warning)
-            // on_closed 的回调参数是 ContentDialogResult（代表点了哪个按钮），
-            // 我们只关心"关掉了"，所以忽略它。
-            .on_closed(context.callback(|_: ContentDialogResult| Msg::DismissNoFileWarning))
-            .content(
-                StackPanel::new().spacing(8.0).children((
-                    TextBlock::new()
-                        .text("请先添加要处理的视频或音频。")
-                        .font_size(14.0),
-                    TextBlock::new()
-                        .text("· 点「添加文件」或「添加文件夹」")
-                        .font_size(14.0),
-                    TextBlock::new()
-                        .text("· 或者把它们直接拖进窗口")
-                        .font_size(14.0),
-                    TextBlock::new()
-                        .text("添加之后再点「开始处理」。")
-                        .font_size(14.0),
-                )),
-            );
-
-        // 「恢复上次队列」的弹窗。
+        // ── 自绘模态层（取代 ContentDialog）──
         //
-        //   ContentDialogResult 有三个值：Primary / Secondary / None。
-        //   Primary = 「恢复」按钮，Secondary = 「清空」按钮，
-        //   None = 按 ESC 或关掉窗口 —— 按清空处理（安全，不会误恢复）。
-        let restore_dialog = ContentDialog::new()
-            .title("恢复上次的队列？")
-            .primary_button_text("恢复")
-            .secondary_button_text("清空")
-            .is_open(self.show_restore_dialog)
-            .on_closed(context.callback(|r: ContentDialogResult| {
-                if matches!(r, ContentDialogResult::Primary) {
-                    Msg::RestoreQueue
-                } else {
-                    Msg::ClearQueue
-                }
-            }))
-            .content(
-                StackPanel::new().spacing(8.0).children((
-                    TextBlock::new()
-                        .text(format!(
-                            "检测到上次留下的队列（{} 个文件，处理到第 {} 个）。",
-                            self.pending_queue.len(),
-                            self.pending_idx + 1
-                        ))
-                        .font_size(14.0),
-                    TextBlock::new()
-                        .text("· 恢复：填回列表，从上次的位置继续")
-                        .font_size(14.0),
-                    TextBlock::new()
-                        .text("· 清空：丢弃队列，从空列表重新开始")
-                        .font_size(14.0),
-                    TextBlock::new().text("").font_size(6.0),
-                    TextBlock::new()
-                        .text("（已删除的源文件会自动跳过）")
-                        .font_size(13.0)
-                        .foreground(INK3),
-                )),
-            );
+        // 【为什么不直接用 ContentDialog】
+        //   reactor 的 ContentDialog 只暴露 title / *_button_text / is_open /
+        //   on_closed / content，【没有 theme、没有 background】。它跟着系统
+        //   深浅色走 —— 系统是深色模式时，就在米色界面上弹出一块深灰卡片，
+        //   和整窗风格彻底割裂（用户截图圈出来问过）。
+        //   自绘就没有这个限制：遮罩 + 纸白卡片 + 胶囊按钮，全部用本项目的色板。
+        //
+        // 【实现要点】
+        //   · 遮罩铺满整个客户区，卡片在其中居中；
+        //   · 必须显式 grid_row(0)/grid_column(0)：Grid 里同格叠加要靠它，
+        //     不给就会自动排到下一行（按钮曾经因此跑到标题区上）；
+        //   · 三层互斥，同一时刻最多一张。
 
-        // 「没有 NVIDIA 显卡」的警告框。
-        // 用和上面那个警告框相同的模式（ContentDialog 覆盖层）。
+        // ①「没有可处理的文件」
+        let no_file_modal = modal_overlay(
+            "没有可处理的文件",
+            StackPanel::new().spacing(8.0).children((
+                TextBlock::new()
+                    .text("请先添加要处理的视频或音频。")
+                    .font_size(14.0)
+                    .foreground(INK),
+                TextBlock::new()
+                    .text("· 点「添加文件」或「添加文件夹」")
+                    .font_size(13.0)
+                    .foreground(INK2),
+                TextBlock::new()
+                    .text("· 或者把它们直接拖进窗口")
+                    .font_size(13.0)
+                    .foreground(INK2),
+                TextBlock::new()
+                    .text("添加之后再点「开始处理」。")
+                    .font_size(13.0)
+                    .foreground(INK2),
+            )),
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(10.0)
+                .children((pill_button(
+                    "好",
+                    false,
+                    ACCENT_DEEP,
+                    ACCENT_DEEP,
+                    Color::rgb(0xff, 0xff, 0xff),
+                    true,
+                    context.message(Msg::DismissNoFileWarning),
+                ),)),
+        );
+
+        // ②「恢复上次的队列」—— 两个按钮，恢复 / 清空
+        let restore_modal = modal_overlay(
+            "恢复上次的队列？",
+            StackPanel::new().spacing(8.0).children((
+                TextBlock::new()
+                    .text(format!(
+                        "检测到上次留下的队列（{} 个文件，处理到第 {} 个）。",
+                        self.pending_queue.len(),
+                        self.pending_idx + 1
+                    ))
+                    .font_size(14.0)
+                    .foreground(INK),
+                TextBlock::new()
+                    .text("· 恢复：填回列表，从上次的位置继续")
+                    .font_size(13.0)
+                    .foreground(INK2),
+                TextBlock::new()
+                    .text("· 清空：丢弃队列，从空列表重新开始")
+                    .font_size(13.0)
+                    .foreground(INK2),
+                TextBlock::new()
+                    .text("（已删除的源文件会自动跳过）")
+                    .font_size(12.0)
+                    .foreground(INK3),
+            )),
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(10.0)
+                .children((
+                    pill_button(
+                        "恢复",
+                        false,
+                        ACCENT_DEEP,
+                        ACCENT_DEEP,
+                        Color::rgb(0xff, 0xff, 0xff),
+                        true,
+                        context.message(Msg::RestoreQueue),
+                    ),
+                    pill_button(
+                        "清空",
+                        false,
+                        CARD,
+                        CARD_LINE,
+                        ACCENT_INK,
+                        true,
+                        context.message(Msg::ClearQueue),
+                    ),
+                )),
+        );
+
+        // ③「没有可用的 GPU 加速」
         // ★ 为什么【不提供】"下载 ROCm / DirectML" 这类选项
         //
         //   调研结论（2026-10）：
         //     · ROCm —— Windows 上没有可用产物。PyTorch 的 ROCm 轮子只有
         //       Linux，onnxruntime-rocm 不存在，CTranslate2 也没有 ROCm 后端。
-        //       "下载 ROCm 就能跑"是做不到的，不是我们不实现。
         //     · DirectML —— 曾经是那条路，但 torch-directml 的元数据里
         //       硬绑 Requires-Dist: torch==2.4.1，而我们是 torch 2.11.0+cu128。
-        //       降级到 2.4.1 会让 sm_120（RTX 50 系）支持全部失效 ——
-        //       用 A 卡加速换掉所有 N 卡用户的正常使用，不划算。
-        //
-        //   所以这里【只告知，不承诺】，并且把"有独显却没被识别"这个
-        //   更常见的情况单独指出来 —— 笔记本双显卡被分到核显，
-        //   比真的没有 N 卡更常见。
-        // 弹窗内容按实际原因动态生成：没卡 / 显存太小
+        //       降级会让 sm_120（RTX 50 系）支持全部失效。
+        //   所以这里【只告知，不承诺】。
         let cpu_reason = if !self.has_gpu && !self.has_vulkan {
             "没有检测到可用的 GPU（CUDA 和 Vulkan 都不可用）".to_string()
         } else if self.vram_gb > 0.0 {
@@ -3687,58 +3755,80 @@ impl Component for AppUi {
             "显卡信息检测失败".to_string()
         };
 
-        let cpu_dialog = ContentDialog::new()
-            .title("没有可用的 GPU 加速")
-            .primary_button_text("同意，用纯 CPU 继续")
-            .secondary_button_text("不同意，退出")
-            .is_open(self.show_cpu_warning)
-            .on_closed(context.callback(|r: ContentDialogResult| {
-                if matches!(r, ContentDialogResult::Primary) {
-                    Msg::AgreeCpu
-                } else {
-                    Msg::RefuseCpu
-                }
-            }))
-            .content(
-                StackPanel::new().spacing(8.0).children((
-                    TextBlock::new()
-                        .text(cpu_reason)
-                        .font_size(14.0)
-                        .foreground(WARN),
-                    TextBlock::new().text("").font_size(4.0),
-                    TextBlock::new()
-                        .text("· 人声分离需要约 2.5 GB 显存，装不下就跑不了 GPU 版")
-                        .font_size(14.0),
-                    TextBlock::new()
-                        .text("· 如果同意，程序会改用 CPU 处理")
-                        .font_size(14.0),
-                    TextBlock::new()
-                        .text("  速度约为 GPU 的 1/50：1 小时视频可能要几小时")
-                        .font_size(14.0),
-                    TextBlock::new().text("").font_size(4.0),
-                    TextBlock::new()
-                        .text("如果你这台电脑【有】NVIDIA 显卡但没被识别：")
-                        .font_size(13.0),
-                    TextBlock::new()
-                        .text("打开 NVIDIA 控制面板 → 管理 3D 设置 → 程序设置")
-                        .font_size(13.0),
-                    TextBlock::new()
-                        .text("→ 添加本程序 → 首选图形处理器选「高性能 NVIDIA 处理器」")
-                        .font_size(13.0)
-                        .foreground(INK3),
+        let cpu_modal = modal_overlay(
+            "没有可用的 GPU 加速",
+            StackPanel::new().spacing(7.0).children((
+                TextBlock::new()
+                    .text(cpu_reason)
+                    .font_size(14.0)
+                    .foreground(WARN),
+                TextBlock::new()
+                    .text("· 人声分离需要约 2.5 GB 显存，装不下就跑不了 GPU 版")
+                    .font_size(13.0)
+                    .foreground(INK2),
+                TextBlock::new()
+                    .text("· 如果同意，程序会改用 CPU 处理")
+                    .font_size(13.0)
+                    .foreground(INK2),
+                TextBlock::new()
+                    .text("  速度约为 GPU 的 1/50：1 小时视频可能要几小时")
+                    .font_size(13.0)
+                    .foreground(INK2),
+                TextBlock::new()
+                    .text("如果你这台电脑【有】NVIDIA 显卡但没被识别：")
+                    .font_size(13.0)
+                    .foreground(INK),
+                TextBlock::new()
+                    .text("打开 NVIDIA 控制面板 → 管理 3D 设置 → 程序设置")
+                    .font_size(12.5)
+                    .foreground(INK2),
+                TextBlock::new()
+                    .text("→ 添加本程序 → 首选图形处理器选「高性能 NVIDIA 处理器」")
+                    .font_size(12.5)
+                    .foreground(INK3),
+            )),
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(10.0)
+                .children((
+                    pill_button(
+                        "同意，用纯 CPU 继续",
+                        false,
+                        ACCENT_DEEP,
+                        ACCENT_DEEP,
+                        Color::rgb(0xff, 0xff, 0xff),
+                        true,
+                        context.message(Msg::AgreeCpu),
+                    ),
+                    pill_button(
+                        "不同意，退出",
+                        false,
+                        CARD,
+                        CARD_LINE,
+                        ACCENT_INK,
+                        true,
+                        context.message(Msg::RefuseCpu),
+                    ),
                 )),
-            );
+        );
 
-        // dialog 是覆盖层，要和主内容并列放在同一个 StackPanel 里。
-        // 用 keyed_children（而不是 children）：给每个孩子一个稳定身份，
-        // 这样重新渲染时 dialog 的开关状态不会被当成"换了一个新控件"。
-        // 官方在 reactor 自己的用例里就是这么放的。
-        let root = StackPanel::new().keyed_children([
-            KeyedView::new("main", main_area),
-            KeyedView::new("no_file_dialog", no_file_dialog),
-            KeyedView::new("cpu_dialog", cpu_dialog),
-            KeyedView::new("restore_dialog", restore_dialog),
-        ]);
+        // 用 Grid 叠加：主界面永远是第 0 个孩子，弹窗按需追加在后面（叠在上层）。
+        let mut stack: Vec<KeyedView> = Vec::with_capacity(4);
+        stack.push(KeyedView::new("main", main_area));
+        if self.show_no_file_warning {
+            stack.push(KeyedView::new("no_file_modal", no_file_modal));
+        }
+        if self.show_restore_dialog {
+            stack.push(KeyedView::new("restore_modal", restore_modal));
+        }
+        if self.show_cpu_warning {
+            stack.push(KeyedView::new("cpu_modal", cpu_modal));
+        }
+
+        let root = Grid::new()
+            .rows([GridLength::STAR])
+            .columns([GridLength::STAR])
+            .keyed_children(stack);
 
         // ── 窗口底板：一层深蓝，用来隔开壁纸 ──
         //
