@@ -87,53 +87,52 @@ pub fn stages(mode: RunMode) -> &'static [(usize, &'static str, &'static str)] {
 // 而分离耗时和音频长度严格成正比。先圈出语音段再只分离那些段，
 // 实测 12 分钟视频分离 65s→9.45s（省 85%），30 分钟音声 122s→52s（省 57%）。
 
-use std::os::windows::process::CommandExt;
-
 use crate::config;
 use crate::srt;
 
-/// 检测本机有哪些 Vulkan 设备（AMD/Intel 核显或独显）。
+/// 枚举本机的显示适配器名称（AMD / Intel / NVIDIA）。
 ///
-/// 为什么不问 torch：PyTorch 在 Windows 上不认 AMD/Intel 的 GPU，
-/// 只能看到 CUDA。兼容模式用的是 llama.cpp（Vulkan 后端），
-/// 所以直接让 llama-server 枚举设备，拿到的才是真实可用的列表。
+/// ★ 刻意【不调用 llama-server】：用户明确要求，llama 和 1.5B 模型
+///   只在「勾选兼容模式 + 点开始处理」时才启动。启动程序时调
+///   `llama-server --list-devices` 会闪一个黑框，也违背这个要求。
 ///
-/// 返回示例：["NVIDIA GeForce RTX 5070", "AMD Radeon(TM) Graphics"]
-/// llama\llama-server.exe 不存在（没装兼容模式组件）时返回空。
+/// 这里直接用 Win32 的 EnumDisplayDevicesW 枚举显卡名，纯 API 调用，
+/// 不起进程、不加载模型。设备名的用途只有两个：状态栏显示、
+/// 判断「有没有非 N 卡设备」。
 pub fn detect_vulkan_devices() -> Vec<String> {
-    let exe = std::path::Path::new(config::work_dir())
-        .join("llama")
-        .join("llama-server.exe");
-    if !exe.is_file() {
-        return Vec::new();
-    }
-    // ★ CREATE_NO_WINDOW：llama-server 是控制台程序，不加这个标志
-    //   启动时会在屏幕上闪一个黑框（用户可见）。
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.arg("--list-devices").creation_flags(0x0800_0000);
-    let out = cmd.output();
-    let Ok(out) = out else {
-        return Vec::new();
+    use windows_sys::Win32::Graphics::Gdi::{
+        EnumDisplayDevicesW, DISPLAY_DEVICE_ACTIVE, DISPLAY_DEVICEW,
     };
-    let text = String::from_utf8_lossy(&out.stdout);
+
     let mut devices = Vec::new();
-    for line in text.lines() {
-        let t = line.trim();
-        if !t.starts_with("Vulkan") {
+    let mut idx: u32 = 0;
+    loop {
+        let mut dd: DISPLAY_DEVICEW = unsafe { std::mem::zeroed() };
+        dd.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+        let ok = unsafe { EnumDisplayDevicesW(std::ptr::null(), idx, &mut dd, 0) };
+        if ok == 0 {
+            break;
+        }
+        idx += 1;
+
+        // 千问评审：不要用 ATTACHED_TO_DESKTOP 过滤（无头/远程/多屏时会漏），
+        // 用 ACTIVE 判断设备是否启用即可。
+        if dd.StateFlags & DISPLAY_DEVICE_ACTIVE == 0 {
             continue;
         }
-        // 形如：Vulkan0: NVIDIA GeForce RTX 5070 (11943 MiB, 11175 MiB free)
-        if let Some((_idx, rest)) = t.split_once(':') {
-            let name = rest
-                .trim()
-                .split('(')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if !name.is_empty() {
-                devices.push(name);
-            }
+        let name = String::from_utf16_lossy(&dd.DeviceString)
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        // 虚拟/基本显示适配器不是真实 GPU，排掉。
+        let low = name.to_lowercase();
+        if low.contains("basic display") || low.contains("remote") || low.contains("virtual") {
+            continue;
+        }
+        if !devices.contains(&name) {
+            devices.push(name);
         }
     }
     devices

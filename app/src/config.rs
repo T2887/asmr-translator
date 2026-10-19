@@ -115,6 +115,11 @@ pub fn python_exe() -> String {
 
 /// 应用版本号。发新版时改这里，窗口标题跟着变。
 ///
+/// 1.22.1 相对 1.22.0 的变化：
+///   · 【修 bug】启动程序时不应启动 llama：设备枚举改为 Win32
+///     EnumDisplayDevicesW（纯 API 调用，不起进程、无黑框）。
+///     llama 和 1.5B 模型只在「勾选兼容模式 + 点开始处理」时才启动。
+///
 /// 1.22.0 相对 1.21.1 的变化：
 ///   · 【新功能】文件列表里已处理完（有字幕产物）的文件名显示为浅绿色，
 ///     一眼看出还剩哪些没跑。
@@ -660,7 +665,7 @@ pub fn python_exe() -> String {
 ///     不再只是数文件个数。磁盘满产生的半截文件会被识别出来并挪到
 ///     ！audio\_corrupted\。
 ///   · 第3步单文件失败不再中止整批，跳过并继续，最后汇总。
-pub const APP_VERSION: &str = "1.22.0";
+pub const APP_VERSION: &str = "1.22.1";
 
 /// 窗口标题
 pub fn app_title() -> String {
