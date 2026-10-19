@@ -1242,6 +1242,7 @@ const ACCENT_DEEP: Color = Color::rgb(0xb4, 0x53, 0x2f); // 主按钮底（白�
 const ACCENT_SOFT: Color = Color::rgb(0xf7, 0xeb, 0xe4); // 选中胶囊、浅橙底（原稿 --blue-soft）
 const ACCENT_INK: Color = Color::rgb(0x7d, 0x3f, 0x26); // 橙色文字（对比度够）
 const OK_GREEN: Color = Color::rgb(0x5f, 0x8a, 0x63); // 已完成标记
+const DONE_INK: Color = Color::rgb(0x8a, 0x83, 0x74); // 已完成文件的路径（淡化）
 const WARN: Color = Color::rgb(0xa4, 0x44, 0x2c); // 警告文字
 
 // ─────────────────────────────────────────────────────────
@@ -2865,26 +2866,65 @@ impl Component for AppUi {
             .iter()
             .enumerate()
             .map(|(i, f)| {
+                // 三态，和原稿一致：
+                //   · 已处理完（已有字幕产物）→ 路径淡化 + 后面打勾
+                //   · 正在处理（current_idx）→ 整行浅橙底 + 序号变橙 + 墨色字
+                //   · 排队中 → 正常次要色
                 let done = Self::has_subtitle(f);
-                let tb = TextBlock::new().text(f.clone()).font_size(13.0);
-                let tb = if done {
-                    tb.foreground(OK_GREEN)
+                let is_current = self.running && i == self.current_idx;
+
+                let name_color = if is_current {
+                    INK
+                } else if done {
+                    DONE_INK
                 } else {
-                    tb
+                    INK2
                 };
-                // 序号列：原稿每行前面有一个右对齐的编号（1 / 2 / 56 …），
-                // 固定宽度是为了让文件名的左边缘对齐。
-                let row = StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(10.0)
+                let no_color = if is_current { ACCENT } else { INK3 };
+                let tick = if done { "✓" } else { "" };
+
+                // 行内用 Grid 三列，而不是横向 StackPanel：
+                //   序号(Auto) | 路径(STAR) | 勾(Auto)
+                // 中间列必须是 STAR 才有确定宽度，`text_trimming` 才会真的生效；
+                // StackPanel 里 TextBlock 的宽度是"内容宽度"，超长时会把后面的勾
+                // 直接顶出可视区（实测：勾完全看不见）。
+                let inner = Grid::new()
+                    .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
+                    .column_spacing(10.0)
                     .children((
                         TextBlock::new()
                             .text(format!("{}", i + 1))
                             .font_size(12.0)
-                            .foreground(INK3)
-                            .width(28.0),
-                        tb,
+                            .foreground(no_color)
+                            .width(28.0)
+                            .grid_column(0),
+                        TextBlock::new()
+                            .text(f.clone())
+                            .font_size(13.0)
+                            .foreground(name_color)
+                            .text_trimming(TextTrimming::CharacterEllipsis)
+                            .grid_column(1),
+                        TextBlock::new()
+                            .text(tick)
+                            .font_size(13.0)
+                            .foreground(OK_GREEN)
+                            .grid_column(2),
                     ));
+
+                // 每行都套一层极薄的 Border：高亮时它是浅橙块，
+                // 不高亮时背景透明 —— 两种情况下内边距一致，
+                // 文字的左边缘才不会在高亮行和普通行之间错位。
+                let bg = if is_current {
+                    ACCENT_SOFT
+                } else {
+                    Color::argb(0, 0, 0, 0)
+                };
+                let row = Border::new()
+                    .background(bg)
+                    .corner_radius(8.0)
+                    .padding(Thickness::xy(8.0, 2.0))
+                    .content(inner);
+
                 (f.clone(), row.into())
             })
             .collect();
@@ -2892,7 +2932,7 @@ impl Component for AppUi {
         // 文件列表高度：随窗口高度变化，列表在卡片内部滚动。
         // 不限制高度的话 ListView 会无限长，把 Grid 的 STAR 行撑爆，
         // 结果就是整个界面出现外侧滚动条（用户截图反馈的问题）。
-        let list_h = ((self.window_height - 28.0) * 0.28).clamp(120.0, 560.0);
+        let list_h = ((self.window_height - 36.0) * 0.32).clamp(120.0, 620.0);
 
         let list_area: View = if file_items.is_empty() {
             View::from(TextBlock::new().text("（列表为空，点下面的按钮或把文件拖进来）").font_size(13.0))
@@ -2900,7 +2940,17 @@ impl Component for AppUi {
             View::from(
                 ListView::new()
                     .selection_mode(ListViewSelectionMode::Extended)
-                    .height(list_h)
+                    // 【行高改不动】试过给 ListView 加 resource_overrides
+                    //   把 ListViewItemMinHeight 压到 26 —— ListView 上没有
+                    //   这个方法（E0599）。所以每行还是 WinUI 默认的 40 上下
+                    //   再加我们那层 Border 的 4px，一屏大约 5~6 行。
+                    //   想更紧凑只能不用 ListView 自己画行，但那会丢掉多选、
+                    //   键盘导航和 RemoveSelected 的选中态，不划算。
+                    // 用 max_height 而不是 height：
+                    //   height 是写死的固定值，文件少的时候列表下方留一大片空白，
+                    //   文件多的时候又超出卡片被裁；max_height 让它"最多长这么高"，
+                    //   少了就贴合内容，多了才出滚动条。
+                    .max_height(list_h)
                     .collection_slot(ListViewSlot::Items, file_items),
             )
         };
@@ -3293,6 +3343,9 @@ impl Component for AppUi {
             .rows([
                 GridLength::Auto,
                 GridLength::Auto,
+                // 试过 1.35:1 让上排更高（原稿确实如此），但下排的日志区
+                // 就会顶到卡片底边、末行被裁 —— 日志是本程序最常用的区域，
+                // 不能为了像原稿而牺牲它。所以还是 1:1。
                 GridLength::STAR,
                 GridLength::STAR,
             ])
@@ -3342,8 +3395,8 @@ impl Component for AppUi {
         //
         //   注意 ScrollViewer 的横向滚动条是 Disabled 的 —— 所以溢出
         //   不是变成可滚动，而是【直接被裁掉】，更难发现。
-        let body_w = (self.window_width - 28.0).max(300.0);
-        let body_h = (self.window_height - 28.0).max(300.0);
+        let body_w = (self.window_width - 36.0).max(300.0);
+        let body_h = (self.window_height - 36.0).max(300.0);
         let main_area = Grid::new()
             .width(body_w)
             .height(body_h)
