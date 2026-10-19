@@ -1268,6 +1268,23 @@ const WARN: Color = Color::rgb(0xa4, 0x44, 0x2c); // 警告文字
 ///
 /// 后面四个参数是它在父 Grid 里的位置 —— 必须在 `.children()` 【之前】
 /// 调 grid_row 之类：children() 返回的是 View，而 GridChildExt 只实现给
+/// 从设备描述里抠出显卡短名。
+///
+///   "兼容模式（Vulkan: NVIDIA GeForce RTX 5070）" → "RTX 5070"
+///   检测中（"检测中…"）或纯 CPU 时返回 None，调用处就不显示这一段。
+fn gpu_short_name(status: &str) -> Option<&str> {
+    for tag in ["RTX", "GTX", "Arc ", "Radeon"] {
+        if let Some(pos) = status.find(tag) {
+            let rest = &status[pos..];
+            let end = rest
+                .find(|c| matches!(c, '）' | ')' | '，' | ','))
+                .unwrap_or(rest.len());
+            return Some(rest[..end].trim());
+        }
+    }
+    None
+}
+
 /// 具体控件（Border/StackPanel/...），View 上没有这些方法（E0599）。
 ///
 /// 位置交给 Grid 是为了让卡片随窗口拉伸：放在 STAR 行/列里，
@@ -2737,6 +2754,26 @@ impl Component for AppUi {
             None => View::from(TextBlock::new().text("").font_size(1.0)),
         };
 
+        // 副标题：「本地转写 · 离线翻译 · RTX 5070 加速 · 第 56 / 137 个文件」
+        //   显卡短名从 device_status 里抠（"兼容模式（Vulkan: NVIDIA GeForce
+        //   RTX 5070）" → "RTX 5070"），检测中或纯 CPU 时这一段直接不出现。
+        let subtitle = {
+            let total = self.files.len();
+            let mut parts: Vec<String> = vec!["本地转写".to_string(), "离线翻译".to_string()];
+            if let Some(gpu) = gpu_short_name(&self.device_status) {
+                parts.push(format!("{gpu} 加速"));
+            }
+            if total > 0 {
+                let idx = if self.running {
+                    (self.current_idx + 1).min(total)
+                } else {
+                    total
+                };
+                parts.push(format!("第 {idx} / {total} 个文件"));
+            }
+            parts.join(" · ")
+        };
+
         let title_block = StackPanel::new()
             .grid_row(0)
             .grid_column(0)
@@ -2751,10 +2788,11 @@ impl Component for AppUi {
                         .font_size(26.0)
                         .font_weight(FontWeight::SEMI_BOLD)
                         .foreground(INK),
-                    // 副标题：把「本地 / 离线 / 版本」一次说完，标题区不至于空荡。
-                    // 版本号从 config 取，不在这里再写一遍字面量。
+                    // 副标题：本地 / 离线 / 显卡 / 队列位置，一行说完。
+                    //   版本号不写在这里 —— 窗口标题栏已经有 "v1.23.0"，
+                    //   副标题再重复一遍纯属占位。
                     TextBlock::new()
-                        .text(format!("本地转写 · 离线翻译 · v{}", config::APP_VERSION))
+                        .text(subtitle)
                         .font_size(12.0)
                         .foreground(INK2),
                 )),
@@ -3336,7 +3374,7 @@ impl Component for AppUi {
         //   children() 返回的是 View，View 上没有这些方法（编译报 E0599）。
         //   先定好位置，挂载时 reactor 会从元素状态里读出来。
         let buttons = StackPanel::new()
-            .grid_row(1)
+            .grid_row(0)
             .grid_column(0)
             .orientation(Orientation::Horizontal)
             .spacing(8.0)
@@ -3468,15 +3506,58 @@ impl Component for AppUi {
         //
         //   注意 ScrollViewer 的横向滚动条是 Disabled 的 —— 所以溢出
         //   不是变成可滚动，而是【直接被裁掉】，更难发现。
+        // 按钮行右侧的状态文案（原稿右下角那行）：
+        //   「已用 112 分 51 秒 · 剩余约 81 个文件」
+        //   running 时给已用时间和剩余文件数，空闲时给队列总数量。
+        let footer_txt = {
+            let total = self.files.len();
+            if self.running && total > 0 {
+                let idx = self.current_idx.min(total.saturating_sub(1));
+                format!(
+                    "已用 {} · 剩余约 {} 个文件",
+                    elapsed_txt,
+                    total.saturating_sub(idx + 1)
+                )
+            } else if total > 0 {
+                format!("共 {total} 个文件 · 尚未开始")
+            } else {
+                String::new()
+            }
+        };
+
+        let footer_status = TextBlock::new()
+            .grid_row(0)
+            .grid_column(1)
+            .text(footer_txt)
+            .font_size(12.0)
+            .foreground(INK3)
+            .horizontal_alignment(HorizontalAlignment::Right)
+            .vertical_alignment(VerticalAlignment::Center);
+
         let body_w = (self.window_width - 36.0).max(300.0);
         let body_h = (self.window_height - 36.0).max(300.0);
+        // 按钮行：按钮靠左，状态文字靠右。
+        //
+        // ★ 这一段原来直接挂在 main_area 的第 2 行上，把 main_area 改成
+        //   两列 —— 结果 footer 的 Auto 列吃掉了 ~150px，上方的卡片区跟着
+        //   变窄（文件路径肉眼可见被截得更早）。现在按钮和状态先包进一个
+        //   自己的 Grid，main_area 仍然只有一列。
+        //   button_row 自己要显式定位（grid_row(1)）：不设的话它会被当成
+        //   自动放置的子元素，落到 main_area 的第一行 —— 实测按钮会跑到
+        //   标题区上面，把标题盖住。
+        let button_row = Grid::new()
+            .grid_row(1)
+            .grid_column(0)
+            .columns([GridLength::STAR, GridLength::Auto])
+            .children((buttons, footer_status));
+
         let main_area = Grid::new()
             .width(body_w)
             .height(body_h)
             .rows([GridLength::STAR, GridLength::Auto])
             .columns([GridLength::STAR])
             .row_spacing(6.0)
-            .children((scrolled, buttons));
+            .children((scrolled, button_row));
 
         // ── 「没有可处理的文件」警告框 ──
         //
