@@ -3564,11 +3564,13 @@ impl Component for AppUi {
                     !self.running,
                     context.message(Msg::Start),
                 ),
-                // 停止：浅橙底 + 深橙字，和主操作同一色系但明显更弱
+                // 停止：底色和旁边两个键一样（纸白 + 浅描边），只让【字】是深橙
+                //   —— 危险动作靠字色提示就够了，不必整块底色也染色，
+                //   否则三个键里只有它是彩色块，看着像另一种控件。
                 pill_button(
                     "停止",
                     false,
-                    SUNK,
+                    CARD,
                     CARD_LINE,
                     ACCENT_INK,
                     true,
