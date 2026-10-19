@@ -3547,14 +3547,20 @@ impl Component for AppUi {
                 //
                 //   ⚠ 必须在 .content() 【之前】调：content() 返回 View，
                 //     而 resource_overrides 在具体控件上（同 grid_row 的道理）。
-                // 主操作：赤陶橙实心 + 白字 + 前置小圆点；处理中变弱色并禁用。
-                //   颜色在调用处决定，不走 WinUI 的 disabled 视觉（见 pill_button 注释）。
+                // 主操作键：平时和旁边两个键同色（中性纸白 + 浅描边），
+                //   只有【正在跑】的时候才变成赤陶橙实心 —— 橙色在这里的意思是
+                //   "某件事正在发生"，不是"这是主按钮"。
+                //   反过来做过一版（橙色常亮、跑起来变灰），用户直接指出
+                //   "开始处理应该和旁边按键颜色一样，处理中才变色"。
+                //
+                //   小圆点同理：只在处理中出现（原稿里那颗点就是状态灯）。
+                //   颜色在调用处决定，不走 WinUI 的 disabled 视觉。
                 pill_button(
                     if self.running { "处理中…" } else { "开始处理  ➜" },
-                    true,
-                    if self.running { SUNK } else { ACCENT_DEEP },
-                    if self.running { SUNK } else { ACCENT_DEEP },
-                    if self.running { INK3 } else { Color::rgb(0xff, 0xff, 0xff) },
+                    self.running,
+                    if self.running { ACCENT_DEEP } else { CARD },
+                    if self.running { ACCENT_DEEP } else { CARD_LINE },
+                    if self.running { Color::rgb(0xff, 0xff, 0xff) } else { INK2 },
                     !self.running,
                     context.message(Msg::Start),
                 ),
