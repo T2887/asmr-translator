@@ -360,6 +360,19 @@ fn finalize_subtitles_in(
             continue;
         }
 
+        // 【护栏】超长文件名直接跳过。
+        //
+        //   Windows 的旧路径上限是 260；目录已经占掉 100 多字符，文件名
+        //   一旦超过 ~200，open/copy 全是 os error 123。历史上那个滚雪球
+        //   的 `.chs.chs...` 就撞上了。跳过它，别让它把整轮整理带崩。
+        if fname.chars().count() > 200 {
+            logs.push(format!(
+                "[字幕] 跳过超长文件名（{} 字符，疑似历史残留）",
+                fname.chars().count()
+            ));
+            continue;
+        }
+
         // 剥掉 _中文字幕 / _(Vocals)... 后缀
         let mut stem = fname[..fname.len() - 4].to_string();
         if let Some(rest) = stem.strip_suffix("_中文字幕") {
@@ -367,6 +380,17 @@ fn finalize_subtitles_in(
         }
         if let Some(pos) = stem.find("_(Vocals)") {
             stem.truncate(pos);
+        }
+
+        // 【幂等】把已有的 .chs 一并剥掉。
+        //
+        //   不剥的话：`bgm_test.chs.srt` 会被当成 stem=`bgm_test.chs`，
+        //   目标名又拼成 `bgm_test.chs.chs.srt`。当「字幕留在 3asr」且
+        //   输出目录也是 3asr 时，这就是原地改名 —— 每跑一轮多一级
+        //   `.chs`，实测滚到 252 个字符、超出 MAX_PATH，之后每轮整理
+        //   都报 os error 123，还把这一轮真正要搬的字幕一起拖下水。
+        while stem.to_lowercase().ends_with(".chs") {
+            stem.truncate(stem.len() - 4);
         }
 
         // 决定目标位置
@@ -903,6 +927,34 @@ mod tests {
 
         assert!(srt.join("第三集.chs.srt").is_file(), "应留在 3asr 并改名");
         assert!(!vid.join("第三集.chs.srt").exists(), "不该跑到视频目录去");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // 幂等：已经叫 .chs.srt 的字幕，再来一轮不能再叠一层 .chs。
+    //
+    //   历史上这里少了剥 .chs 的一步，加上「字幕留在 3asr」时源目录就是
+    //   目标目录，于是每跑一轮多一级 .chs —— 实测滚到 252 个字符、撞上
+    //   MAX_PATH，之后每轮整理都报 os error 123，还顺带把同一轮真正的
+    //   字幕一并拖下水（35 次「失败 1 个」）。
+    #[test]
+    fn chs_suffix_is_idempotent() {
+        let (root, srt, vid) = make_scene("idempotent");
+
+        std::fs::write(srt.join("bgm_test.chs.srt"), "字幕内容").unwrap();
+        let files: Vec<String> = Vec::new(); // 没有对应视频
+
+        let logs =
+            finalize_subtitles_in(&srt.to_string_lossy(), &srt.to_string_lossy(), &files, false);
+
+        assert!(
+            srt.join("bgm_test.chs.srt").is_file(),
+            "应保持原名，不能变成 .chs.chs.srt；日志: {logs:?}"
+        );
+        assert!(
+            !srt.join("bgm_test.chs.chs.srt").exists(),
+            "不能叠加 .chs 后缀"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
