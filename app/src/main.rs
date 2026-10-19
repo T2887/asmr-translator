@@ -61,7 +61,8 @@ mod center_hook {
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows_sys::Win32::Graphics::Dwm::{
         DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_COLOR_NONE,
-        DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_TEXT_COLOR,         DWMWA_USE_IMMERSIVE_DARK_MODE,
+        DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_TEXT_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE,
+        DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWCP_ROUND,
         DWMSBT_MAINWINDOW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -162,6 +163,19 @@ mod center_hook {
 
             // 窗口边框留一条淡灰 #E5DFD2，让窗口边缘不糊在浅色壁纸上
             set(hwnd, DWMWA_BORDER_COLOR, 0x00D2DFE5);
+
+            // ── 窗口四角圆角 ──
+            //
+            // 用户反馈「圆角不一致」：卡片是 20px 圆角，窗口四角却是直角，
+            // 米色客户区一直顶到方形边框上，四角看着像被切了一刀。
+            //
+            // Win11 的窗口圆角由 DWM 统一裁（DWMWA_WINDOW_CORNER_PREFERENCE）。
+            // 不显式设的话，某些创建路径（自定义标题栏 / 关掉系统边框）会落到
+            // DONOTROUND，客户区就保持直角。这里明确要 ROUND。
+            //
+            // 注意必须在窗口显示【之前】设（这里在 HCBT_ACTIVATE 钩子里，
+            // 正好赶在第一次绘制前），显示之后再改也能生效，但会闪一下。
+            set(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND as u32);
 
             // ── 窗口 / 任务栏图标 ──
             //
