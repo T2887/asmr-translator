@@ -1919,9 +1919,13 @@ impl Component for AppUi {
                 self.has_gpu = is_gpu;
                 self.vram_gb = vram_gb;
                 self.has_vulkan = has_vulkan;
-                // v1.20：三种运行模式的判定（用户要求只有这三种）
-                self.mode_full_ok = is_gpu && vram_gb >= 8.0;
-                self.mode_lite_ok = is_gpu && vram_gb >= 6.0 && vram_gb < 8.0;
+                // v1.21.1：精简模式的条件放宽为「N 卡显存 ≥ 6 GB」——
+                // 大显存卡也可以主动选精简模式（比如想省显存跑别的程序）。
+                // vram_gb == 0.0 表示「有 GPU 但显存读不出来」，按未知处理，
+                // 不阻止用户选择（否则会被强制塞进兼容模式）。
+                let vram_unknown = vram_gb <= 0.0;
+                self.mode_full_ok = is_gpu && (vram_unknown || vram_gb >= 8.0);
+                self.mode_lite_ok = is_gpu && (vram_unknown || vram_gb >= 6.0);
                 self.mode = if self.mode_full_ok {
                     pipeline::RunMode::Full
                 } else if self.mode_lite_ok {
@@ -2594,15 +2598,15 @@ impl Component for AppUi {
                                 .is_enabled(self.mode_lite_ok)
                                 .on_checked(context.callback(|_| Msg::SetModeLite))
                                 .content(if self.mode_lite_ok {
-                                    "精简模式（N 卡显存 6~8 GB）"
+                                    "精简模式（N 卡显存 ≥ 6 GB）"
                                 } else {
-                                    "精简模式（不满足：需要 N 卡显存 6~8 GB）"
+                                    "精简模式（不满足：需要 N 卡显存 ≥ 6 GB）"
                                 }),
                             RadioButton::new()
                                 .group_name("run_mode")
                                 .is_checked(self.mode == pipeline::RunMode::Compat)
                                 .on_checked(context.callback(|_| Msg::SetModeCompat))
-                                .content("兼容模式（CPU / 核显 / AMD 显卡）"),
+                                .content("兼容模式（N 卡显存低于 6GB / 非 N 独立显卡 / 核显）"),
                         )),
                         copy_check,
                         force_check,
@@ -2612,10 +2616,21 @@ impl Component for AppUi {
         );
 
         // ── 卡片 3：待处理文件 ──
+        // 文件列表：已处理完（有字幕产物）的文件名用浅绿色标出来，
+        // 方便一眼看出还剩哪些没跑。
         let file_items: Vec<(String, View)> = self
             .files
             .iter()
-            .map(|f| (f.clone(), TextBlock::new().text(f.clone()).into()))
+            .map(|f| {
+                let done = Self::has_subtitle(f);
+                let tb = TextBlock::new().text(f.clone());
+                let tb = if done {
+                    tb.foreground(Color::rgb(0x8f, 0xd1, 0x8f))
+                } else {
+                    tb
+                };
+                (f.clone(), tb.into())
+            })
             .collect();
 
         // 文件列表高度：随窗口高度变化，列表在卡片内部滚动。

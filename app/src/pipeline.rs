@@ -87,6 +87,8 @@ pub fn stages(mode: RunMode) -> &'static [(usize, &'static str, &'static str)] {
 // 而分离耗时和音频长度严格成正比。先圈出语音段再只分离那些段，
 // 实测 12 分钟视频分离 65s→9.45s（省 85%），30 分钟音声 122s→52s（省 57%）。
 
+use std::os::windows::process::CommandExt;
+
 use crate::config;
 use crate::srt;
 
@@ -105,9 +107,11 @@ pub fn detect_vulkan_devices() -> Vec<String> {
     if !exe.is_file() {
         return Vec::new();
     }
-    let out = std::process::Command::new(&exe)
-        .arg("--list-devices")
-        .output();
+    // ★ CREATE_NO_WINDOW：llama-server 是控制台程序，不加这个标志
+    //   启动时会在屏幕上闪一个黑框（用户可见）。
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("--list-devices").creation_flags(0x0800_0000);
+    let out = cmd.output();
     let Ok(out) = out else {
         return Vec::new();
     };

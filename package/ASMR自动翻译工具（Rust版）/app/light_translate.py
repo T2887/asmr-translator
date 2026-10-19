@@ -74,8 +74,9 @@ def pick_device():
       · 核显：共享系统内存，要求 ≥ 3 GB 空闲。
       · 都不满足 → CPU。
     """
-    DISCRETE_MIN_FREE_MIB = 3 * 1024
-    INTEGRATED_MIN_FREE_MIB = 3 * 1024
+    # 1.5B 模型约 1.5 GB（权重+上下文），再留约 1 GB 余量。
+    DISCRETE_MIN_FREE_MIB = 2560
+    INTEGRATED_MIN_FREE_MIB = 2560
 
     try:
         out = subprocess.run(
@@ -187,19 +188,39 @@ def main():
         sys.exit(1)
 
     port = free_port()
+
+    def start_server(device):
+        return subprocess.Popen(
+            [LLAMA, "--model", MODEL, "--host", "127.0.0.1", "--port", str(port),
+             "--device", device, "-c", "4096", "-np", "1", "--no-webui",
+             "--log-verbosity", "0"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=".",
+            # CREATE_NO_WINDOW：否则翻译时会在屏幕上闪一个黑框
+            creationflags=0x08000000,
+        )
+
     dev, dev_name = pick_device()
     print(f"[设备] 翻译使用：{dev_name}（{dev}）", flush=True)
     print(f"启动内置 llama.cpp（端口 {port}）...", flush=True)
-    proc = subprocess.Popen(
-        [LLAMA, "--model", MODEL, "--host", "127.0.0.1", "--port", str(port),
-         "--device", dev, "-c", "4096", "-np", "1", "--no-webui",
-         "--log-verbosity", "0"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=".",
-    )
+    proc = start_server(dev)
     try:
         if not wait_health(port):
-            print("[失败] llama-server 启动超时")
-            sys.exit(1)
+            # 选中设备加载失败（显存不够 / OOM / 驱动问题）→ 回退 CPU 重试一次。
+            # 千问评审指出：--list-devices 的 free 是瞬时值，不能保证加载时还够。
+            print("[回退] 该设备加载失败，改用 CPU 重试", flush=True)
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            dev, dev_name = "none", "CPU"
+            proc = start_server("none")
+            if not wait_health(port):
+                print("[失败] llama-server 启动超时")
+                sys.exit(1)
         print("llama-server 就绪", flush=True)
 
         os.makedirs(ASR_DIR, exist_ok=True)
