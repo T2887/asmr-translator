@@ -260,6 +260,16 @@ for _idx, flac in enumerate(audio_files, 1):
         continue
 
     total_sec = sum(b - a for a, b in segs)
+    # ★ v1.22.2：有效语音太短时不要送进分离模型。
+    #   BS-RoFormer 处理 1~2 秒的短音频会崩：
+    #   "The size of tensor a (0) must match the size of tensor b (76293)"。
+    #   阈值取 2.0 秒（实测 1.74 秒必崩；2 秒以上一般能跑）。
+    MIN_SPEECH_SEC = 2.0
+    if total_sec < MIN_SPEECH_SEC:
+        print(f"  [跳过] 有效语音只有 {total_sec:.1f}s（< {MIN_SPEECH_SEC:.0f}s），"
+              f"不送分离模型（短音频会崩），继续下一个")
+        _skip.append(base)
+        continue
     try:
         data, sr = read_audio(flac)
         dur = len(data) / sr
@@ -282,8 +292,9 @@ for _idx, flac in enumerate(audio_files, 1):
 
         voc = [f for f in voc_files if "Vocals" in f]
         if not voc:
-            print("  [失败] 分离没有产出人声")
-            _fail.append((base, "无人声输出"))
+            # 分离没产出人声（短音频/模型限制）→ 跳过这个文件，别中止整批
+            print("  [跳过] 分离没有产出人声（短音频/模型限制），继续下一个")
+            _skip.append(base)
             continue
         # 分离结果现在落在临时目录
         vt = voc[0]
@@ -322,9 +333,9 @@ for _idx, flac in enumerate(audio_files, 1):
             pass
 
     except Exception as e:
-        import traceback
-        print(f"  [失败] {type(e).__name__}: {e}")
-        traceback.print_exc()
+        # 单个文件分离异常（模型限制/文件损坏）→ 记为失败，但不中止整批。
+        # 只有「整批一个都没产出 且 存在失败」时才让退出码变 1（文件末尾判断）。
+        print(f"  [失败] 分离异常（{type(e).__name__}: {e}），继续下一个")
         _fail.append((base, f"{type(e).__name__}: {str(e)[:120]}"))
 
 # 清理临时文件
@@ -347,10 +358,14 @@ print("=" * 60)
 _produced = [f for f in os.listdir(config["path"]["audio"])
              if f.lower().endswith((".wav", ".flac", ".mp3"))]
 if not _produced:
-    if _skip and not _fail:
-        # 整批都是 BGM / 静音：不是失败，正常结束，让流水线继续。
-        print(f"[跳过] {len(_skip)} 个文件都没有检测到人声（BGM / 静音），无需分离")
-        sys.exit(0)
-    print("[失败] 人声分离没有产出任何文件")
-    sys.exit(1)
+    if _fail:
+        # 整批一个都没产出，而且有真错误（磁盘满/模型崩/文件损坏）
+        # → 这才是需要中止的情况，让用户看到。
+        print("[失败] 人声分离没有产出任何文件，且存在处理错误：")
+        for b, why in _fail:
+            print(f"  ✗ {b}: {why}")
+        sys.exit(1)
+    # 全部是「无语音/短音频」跳过 → 正常结束，流水线继续
+    print(f"[跳过] 本批没有可分离的人声（跳过 {len(_skip)} 个），流水线继续")
+    sys.exit(0)
 print(f"产出 {len(_produced)} 个文件")

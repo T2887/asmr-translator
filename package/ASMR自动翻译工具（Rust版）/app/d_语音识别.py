@@ -149,24 +149,11 @@ files = [
 ]
 
 if not files:
-    # 可能是纯 BGM / 静音文件：第3步按「VAD 0 段」跳过了，没有产出 1audio。
-    # 这时不该报失败 —— 检查 2vad 里的 vad.json，确认是真没人声就正常结束。
-    import json as _json
-    _vad_jsons = glob.glob(os.path.join(config["path"]["vad"], "*.vad.json"))
-    _empty = []
-    for _vp in _vad_jsons:
-        try:
-            with open(_vp, encoding="utf-8") as _f:
-                if not _json.load(_f).get("segments"):
-                    _empty.append(_vp)
-        except Exception:
-            pass
-    if _empty:
-        print(f"[跳过] 没有检测到人声（{len(_empty)} 个文件为纯 BGM / 静音），无需识别")
-        sys.exit(0)  # 正常结束，不是失败
-    print(f"在 {config['path']['audio']} 中未找到音频文件")
-    # ★ 非 0 退出码：没有输入文件就等于这一步没做成，不能让界面以为成功了
-    sys.exit(1)
+    # 第3步可能因为「无语音 / 短音频」跳过了这个文件，没有产出 1audio。
+    # 第3步真失败会以非 0 退出码中止流水线（见 b_分离人声.py 末尾），
+    # 所以能走到这里就说明是「跳过」而不是失败 —— 正常结束，继续下一个。
+    print("[跳过] 没有可识别的音频（第3步已跳过该文件），流水线继续")
+    sys.exit(0)
 
 import re as _re
 
