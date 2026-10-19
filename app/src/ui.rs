@@ -1252,6 +1252,7 @@ const BG: Color = Color::rgb(0xf0, 0xee, 0xe6); // 窗口底色
 const CARD: Color = Color::rgb(0xfa, 0xf9, 0xf5); // 卡片面
 const CARD_LINE: Color = Color::rgb(0xe3, 0xdd, 0xd0); // 卡片描边
 const SUNK: Color = Color::rgb(0xf5, 0xf2, 0xea); // 内嵌框（日志 / 预览）
+#[allow(dead_code)]
 const SUNK_LINE: Color = Color::rgb(0xe3, 0xdd, 0xd0); // 内嵌框描边
 const INK: Color = Color::rgb(0x1f, 0x1e, 0x1d); // 主文字
 const INK2: Color = Color::rgb(0x4a, 0x46, 0x3f); // 次要文字
@@ -1287,8 +1288,14 @@ fn gpu_short_name(status: &str) -> Option<&str> {
     for tag in ["RTX", "GTX", "Arc ", "Radeon"] {
         if let Some(pos) = status.find(tag) {
             let rest = &status[pos..];
+            // ★ 截断点必须包含【左】括号。
+            //   原来只找右括号：状态是 "GPU：NVIDIA GeForce RTX 5070（已启用
+            //   CUDA）" 时，rest 从 "RTX" 开始、截到 "）" 之前，得到的却是
+            //   "RTX 5070（已启用 CUDA" —— 整段括号内容被当成显卡名塞进副标题，
+            //   副标题于是变成 "RTX 5070（已启用 CUDA 加速"，少了个右括号
+            //   （用户截图圈出来问过）。
             let end = rest
-                .find(|c| matches!(c, '）' | ')' | '，' | ','))
+                .find(|c| matches!(c, '（' | '(' | '）' | ')' | '，' | ','))
                 .unwrap_or(rest.len());
             return Some(rest[..end].trim());
         }
@@ -1506,6 +1513,59 @@ fn tap_button(label: &str, on_click: Callback<()>) -> View {
     pill_button(label, false, CARD, CARD_LINE, INK2, true, on_click)
 }
 
+/// 自绘复选框。
+///
+/// 【为什么不用 CheckBox】
+///   WinUI 的 CheckBox 选中态取的是系统 accent 色 —— 在米色 + 赤陶橙的界面上
+///   会蹦出一个紫蓝色的方块（用户截图圈出来说"颜色不统一"）。而 CheckBox
+///   也没有 resource_overrides（那是 Button 独有的），改不了。
+///   所以和胶囊按钮一样：外观自己画，外面套一个透明 Button 负责点击。
+fn check_row(label: &str, checked: bool, on_click: Callback<()>) -> View {
+    let face = Border::new()
+        .width(18.0)
+        .height(18.0)
+        .corner_radius(5.0)
+        .background(if checked { ACCENT_DEEP } else { CARD })
+        .border_brush(if checked { ACCENT_DEEP } else { CARD_LINE })
+        .border_thickness(1.0)
+        .vertical_alignment(VerticalAlignment::Center)
+        .content(
+            TextBlock::new()
+                .text(if checked { "✓" } else { "" })
+                .font_size(12.0)
+                .foreground(Color::rgb(0xff, 0xff, 0xff))
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .vertical_alignment(VerticalAlignment::Center),
+        );
+
+    let row = StackPanel::new()
+        .orientation(Orientation::Horizontal)
+        .spacing(8.0)
+        .children((
+            face,
+            TextBlock::new()
+                .text(label)
+                .font_size(14.0)
+                .foreground(INK)
+                .vertical_alignment(VerticalAlignment::Center),
+        ));
+
+    Button::new()
+        .resource_overrides(
+            ResourceOverrides::new()
+                .set("ButtonBackground", Color::argb(0, 0, 0, 0))
+                .set("ButtonBackgroundPointerOver", Color::argb(0, 0, 0, 0))
+                .set("ButtonBackgroundPressed", Color::argb(0, 0, 0, 0))
+                .set("ButtonBorderThemeThickness", Thickness::uniform(0.0))
+                .set("ButtonPadding", Thickness::uniform(0.0)),
+        )
+        .min_height(22.0)
+        .horizontal_content_alignment(HorizontalAlignment::Left)
+        .automation_name(label)
+        .on_click(on_click)
+        .content(row)
+}
+
 /// 自绘模态层：半透明遮罩 + 居中纸白卡片。
 ///
 /// ContentDialog 没有 theme/background API，深色模式下会在米色界面上糊一块
@@ -1592,16 +1652,11 @@ fn mode_chip(label: &str, selected: bool, enabled: bool, on_click: Callback<()>)
 /// 比如日志区和预览区 —— 让它们看起来是独立的一块，
 /// 而不是直接糊在卡片上。
 fn inner_box(body: View) -> View {
-    Border::new()
-        // 内嵌框比卡片再深一层、再实一点 —— 日志区压在花壁纸上要能看清字
-        // 内嵌框要比卡片【深】，才有凹进去的层次；
-        // 但底色也往冷蓝偏，不要死黑 —— 死黑在冰川蓝的卡片上很突兀。
-        .background(SUNK)
-        .border_brush(SUNK_LINE)
-        .border_thickness(1.0)
-        .corner_radius(12.0)
-        .padding(12.0)
-        .content(body)
+    // 曾经是「浅米底色 + 细描边」的内嵌框（SUNK / SUNK_LINE）。
+    // 用户看过截图后的意见：「这两栏不要有底色了」—— 预览和日志两块
+    // 内容区直接坐在卡片纸面上，只靠内边距和卡片留白做层次，
+    // 整窗的颜色块因此少了两大块，比原来干净。
+    Border::new().padding(12.0).content(body)
 }
 
 impl Component for AppUi {
@@ -2841,15 +2896,19 @@ impl Component for AppUi {
             ));
 
         // ── 卡片 1：环境 ──
-        let copy_check = CheckBox::new()
-            .is_checked(self.copy_to_video)
-            .on_is_checked_changed(context.callback(Msg::SetCopyToVideo))
-            .content("字幕直接放到视频旁边（播放器可自动加载）");
+        let copy_to_video = self.copy_to_video;
+        let copy_check = check_row(
+            "字幕直接放到视频旁边（播放器可自动加载）",
+            self.copy_to_video,
+            context.callback(move |_: ()| Msg::SetCopyToVideo(!copy_to_video)),
+        );
 
-        let force_check = CheckBox::new()
-            .is_checked(self.force_redo)
-            .on_is_checked_changed(context.callback(Msg::SetForceRedo))
-            .content("强制重新处理（删除已有字幕）");
+        let force_redo = self.force_redo;
+        let force_check = check_row(
+            "强制重新处理（删除已有字幕）",
+            self.force_redo,
+            context.callback(move |_: ()| Msg::SetForceRedo(!force_redo)),
+        );
 
         let out_dir = if self.copy_to_video {
             "跟随视频所在目录（自动）".to_string()

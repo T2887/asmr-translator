@@ -189,7 +189,7 @@ except Exception:
             // float16 峰值 4265 + 基线 3000 + 预留 1024 = 8289 MiB ≈ 8.1 GB
             let lite = vram > 0.0 && vram < 8.1;
             let text = if vram > 0.0 && vram < 6.0 {
-                format!("兼容模式（N 卡显存不足 6 GB：{vram:.1} GB）")
+                "兼容模式".to_string()
             } else if name.is_empty() {
                 "GPU（已启用 CUDA）".to_string()
             } else if lite {
@@ -201,11 +201,12 @@ except Exception:
         }
         // 没有 CUDA：不再说「CPU 慢 50 倍」，而是走兼容模式。
         Ok(s) if s == "CPU" => {
-            let text = if has_vulkan {
-                format!("兼容模式（Vulkan：{}）", vulkan.join(" / "))
-            } else {
-                "兼容模式（纯 CPU）".to_string()
-            };
+            // 设备状态栏只写「兼容模式」四个字（用户明确要求）。
+            //   原来写的是「兼容模式（Vulkan：NVIDIA GeForce RTX 5070）」
+            //   这种带型号的长句 —— 型号在副标题里，状态栏只需说明
+            //   "现在用的是哪个模式"。
+            let _ = &vulkan;
+            let text = "兼容模式".to_string();
             (text, false, 0.0, has_vulkan)
         }
         Ok(other) => (format!("未知（检测失败：{other}）"), false, 0.0, has_vulkan),
