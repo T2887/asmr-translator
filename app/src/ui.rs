@@ -28,7 +28,11 @@ use crate::pipeline::{self, StageResult};
 //    减到 8 行正好省下 80px，一屏就能放全 —— 用户要的是「打开就能看到
 //    所有功能」，多显示 4 行日志不值得让它少一个关键按钮。
 //    （每行约 20px，改这个数要重新核对总高度。）
-const LOG_SLOTS: usize = 6;
+//
+//  2026-10-20：6 → 5。Claude 暖色版把卡片内边距从 12 加到 16、行距从
+//    8 加到 12，日志卡矮了约 12px，第 6 行（最新一行！）被裁掉半截。
+//    与其压字号不如少一行 —— 反正「导出完整日志」还在，完整内容不会丢。
+const LOG_SLOTS: usize = 5;
 
 /// 翻译预览区显示的槽位数。
 //  ★ 和 LOG_SLOTS 同理，同步减到 8 保持两栏高度接近。
@@ -1213,15 +1217,42 @@ impl AppUi {
 }
 
 // ─────────────────────────────────────────────────────────
+//  主题色板 —— Claude 暖色（v1.23.0）
+//
+//  改版前是深色冰川蓝玻璃：深色主题 + Acrylic 半透明，卡片靠 alpha
+//  压住壁纸。问题有三个：① 底色跟着壁纸走，永远调不准；
+//  ② 卡片和日志区都是半透明，长文本对比度上不去；③ 换主题要逐处改。
+//
+//  这一版改成不透明的暖米色纸面，颜色只在这里定义：
+//    窗口底 #f0eee6 / 卡片 #faf9f5 / 内嵌框 #f5f2ea / 描边 #e3ddd0
+//    赤陶橙 #c96442 做强调，橙系文字用 #7d3f26 保证 4.5:1 对比度
+//
+//  Color::rgb 是 const fn，所以可以直接定义成常量。
+// ─────────────────────────────────────────────────────────
+const BG: Color = Color::rgb(0xf0, 0xee, 0xe6); // 窗口底色
+const CARD: Color = Color::rgb(0xfa, 0xf9, 0xf5); // 卡片面
+const CARD_LINE: Color = Color::rgb(0xe3, 0xdd, 0xd0); // 卡片描边
+const SUNK: Color = Color::rgb(0xf5, 0xf2, 0xea); // 内嵌框（日志 / 预览）
+const SUNK_LINE: Color = Color::rgb(0xe3, 0xdd, 0xd0); // 内嵌框描边
+const INK: Color = Color::rgb(0x1f, 0x1e, 0x1d); // 主文字
+const INK2: Color = Color::rgb(0x4a, 0x46, 0x3f); // 次要文字
+const INK3: Color = Color::rgb(0x6b, 0x64, 0x58); // 更次要（提示、尾注）
+const ACCENT: Color = Color::rgb(0xc9, 0x64, 0x42); // 赤陶橙（强调块、进度）
+const ACCENT_DEEP: Color = Color::rgb(0xb4, 0x53, 0x2f); // 主按钮底（白字可读）
+const ACCENT_SOFT: Color = Color::rgb(0xf7, 0xeb, 0xe4); // 选中胶囊、浅橙底（原稿 --blue-soft）
+const ACCENT_INK: Color = Color::rgb(0x7d, 0x3f, 0x26); // 橙色文字（对比度够）
+const OK_GREEN: Color = Color::rgb(0x5f, 0x8a, 0x63); // 已完成标记
+const WARN: Color = Color::rgb(0xa4, 0x44, 0x2c); // 警告文字
+
+// ─────────────────────────────────────────────────────────
 //  样式 helper —— 统一界面的视觉语言
 //
 //  参照 Windows 11 设置页（Fluent / WinUI 3）的做法：
-//    · 每一块内容装在一张卡片里（圆角 + CardBackground + 细描边）
+//    · 每一块内容装在一张卡片里（圆角 + 细描边）
 //    · 卡片有标题，正文靠内边距和间距拉开
 //    · 层级靠【字号 + 字重】表达，不靠颜色堆砌
 //
-//  颜色全部用 ThemeBrush 而不是写死的 RGB —— 这样系统切换浅色/深色
-//  主题时会自动跟着变。写死颜色在浅色主题下会瞎。
+//  颜色统一取自上面的色板，不再在 view 里写死 RGB。
 // ─────────────────────────────────────────────────────────
 
 /// 一张卡片。body 是卡片内容。
@@ -1240,6 +1271,29 @@ fn card(
     row_span: i32,
     col_span: i32,
 ) -> View {
+    // 没胶囊就塞一个 1px 的空文本 —— StackPanel 的 children 是定长元组，
+    // 不接受 Option，这是最省事的「空位」写法（本文件其他地方也这么占位）。
+    card_x(
+        title,
+        View::from(TextBlock::new().text("").font_size(1.0)),
+        body,
+        row,
+        col,
+        row_span,
+        col_span,
+    )
+}
+
+/// 带「标题右侧小胶囊」的卡片，比如「文件列表 137」。
+fn card_x(
+    title: &str,
+    badge: View,
+    body: View,
+    row: i32,
+    col: i32,
+    row_span: i32,
+    col_span: i32,
+) -> View {
     // ★ orientation(Horizontal) 不能少。
     //   StackPanel 默认是【纵向】的，不写这个，那个 3x16 的强调色小竖条
     //   会和标题竖着排 —— 实测结果是竖条飘到卡片右上角、标题掉到下面。
@@ -1248,15 +1302,17 @@ fn card(
         .spacing(8.0)
         .children((
             Border::new()
-                .background(Color::rgb(0x72, 0xa8, 0xd8))
+                .background(ACCENT)
                 .corner_radius(2.0)
                 .width(3.0)
                 .height(16.0)
                 .content(TextBlock::new().text("").font_size(1.0)),
             TextBlock::new()
                 .text(title)
-                .font_size(14.0)
-                .font_weight(FontWeight::SEMI_BOLD),
+                .font_size(15.0)
+                .font_weight(FontWeight::SEMI_BOLD)
+                .foreground(INK),
+            badge,
         ));
     Border::new()
         .grid_row(row)
@@ -1286,12 +1342,12 @@ fn card(
         // 要点：冰川蓝不是"深蓝加透明度"，而是【高 RGB + 冷色调】——
         //   R 比 G 低、G 比 B 低，整体亮度高（都在 160~240 区间）。
         //   这样才透出"冰面反光"的冷白感，而不是"深海的蓝"。
-        .background(Color::argb(70, 218, 234, 250))
-        // 描边同步提亮，冰棱的边
-        .border_brush(Color::argb(120, 235, 245, 255))
+        .background(CARD)
+        // 描边：暖灰，比底色深一档就够，不要抢内容
+        .border_brush(CARD_LINE)
         .border_thickness(1.0)
-        .corner_radius(12.0)
-        .padding(12.0)
+        .corner_radius(20.0)
+        .padding(16.0)
         .content(StackPanel::new().spacing(6.0).children((
             // 【不要在这里加"顶部内高光"】
             //
@@ -1312,10 +1368,147 @@ fn card(
 
 /// 「标签 + 值」两行。标签小一号、值大一号，靠字号做层级。
 fn field(label: &str, value: &str) -> View {
-    View::from(StackPanel::new().spacing(2.0).children((
-        TextBlock::new().text(label).font_size(11.0).foreground(Color::rgb(0xa3, 0xb2, 0xcd)),
-        TextBlock::new().text(value).font_size(14.0).foreground(Color::rgb(0xee, 0xf3, 0xfb)),
+    View::from(StackPanel::new().spacing(3.0).children((
+        TextBlock::new().text(label).font_size(11.0).foreground(INK2),
+        TextBlock::new().text(value).font_size(14.0).foreground(INK),
     )))
+}
+
+/// 卡片标题右侧的计数小胶囊（「文件列表 137」里的 137）。
+fn count_pill(text: &str) -> View {
+    View::from(
+        Border::new()
+            .background(Color::rgb(0xf0, 0xdc, 0xd2))
+            .corner_radius(9.0)
+            .padding(Thickness::xy(8.0, 1.0))
+            .vertical_alignment(VerticalAlignment::Center)
+            .content(
+                TextBlock::new()
+                    .text(text)
+                    .font_size(11.0)
+                    .foreground(ACCENT_INK),
+            ),
+    )
+}
+
+/// 处理模式的「胶囊按钮」。
+///
+/// 【为什么不用 RadioButton】
+///   WinUI 的单选圆点是系统强调色（蓝紫），而 resource_overrides 只有
+///   Button 支持 —— RadioButton 改不了配色。换来的代价是三个模式从
+///   「一列单选」变成「一排互斥胶囊」，视觉和原稿一致了。
+/// 底部操作按钮（开始处理 / 停止 / 暂停）。
+///
+/// 【为什么不是给 Button 上色】和 `mode_chip` 同一套理由：`ControlCornerRadius`
+/// 这个主题资源键覆盖不掉 WinUI 按钮模板的圆角，`corner_radius` 又只长在
+/// Border 上（Button 上没有这个方法，试过，E0599）。所以外形一律 Border 画，
+/// Button 透明、只保留点击区域。
+///
+/// `dot` = 主操作前面那个小圆点；禁用态由调用方把颜色换成弱色，
+/// 不依赖 WinUI 的 disabled 视觉（那套会把胶囊底色一起冲掉）。
+fn pill_button(
+    label: &str,
+    dot: bool,
+    bg: Color,
+    line: Color,
+    fg: Color,
+    enabled: bool,
+    on_click: Callback<()>,
+) -> View {
+    let inner: View = if dot {
+        View::from(
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(8.0)
+                .children((
+                    Border::new()
+                        .width(8.0)
+                        .height(8.0)
+                        .corner_radius(4.0)
+                        .background(fg)
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .content(TextBlock::new().text("").font_size(1.0)),
+                    TextBlock::new().text(label).font_size(13.0).foreground(fg),
+                )),
+        )
+    } else {
+        View::from(TextBlock::new().text(label).font_size(13.0).foreground(fg))
+    };
+
+    let face = Border::new()
+        .background(bg)
+        .border_brush(line)
+        .border_thickness(1.0)
+        .corner_radius(18.0)
+        .padding(Thickness::xy(18.0, 8.0))
+        .content(inner);
+
+    Button::new()
+        .resource_overrides(
+            ResourceOverrides::new()
+                .set("ButtonBackground", Color::argb(0, 0, 0, 0))
+                .set("ButtonBackgroundPointerOver", Color::argb(0, 0, 0, 0))
+                .set("ButtonBackgroundPressed", Color::argb(0, 0, 0, 0))
+                .set("ButtonBorderThemeThickness", Thickness::uniform(0.0))
+                .set("ButtonPadding", Thickness::uniform(0.0)),
+        )
+        .is_enabled(enabled)
+        // 外观是自己画的，屏幕阅读器读不到里面的 TextBlock 时，
+        // 这一句保证「全量模式 / 精简模式 / 兼容模式」仍然有可读名字。
+        .automation_name(label)
+        .on_click(on_click)
+        .content(face)
+}
+
+fn mode_chip(label: &str, selected: bool, enabled: bool, on_click: Callback<()>) -> View {
+    // 【为什么是「Border 自绘 + 透明按钮」而不是「给 Button 上色」】
+    //   一开始走的是 resource_overrides 改 ButtonBackground / ButtonBorderBrush，
+    //   实测不生效：按钮边框能出来，但选中态的橙底完全不见（截图取色仍是卡片色）。
+    //   主按钮同样的写法却正常 —— 差别不明，不再赌框架行为。
+    //   现在把「好看的那层」交给 Border（背景/描边/圆角全都自己说了算），
+    //   Button 只保留点击区域，并且把它的背景和描边全部清零。
+    let bg = if selected { ACCENT_SOFT } else { CARD };
+    let line = if selected { ACCENT } else { CARD_LINE };
+    let fg = if selected { ACCENT_INK } else { INK2 };
+    // 左端那个小圆点：原稿每个胶囊前面都有一个，选中时填实。
+    let dot = if selected { ACCENT } else { CARD_LINE };
+
+    let face = Border::new()
+        .background(bg)
+        .border_brush(line)
+        .border_thickness(1.0)
+        .corner_radius(15.0)
+        .padding(Thickness::xy(13.0, 6.0))
+        .content(
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(7.0)
+                .children((
+                    Border::new()
+                        .width(9.0)
+                        .height(9.0)
+                        .corner_radius(4.5)
+                        .background(dot)
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .content(TextBlock::new().text("").font_size(1.0)),
+                    TextBlock::new().text(label).font_size(13.0).foreground(fg),
+                )),
+        );
+
+    Button::new()
+        .resource_overrides(
+            ResourceOverrides::new()
+                .set("ButtonBackground", Color::argb(0, 0, 0, 0))
+                .set("ButtonBackgroundPointerOver", Color::argb(0, 0, 0, 0))
+                .set("ButtonBackgroundPressed", Color::argb(0, 0, 0, 0))
+                .set("ButtonBorderThemeThickness", Thickness::uniform(0.0))
+                .set("ButtonPadding", Thickness::uniform(0.0)),
+        )
+        .is_enabled(enabled)
+        // 同 mode_chip：外观是自绘的，补一个可读名字给屏幕阅读器。
+        .automation_name(label)
+        .on_click(on_click)
+        .content(face)
 }
 
 /// 卡片内部再嵌一层的浅色框。用来区分"一块可滚动的内容"，
@@ -1326,11 +1519,11 @@ fn inner_box(body: View) -> View {
         // 内嵌框比卡片再深一层、再实一点 —— 日志区压在花壁纸上要能看清字
         // 内嵌框要比卡片【深】，才有凹进去的层次；
         // 但底色也往冷蓝偏，不要死黑 —— 死黑在冰川蓝的卡片上很突兀。
-        .background(Color::argb(120, 22, 42, 78))
-        .border_brush(Color::argb(80, 140, 175, 215))
+        .background(SUNK)
+        .border_brush(SUNK_LINE)
         .border_thickness(1.0)
-        .corner_radius(8.0)
-        .padding(10.0)
+        .corner_radius(12.0)
+        .padding(12.0)
         .content(body)
 }
 
@@ -2473,8 +2666,12 @@ impl Component for AppUi {
         // 窗口材质用 Acrylic —— 磨砂玻璃，比 Mica 更"雾面玻璃"。
         context.window_visuals(
             WindowVisuals::new()
-                .backdrop(WindowBackdrop::Acrylic)
-                .theme(WindowTheme::Dark)
+                // 标题栏是非客户区，由 DWM 画，Border 铺不到它。
+                // 上一版用 Acrylic 是为了让标题栏和客户区同源，现在客户区
+                // 改成不透明米色，只能反过来：用 Mica + Light 把标题栏
+                // 也推到浅色，客户区再用 Border 盖成米色，两边才不割裂。
+                .backdrop(WindowBackdrop::Mica)
+                .theme(WindowTheme::Light)
                 // 尺寸按屏幕算（固定 1280x720 逻辑像素，见 preferred_window_size）
                 .client_size(Self::preferred_window_size().0, Self::preferred_window_size().1)
                 .constraints(WindowConstraints {
@@ -2499,18 +2696,45 @@ impl Component for AppUi {
         crate::tick::set_sender(context.sender());
 
         // ── 标题区 ──
+        // 原稿是「小 logo + 标题 + 副标题」横排。logo 用 exe 旁边的
+        // assets\icon.png；没有的话退回一个空占位（源码目录直接跑时就属于这种情况）。
+        let logo: View = match config::icon_path() {
+            Some(path) => {
+                let uri = format!("file:///{}", path.replace('\\', "/"));
+                match Image::new().source(uri) {
+                    Ok(img) => View::from(
+                        img.width(26.0)
+                            .height(26.0)
+                            .vertical_alignment(VerticalAlignment::Center),
+                    ),
+                    Err(_) => View::from(TextBlock::new().text("").font_size(1.0)),
+                }
+            }
+            None => View::from(TextBlock::new().text("").font_size(1.0)),
+        };
+
         let title_block = StackPanel::new()
             .grid_row(0)
             .grid_column(0)
             .grid_column_span(2)
-            .spacing(2.0)
+            .orientation(Orientation::Horizontal)
+            .spacing(12.0)
             .children((
-            TextBlock::new()
-                .text("ASMR 日语语音 → 中文翻译")
-                .font_size(28.0)
-                .font_weight(FontWeight::SEMI_BOLD)
-                .foreground(Color::rgb(0xee, 0xf3, 0xfb)),
-        ));
+                logo,
+                StackPanel::new().spacing(2.0).children((
+                    TextBlock::new()
+                        .text("ASMR 日语语音 → 中文翻译")
+                        .font_size(26.0)
+                        .font_weight(FontWeight::SEMI_BOLD)
+                        .foreground(INK),
+                    // 副标题：把「本地 / 离线 / 版本」一次说完，标题区不至于空荡。
+                    // 版本号从 config 取，不在这里再写一遍字面量。
+                    TextBlock::new()
+                        .text(format!("本地转写 · 离线翻译 · v{}", config::APP_VERSION))
+                        .font_size(12.0)
+                        .foreground(INK2),
+                )),
+            ));
 
         // ── 卡片 1：环境 ──
         let copy_check = CheckBox::new()
@@ -2553,63 +2777,81 @@ impl Component for AppUi {
             "环境",
             StackPanel::new()
                 .orientation(Orientation::Horizontal)
-                .spacing(56.0)
+                .spacing(72.0)
                 .children((
-                    // 左列：路径信息
-                    StackPanel::new().spacing(10.0).children((
+                    // 左列：路径信息 + 两个勾选项（原稿勾选项在左列最下方）
+                    //   width 是必须的：不给宽度时这一列只占内容宽度，
+                    //   右列会被顶到左边，两列就挤成一条（原稿是左右近乎对半）。
+                    StackPanel::new()
+                        .width(520.0)
+                        .spacing(12.0)
+                        .children((
                         field("工作目录", config::work_dir()),
-                        // 输出目录这里不用 field() —— 因为要让它和「更改…」
-                        // 按钮在同一行。
-                        //
-                        // 原来写的是 field("输出目录", ...) 再并排一个按钮，
-                        // 结果按钮跑到【标签】那一行的右边、和下面的路径对不齐，
-                        // 看起来像是浮在中间（用户指出的）。
-                        // 现在是「标签在上 / 路径+按钮在下」，两行都左对齐。
+                        // 输出目录：标签在上，值 + 「更改…」在下，两行左对齐
                         StackPanel::new().spacing(2.0).children((
-                            TextBlock::new().text("输出目录").font_size(11.0).foreground(Color::rgb(0xa3, 0xb2, 0xcd)),
+                            TextBlock::new().text("输出目录").font_size(11.0).foreground(INK2),
                             StackPanel::new()
                                 .orientation(Orientation::Horizontal)
                                 .spacing(8.0)
                                 .children((
-                                    TextBlock::new().text(&out_dir).font_size(14.0).foreground(Color::rgb(0xee, 0xf3, 0xfb)),
+                                    TextBlock::new().text(&out_dir).font_size(14.0).foreground(INK),
                                     out_dir_action,
                                 )),
                         )),
+                        StackPanel::new().spacing(6.0).children((copy_check, force_check)),
                     )),
-                    // 右列：设备与选项
-                    StackPanel::new().spacing(10.0).children((
-                        field("设备状态", &self.device_status),
-                        // 运行模式三选一（v1.20）。
-                        // 不满足条件的模式禁用，并在括号里写明原因。
-                        StackPanel::new().spacing(2.0).children((
-                            RadioButton::new()
-                                .group_name("run_mode")
-                                .is_checked(self.mode == pipeline::RunMode::Full)
-                                .is_enabled(self.mode_full_ok)
-                                .on_checked(context.callback(|_| Msg::SetModeFull))
-                                .content(if self.mode_full_ok {
-                                    "全量模式（N 卡显存 ≥ 8 GB）"
-                                } else {
-                                    "全量模式（不满足：需要 N 卡显存 ≥ 8 GB）"
-                                }),
-                            RadioButton::new()
-                                .group_name("run_mode")
-                                .is_checked(self.mode == pipeline::RunMode::Lite)
-                                .is_enabled(self.mode_lite_ok)
-                                .on_checked(context.callback(|_| Msg::SetModeLite))
-                                .content(if self.mode_lite_ok {
-                                    "精简模式（N 卡显存 ≥ 6 GB）"
-                                } else {
-                                    "精简模式（不满足：需要 N 卡显存 ≥ 6 GB）"
-                                }),
-                            RadioButton::new()
-                                .group_name("run_mode")
-                                .is_checked(self.mode == pipeline::RunMode::Compat)
-                                .on_checked(context.callback(|_| Msg::SetModeCompat))
-                                .content("兼容模式（N 卡显存低于 6GB / 非 N 独立显卡 / 核显）"),
+                    // 右列：设备状态 + 处理模式（横排胶囊）
+                    StackPanel::new().spacing(12.0).children((
+                        // 设备状态：标签在上，(绿点 + 文本) 在下 —— 原稿就是这样
+                        StackPanel::new().spacing(3.0).children((
+                            TextBlock::new().text("设备状态").font_size(11.0).foreground(INK2),
+                            StackPanel::new()
+                                .orientation(Orientation::Horizontal)
+                                .spacing(6.0)
+                                .children((
+                                    Border::new()
+                                        .width(8.0)
+                                        .height(8.0)
+                                        .corner_radius(4.0)
+                                        .background(OK_GREEN)
+                                        .vertical_alignment(VerticalAlignment::Center)
+                                        .content(TextBlock::new().text("").font_size(1.0)),
+                                    TextBlock::new()
+                                        .text(&self.device_status)
+                                        .font_size(14.0)
+                                        .foreground(INK),
+                                )),
                         )),
-                        copy_check,
-                        force_check,
+                        StackPanel::new().spacing(8.0).children((
+                            TextBlock::new().text("处理模式").font_size(11.0).foreground(INK2),
+                            StackPanel::new()
+                                .orientation(Orientation::Horizontal)
+                                .spacing(8.0)
+                                .children((
+                                    mode_chip(
+                                        "全量模式",
+                                        self.mode == pipeline::RunMode::Full,
+                                        self.mode_full_ok,
+                                        context.message(Msg::SetModeFull),
+                                    ),
+                                    mode_chip(
+                                        "精简模式",
+                                        self.mode == pipeline::RunMode::Lite,
+                                        self.mode_lite_ok,
+                                        context.message(Msg::SetModeLite),
+                                    ),
+                                    mode_chip(
+                                        "兼容模式",
+                                        self.mode == pipeline::RunMode::Compat,
+                                        true,
+                                        context.message(Msg::SetModeCompat),
+                                    ),
+                                )),
+                            TextBlock::new()
+                                .text("全量模式需 N 卡显存 ≥ 8 GB；精简模式 ≥ 6 GB；兼容模式用于低于 6 GB / 非 N 独立显卡 / 核显")
+                                .font_size(11.0)
+                                .foreground(INK3),
+                        )),
                     )),
                 )),
         1, 0, 1, 2,
@@ -2621,15 +2863,29 @@ impl Component for AppUi {
         let file_items: Vec<(String, View)> = self
             .files
             .iter()
-            .map(|f| {
+            .enumerate()
+            .map(|(i, f)| {
                 let done = Self::has_subtitle(f);
-                let tb = TextBlock::new().text(f.clone());
+                let tb = TextBlock::new().text(f.clone()).font_size(13.0);
                 let tb = if done {
-                    tb.foreground(Color::rgb(0x8f, 0xd1, 0x8f))
+                    tb.foreground(OK_GREEN)
                 } else {
                     tb
                 };
-                (f.clone(), tb.into())
+                // 序号列：原稿每行前面有一个右对齐的编号（1 / 2 / 56 …），
+                // 固定宽度是为了让文件名的左边缘对齐。
+                let row = StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(10.0)
+                    .children((
+                        TextBlock::new()
+                            .text(format!("{}", i + 1))
+                            .font_size(12.0)
+                            .foreground(INK3)
+                            .width(28.0),
+                        tb,
+                    ));
+                (f.clone(), row.into())
             })
             .collect();
 
@@ -2669,8 +2925,9 @@ impl Component for AppUi {
                 )),
         ));
 
-        let files_card = card(
-            &format!("文件列表（{}）", self.files.len()),
+        let files_card = card_x(
+            "文件列表",
+            count_pill(&self.files.len().to_string()),
             StackPanel::new().spacing(10.0).children((
                 list_area,
                 file_buttons,
@@ -2833,17 +3090,39 @@ impl Component for AppUi {
                             field("总进度", &format!("{:.0}%", self.progress_value)),
                         )),
                     )),
-                ProgressBar::new()
-                    .minimum(0.0)
-                    .maximum(100.0)
-                    .value(self.progress_value)
-                    .width(420.0),
+                // ── 进度条：手搓，不用 ProgressBar ──
+                //
+                // 为什么不用 ProgressBar：reactor 的 ProgressBar 只有
+                // minimum/maximum/value，颜色走系统 accent（WinUI 的蓝），
+                // 而 resource_overrides 只挂在 Button 上，改不了它的前景。
+                // 这条进度条是整页唯一的「进行中」信号，必须是赤陶橙，
+                // 所以用两层 Border 自己画：轨道 + 按百分比算宽度的填充。
+                {
+                    let bar_w = 460.0_f64;
+                    let fill_w = (bar_w * (self.progress_value / 100.0)).clamp(0.5, bar_w);
+                    View::from(
+                        Border::new()
+                            .width(bar_w)
+                            .height(8.0)
+                            .corner_radius(4.0)
+                            .background(Color::rgb(0xe8, 0xe2, 0xd5))
+                            .content(
+                                Border::new()
+                                    .width(fill_w)
+                                    .height(8.0)
+                                    .corner_radius(4.0)
+                                    .background(ACCENT)
+                                    .horizontal_alignment(HorizontalAlignment::Left)
+                                    .content(TextBlock::new().text("").font_size(1.0)),
+                            ),
+                    )
+                },
                 field("当前动作", &live_txt),
                 TextBlock::new()
                     .text(queue_txt)
                     .font_size(12.0)
-                    .foreground(Color::rgb(0x9d, 0xb4, 0xd6)),
-                TextBlock::new().text(hint_txt).font_size(12.0).foreground(Color::rgb(0x7e, 0x90, 0xb2)),
+                    .foreground(INK3),
+                TextBlock::new().text(hint_txt).font_size(12.0).foreground(INK3),
             )),
         3, 1, 1, 1,
         );
@@ -2872,13 +3151,13 @@ impl Component for AppUi {
         let preview_card = card(
             "实时翻译预览",
             inner_box(StackPanel::new().spacing(2.0).children((
-                TextBlock::new().text(pv[0].clone()).font_size(13.0).foreground(Color::rgb(0xee, 0xf3, 0xfb)),
-                TextBlock::new().text(pv[1].clone()).font_size(13.0).foreground(Color::rgb(0xee, 0xf3, 0xfb)),
-                TextBlock::new().text(pv[2].clone()).font_size(13.0).foreground(Color::rgb(0xee, 0xf3, 0xfb)),
-                TextBlock::new().text(pv[3].clone()).font_size(13.0).foreground(Color::rgb(0xee, 0xf3, 0xfb)),
-                TextBlock::new().text(pv[4].clone()).font_size(13.0).foreground(Color::rgb(0xee, 0xf3, 0xfb)),
-                TextBlock::new().text(pv[5].clone()).font_size(13.0).foreground(Color::rgb(0xee, 0xf3, 0xfb)),
-                TextBlock::new().text(pv_tail).font_size(11.0).foreground(Color::rgb(0x7e, 0x90, 0xb2)),
+                TextBlock::new().text(pv[0].clone()).font_size(13.0).foreground(INK),
+                TextBlock::new().text(pv[1].clone()).font_size(13.0).foreground(INK),
+                TextBlock::new().text(pv[2].clone()).font_size(13.0).foreground(INK),
+                TextBlock::new().text(pv[3].clone()).font_size(13.0).foreground(INK),
+                TextBlock::new().text(pv[4].clone()).font_size(13.0).foreground(INK),
+                TextBlock::new().text(pv[5].clone()).font_size(13.0).foreground(INK),
+                TextBlock::new().text(pv_tail).font_size(11.0).foreground(INK3),
             ))),
         2, 1, 1, 1,
         );
@@ -2896,14 +3175,17 @@ impl Component for AppUi {
             slots.push(String::new());
         }
         let hidden = total.saturating_sub(LOG_SLOTS);
-        let tail = if hidden > 0 {
-            format!("…（只显示最近 {LOG_SLOTS} 行，另有 {hidden} 行未显示）")
+        // 原来这里还有一行 tail（"…只显示最近 N 行，另有 M 行未显示"），
+        // 但它是个独立的 TextBlock，即使内容为空也照样占一行高度 ——
+        // 日志卡本来就差一行放不下，宁可把这句话挪进卡片标题。
+        let log_title = if hidden > 0 {
+            format!("运行日志　·　另有 {hidden} 行，可导出查看")
         } else {
-            String::new()
+            "运行日志".to_string()
         };
 
         let logs_card = card(
-            "运行日志",
+            &log_title,
             StackPanel::new().spacing(6.0).children((
                 // 日志区只有固定几个槽位，翻不上去。加个导出按钮，
                 // 把内存里的完整日志（最多 LOG_KEEP 行）写成文件，
@@ -2912,13 +3194,15 @@ impl Component for AppUi {
                     .on_click(context.message(Msg::ExportLog))
                     .content("导出完整日志"),
                 inner_box(StackPanel::new().spacing(2.0).children((
-                    TextBlock::new().text(slots[0].clone()).font_size(12.0).foreground(Color::rgb(0xa3, 0xb2, 0xcd)),
-                    TextBlock::new().text(slots[1].clone()).font_size(12.0).foreground(Color::rgb(0xa3, 0xb2, 0xcd)),
-                    TextBlock::new().text(slots[2].clone()).font_size(12.0).foreground(Color::rgb(0xa3, 0xb2, 0xcd)),
-                    TextBlock::new().text(slots[3].clone()).font_size(12.0).foreground(Color::rgb(0xa3, 0xb2, 0xcd)),
-                    TextBlock::new().text(slots[4].clone()).font_size(12.0).foreground(Color::rgb(0xa3, 0xb2, 0xcd)),
-                    TextBlock::new().text(slots[5].clone()).font_size(12.0).foreground(Color::rgb(0xa3, 0xb2, 0xcd)),
-                    TextBlock::new().text(tail).font_size(11.0).foreground(Color::rgb(0x7e, 0x90, 0xb2)),
+                    TextBlock::new().text(slots[0].clone()).font_size(12.0).foreground(INK2),
+                    TextBlock::new().text(slots[1].clone()).font_size(12.0).foreground(INK2),
+                    TextBlock::new().text(slots[2].clone()).font_size(12.0).foreground(INK2),
+                    TextBlock::new().text(slots[3].clone()).font_size(12.0).foreground(INK2),
+                    TextBlock::new().text(slots[4].clone()).font_size(12.0).foreground(INK2),
+                    // 注意：这里的槽位下标是【写死的】，数量和 LOG_SLOTS 必须一致。
+                    //   刚从 6 改成 5 时忘了删掉第 6 个，程序一启动就
+                    //   `index out of bounds: the len is 5 but the index is 5`
+                    //   直接 panic 退出 —— 改槽位数时先回来核对这里。
                 ))),
             )),
         3, 0, 1, 1,
@@ -2946,60 +3230,38 @@ impl Component for AppUi {
                 //
                 //   ⚠ 必须在 .content() 【之前】调：content() 返回 View，
                 //     而 resource_overrides 在具体控件上（同 grid_row 的道理）。
-                Button::new()
-                    .resource_overrides(
-                        ResourceOverrides::new()
-                            // 正常态：和卡片同色，alpha 130
-                            .set("ButtonBackground", Color::argb(70, 218, 234, 250))
-                            // 悬停：亮一点，让用户知道能点
-                            .set(
-                                "ButtonBackgroundPointerOver",
-                                Color::argb(115, 228, 242, 255),
-                            )
-                            // 按下：再亮一档
-                            .set(
-                                "ButtonBackgroundPressed",
-                                Color::argb(150, 238, 248, 255),
-                            )
-                            // 文字用深色 —— 浅色玻璃上白字看不清
-                            .set("ButtonForeground", Color::rgb(0xee, 0xf3, 0xfb)),
-                    )
-                    .on_click(context.message(Msg::Start))
-                    .content(if self.running { "处理中…" } else { "开始处理  ➜" }),
-                Button::new()
-                    .resource_overrides(
-                        ResourceOverrides::new()
-                            .set("ButtonBackground", Color::argb(70, 218, 234, 250))
-                            .set(
-                                "ButtonBackgroundPointerOver",
-                                Color::argb(115, 228, 242, 255),
-                            )
-                            .set(
-                                "ButtonBackgroundPressed",
-                                Color::argb(150, 238, 248, 255),
-                            )
-                            .set("ButtonForeground", Color::rgb(0xee, 0xf3, 0xfb)),
-                    )
-                    .on_click(context.message(Msg::Stop))
-                    .content("停止"),
+                // 主操作：赤陶橙实心 + 白字 + 前置小圆点；处理中变弱色并禁用。
+                //   颜色在调用处决定，不走 WinUI 的 disabled 视觉（见 pill_button 注释）。
+                pill_button(
+                    if self.running { "处理中…" } else { "开始处理  ➜" },
+                    true,
+                    if self.running { SUNK } else { ACCENT_DEEP },
+                    if self.running { SUNK } else { ACCENT_DEEP },
+                    if self.running { INK3 } else { Color::rgb(0xff, 0xff, 0xff) },
+                    !self.running,
+                    context.message(Msg::Start),
+                ),
+                // 停止：浅橙底 + 深橙字，和主操作同一色系但明显更弱
+                pill_button(
+                    "停止",
+                    false,
+                    SUNK,
+                    CARD_LINE,
+                    ACCENT_INK,
+                    true,
+                    context.message(Msg::Stop),
+                ),
                 // 暂停 / 继续（v1.20）。暂停用 SuspendThread 挂起子进程，
                 // 进度和计时都冻结；点「继续」恢复。
-                Button::new()
-                    .resource_overrides(
-                        ResourceOverrides::new()
-                            .set("ButtonBackground", Color::argb(70, 218, 234, 250))
-                            .set(
-                                "ButtonBackgroundPointerOver",
-                                Color::argb(115, 228, 242, 255),
-                            )
-                            .set(
-                                "ButtonBackgroundPressed",
-                                Color::argb(150, 238, 248, 255),
-                            )
-                            .set("ButtonForeground", Color::rgb(0xee, 0xf3, 0xfb)),
-                    )
-                    .on_click(context.message(Msg::TogglePause))
-                    .content(if self.paused { "继续  ▶" } else { "暂停  ❚❚" }),
+                pill_button(
+                    if self.paused { "继续  ▶" } else { "暂停  ❚❚" },
+                    false,
+                    CARD,
+                    CARD_LINE,
+                    INK2,
+                    true,
+                    context.message(Msg::TogglePause),
+                ),
             ));
 
         // 布局历史：这里原来用横向 StackPanel 做两栏。
@@ -3035,8 +3297,8 @@ impl Component for AppUi {
                 GridLength::STAR,
             ])
             .columns([GridLength::STAR, GridLength::STAR])
-            .row_spacing(8.0)
-            .column_spacing(8.0)
+            .row_spacing(12.0)
+            .column_spacing(12.0)
             .children((title_block, env_card, files_card, preview_card, logs_card, progress_card));
 
         // ── 拖放 ──
@@ -3161,7 +3423,7 @@ impl Component for AppUi {
                     TextBlock::new()
                         .text("（已删除的源文件会自动跳过）")
                         .font_size(13.0)
-                        .foreground(Color::rgb(0x7e, 0x90, 0xb2)),
+                        .foreground(INK3),
                 )),
             );
 
@@ -3210,7 +3472,7 @@ impl Component for AppUi {
                     TextBlock::new()
                         .text(cpu_reason)
                         .font_size(14.0)
-                        .foreground(Color::rgb(0xff, 0xc9, 0x8a)),
+                        .foreground(WARN),
                     TextBlock::new().text("").font_size(4.0),
                     TextBlock::new()
                         .text("· 人声分离需要约 2.5 GB 显存，装不下就跑不了 GPU 版")
@@ -3231,7 +3493,7 @@ impl Component for AppUi {
                     TextBlock::new()
                         .text("→ 添加本程序 → 首选图形处理器选「高性能 NVIDIA 处理器」")
                         .font_size(13.0)
-                        .foreground(Color::rgb(0x7e, 0x90, 0xb2)),
+                        .foreground(INK3),
                 )),
             );
 
@@ -3286,7 +3548,8 @@ impl Component for AppUi {
         //   代价由卡片自己扛：底板没了之后卡片直接坐在壁纸上，所以把卡片
         //   alpha 从 75 提到 110（约 43% 不透明），靠卡片自身压住壁纸干扰。
         Border::new()
-            .padding(14.0)
+            .background(BG)
+            .padding(18.0)
             .drop_policy(drop_policy)
             .on_drop(context.callback(Msg::Dropped))
             .content(root)

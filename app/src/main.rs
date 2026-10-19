@@ -61,7 +61,8 @@ mod center_hook {
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows_sys::Win32::Graphics::Dwm::{
         DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_COLOR_NONE,
-        DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_TEXT_COLOR,         DWMWA_USE_IMMERSIVE_DARK_MODE, DWMSBT_TRANSIENTWINDOW,
+        DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_TEXT_COLOR,         DWMWA_USE_IMMERSIVE_DARK_MODE,
+        DWMSBT_MAINWINDOW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, GetSystemMetrics, GetWindowRect, GetWindowTextLengthW, SetWindowPos,
@@ -137,22 +138,30 @@ mod center_hook {
             //
             //   备选：DWMSBT_MAINWINDOW(2) 是 Mica，更"实"、颗粒感弱，
             //   如果 Acrylic 显得太糊可以换过去。
+            //
+            // 【2026-10-20 第三次改：深色玻璃 → 浅色纸面】
+            //   UI 换成 Claude 暖色纸面后，标题栏就不能再是深蓝磨砂了：
+            //   一深一浅，两块拼在一起像没渲染完。
+            //   现在整窗走浅色 —— 材质用 Mica（和 ui.rs 的 backdrop 对上），
+            //   并强制关掉沉浸式深色，标题文字改成墨色。
             set(hwnd, DWMWA_CAPTION_COLOR, DWMWA_COLOR_NONE);
-            set(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_TRANSIENTWINDOW as u32);
+            set(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_MAINWINDOW as u32);
 
             // 注：试过 DWMWA_USE_HOSTBACKDROPBRUSH 让标题栏借用宿主背景刷，
             // 但客户区现在已经没有底板了（整窗统一 Acrylic），
             // 两边是同一个背景源，不再需要这个开关。
 
-            // 沉浸式深色模式仍要开：不开的话标题栏的文字和按钮是深色，
-            // 压在浅色磨砂玻璃上很难看。
-            set(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, 1);
+            // 【关键】0 = 浅色标题栏。
+            //   这里原来是 1（深色），是为了让标题文字在深蓝玻璃上发白；
+            //   现在底板是浅米色，再开深色就会在浅色客户区顶上盖一块深灰，
+            //   而且系统还会把标题栏文字刷成白色 —— 白字压浅底根本看不清。
+            set(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, 0);
 
-            // 标题文字保持浅白 #EEF3FB，在磨砂玻璃上清楚
-            set(hwnd, DWMWA_TEXT_COLOR, 0x00FBF3EE);
+            // 标题文字改成墨色 #2B2621（COLORREF 是 0x00BBGGRR，倒着写）
+            set(hwnd, DWMWA_TEXT_COLOR, 0x0021262B);
 
-            // 窗口边框留一条亮蓝 #3A5A8C，让窗口边缘不糊在壁纸上
-            set(hwnd, DWMWA_BORDER_COLOR, 0x008C5A3A);
+            // 窗口边框留一条淡灰 #E5DFD2，让窗口边缘不糊在浅色壁纸上
+            set(hwnd, DWMWA_BORDER_COLOR, 0x00D2DFE5);
     }
 
     /// 把窗口摆到主显示器正中。

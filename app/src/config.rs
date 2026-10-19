@@ -674,12 +674,42 @@ pub fn python_exe() -> String {
 ///     不再只是数文件个数。磁盘满产生的半截文件会被识别出来并挪到
 ///     ！audio\_corrupted\。
 ///   · 第3步单文件失败不再中止整批，跳过并继续，最后汇总。
-pub const APP_VERSION: &str = "1.22.2";
+/// 1.23 相对 1.22 的变化：
+///   · 界面换成浅色暖色纸面（Claude 风）：米色底 #f0eee6、纸白卡片
+///     #faf9f5、赤陶橙 #c96442 强调。原来的深色冰川蓝玻璃 + Acrylic
+///     全部撤掉 —— 底色不再跟着桌面壁纸走，长文本对比度也上去了。
+///   · 颜色集中到 ui.rs 顶部的色板常量，view 里不再写死 RGB。
+///   · 进度条改手绘（轨道 + 填充两层 Border），不再用系统 accent 蓝。
+///   · 标题区加副标题（本地转写 · 离线翻译 · 版本号）。
+///   · 功能与流程零改动：四个步骤、三种模式、暂停/继续、拖放、
+///     文件队列、日志导出全部保持原样。
+pub const APP_VERSION: &str = "1.23.0";
 
 /// 窗口标题
 pub fn app_title() -> String {
     format!("ASMR 日语语音 → 中文翻译  v{APP_VERSION}")
 }
+
+/// 界面左上角那个小 logo 的路径（exe 同目录下的 assets\icon.png）。
+///
+/// 找不到就返回 None —— 调用方会退回到「不画图标」，
+/// 而不是让整个窗口起不来（源码目录里跑的时候本来就没有 assets）。
+pub fn icon_path() -> Option<String> {
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    for cand in [
+        dir.join("assets").join("icon.png"),
+        dir.join("assets").join("icon.ico"),
+        // 有些打包方式把资源直接摊在 exe 旁边，也认一下。
+        dir.join("icon.png"),
+        dir.join("icon.ico"),
+    ] {
+        if cand.is_file() {
+            return Some(cand.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
 
 /// 支持的音视频扩展名（和 Python 版的 VIDEO_AUDIO_EXTS 保持一致）
 pub const VIDEO_AUDIO_EXTS: [&str; 5] = [".mp4", ".mkv", ".flac", ".wav", ".mp3"];
