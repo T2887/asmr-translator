@@ -138,7 +138,12 @@ pub fn detect_vulkan_devices() -> Vec<String> {
     devices
 }
 
-/// 检测这台机器能不能用 CUDA。返回 (给人看的显示文本, 是不是 GPU, 显存 GB, 有没有 Vulkan)。
+/// 检测这台机器能不能用 CUDA。
+///
+/// 返回 (显示文本, 是不是 GPU, 显存 GB, 有没有 Vulkan, 设备型号, 是不是走 CUDA)。
+///
+/// 最后两项是给副标题用的：兼容模式下第一个字段被压成「兼容模式」四个字，
+/// 型号已经不在里面了，从字符串里再抠是抠不出来的。
 ///
 /// 对应 Python 版的 _detect_device。它跑一小段 Python 去问 torch，
 /// 因为「有没有 CUDA」只有装在这些脚本用的那个环境里才问得准 ——
@@ -153,7 +158,7 @@ pub fn detect_vulkan_devices() -> Vec<String> {
 ///   · CUDA 但显存 < 6 GB        → 兼容模式
 ///   · 没有 CUDA 但有 Vulkan     → 兼容模式（走 llama.cpp）
 ///   · 什么都没有                → 兼容模式（纯 CPU）
-pub fn detect_device() -> (String, bool, f64, bool) {
+pub fn detect_device() -> (String, bool, f64, bool, String, bool) {
     // 这段 Python 的缩进是语法的一部分，改的时候注意别动前面的空格。
     // 最外层不能有缩进。
     let code = r#"
@@ -197,7 +202,8 @@ except Exception:
             } else {
                 format!("GPU：{name}（已启用 CUDA）")
             };
-            (text, true, vram, has_vulkan)
+            let uses_cuda = !(vram > 0.0 && vram < 6.0) && !name.is_empty();
+            (text, true, vram, has_vulkan, name.to_string(), uses_cuda)
         }
         // 没有 CUDA：不再说「CPU 慢 50 倍」，而是走兼容模式。
         Ok(s) if s == "CPU" => {
@@ -205,11 +211,20 @@ except Exception:
             //   原来写的是「兼容模式（Vulkan：NVIDIA GeForce RTX 5070）」
             //   这种带型号的长句 —— 型号在副标题里，状态栏只需说明
             //   "现在用的是哪个模式"。
-            let _ = &vulkan;
             let text = "兼容模式".to_string();
-            (text, false, 0.0, has_vulkan)
+            // 兼容模式副标题要写「<显卡/核显型号> Vulkan 加速中」，
+            // 型号从显示适配器枚举里拿；纯 CPU 就留空，副标题不显示这段。
+            let name = if has_vulkan { vulkan.join(" / ") } else { String::new() };
+            (text, false, 0.0, has_vulkan, name, false)
         }
-        Ok(other) => (format!("未知（检测失败：{other}）"), false, 0.0, has_vulkan),
+        Ok(other) => (
+            format!("未知（检测失败：{other}）"),
+            false,
+            0.0,
+            has_vulkan,
+            String::new(),
+            false,
+        ),
         Err(e) => {
             // 常见情况：解释器路径不对、torch 没装。
             // 截断一下，别让一整条 traceback 把状态栏撑爆。
@@ -217,7 +232,7 @@ except Exception:
             if msg.chars().count() > 80 {
                 msg = msg.chars().take(80).collect::<String>() + "…";
             }
-            (format!("未知（{msg}）"), false, 0.0, has_vulkan)
+            (format!("未知（{msg}）"), false, 0.0, has_vulkan, String::new(), false)
         }
     }
 }

@@ -72,7 +72,7 @@ pub enum Msg {
     /// 用户从资源管理器拖了东西进来
     Dropped(DroppedData),
     /// 设备检测完成，payload 是给界面直接显示的文本
-    DeviceDetected(String, bool, f64, bool),
+    DeviceDetected(String, bool, f64, bool, String, bool),
     /// 切换运行模式
     SetModeFull,
     SetModeLite,
@@ -190,6 +190,10 @@ pub struct AppUi {
     /// 设备状态显示文本。初值是「检测中…」，
     /// 后台问完 torch 之后由 Msg::DeviceDetected 换成真实结果。
     device_status: String,
+    /// 显卡/核显型号原文（给副标题用）。空串表示没测出来。
+    device_name: String,
+    /// 当前是不是在走 CUDA。false 时副标题写 Vulkan（有 Vulkan 的话）。
+    uses_cuda: bool,
     /// 本机有没有可用的 CUDA。detect_device() 检测完置位。
     ///
     /// 用途：没有 N 卡时会回退到 CPU，而 CPU 跑人声分离要慢 30~100 倍
@@ -1280,27 +1284,39 @@ const WARN: Color = Color::rgb(0xa4, 0x44, 0x2c); // 警告文字
 ///
 /// 后面四个参数是它在父 Grid 里的位置 —— 必须在 `.children()` 【之前】
 /// 调 grid_row 之类：children() 返回的是 View，而 GridChildExt 只实现给
-/// 从设备描述里抠出显卡短名。
+/// 把设备全名压成短名，给副标题用。
 ///
-///   "兼容模式（Vulkan: NVIDIA GeForce RTX 5070）" → "RTX 5070"
-///   检测中（"检测中…"）或纯 CPU 时返回 None，调用处就不显示这一段。
-fn gpu_short_name(status: &str) -> Option<&str> {
-    for tag in ["RTX", "GTX", "Arc ", "Radeon"] {
-        if let Some(pos) = status.find(tag) {
-            let rest = &status[pos..];
-            // ★ 截断点必须包含【左】括号。
-            //   原来只找右括号：状态是 "GPU：NVIDIA GeForce RTX 5070（已启用
-            //   CUDA）" 时，rest 从 "RTX" 开始、截到 "）" 之前，得到的却是
-            //   "RTX 5070（已启用 CUDA" —— 整段括号内容被当成显卡名塞进副标题，
-            //   副标题于是变成 "RTX 5070（已启用 CUDA 加速"，少了个右括号
-            //   （用户截图圈出来问过）。
-            let end = rest
-                .find(|c| matches!(c, '（' | '(' | '）' | ')' | '，' | ','))
-                .unwrap_or(rest.len());
-            return Some(rest[..end].trim());
+///   "NVIDIA GeForce RTX 5070"      → "RTX 5070"
+///   "Intel(R) UHD Graphics 630"    → "UHD Graphics 630"
+///   "AMD Radeon RX 7900 XTX"       → "Radeon RX 7900 XTX"
+///   "NVIDIA GeForce RTX 5070（…）" → "RTX 5070"
+///
+/// 只做"去厂商前缀 + 截掉括号说明"两件事，不动型号本身 —— 型号随设备变，
+/// 任何写死的映射表都迟早对不上。核显（Intel / AMD 集显）走同一条路，
+/// 不再像以前那样只认 RTX/GTX/Arc/Radeon，认不出就整段消失。
+fn short_device(name: &str) -> &str {
+    let mut s = name.trim();
+    // 前缀可能叠着（"AMD Radeon ..." 先剥 AMD 再剥 Radeon 也行），循环剥。
+    for prefix in [
+        "NVIDIA GeForce ",
+        "NVIDIA ",
+        "AMD Radeon ",
+        "AMD ",
+        "Intel(R) ",
+        "Intel ",
+    ] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest.trim();
         }
     }
-    None
+    // 只认【全角】括号和逗号。
+    //   半角括号在型号里是有的："Intel(R) Iris(R) Xe Graphics" —— 若把半角
+    //   括号也当分隔符，型号会被切成 "Iris"，后半截没了（实测踩到）。
+    //   中文界面里追加的说明（"（已启用 CUDA）"）一律是全角，够用。
+    let end = s
+        .find(|c| matches!(c, '（' | '）' | '，'))
+        .unwrap_or(s.len());
+    s[..end].trim()
 }
 
 /// 具体控件（Border/StackPanel/...），View 上没有这些方法（E0599）。
@@ -1684,8 +1700,8 @@ impl Component for AppUi {
         // 后台问一次 CUDA。torch 首次导入要 2~3 秒，不能卡在界面线程里，
         // 所以走 spawn_background，回来时发 Msg::DeviceDetected。
         context.spawn_background(|_token| {
-            let (text, is_gpu, vram, has_vulkan) = pipeline::detect_device();
-            Msg::DeviceDetected(text, is_gpu, vram, has_vulkan)
+            let (text, is_gpu, vram, has_vulkan, name, uses_cuda) = pipeline::detect_device();
+            Msg::DeviceDetected(text, is_gpu, vram, has_vulkan, name, uses_cuda)
         });
 
         // 窗口居中的逻辑【不在这里】。
@@ -1760,6 +1776,8 @@ impl Component for AppUi {
             copy_to_video: std::env::var("ASMR_NO_COPY").is_err(),
             force_redo: false,
             device_status: "检测中…".to_string(),
+            device_name: String::new(),
+            uses_cuda: false,
             has_gpu: true,
             has_vulkan: false,
             mode: pipeline::RunMode::Full,
@@ -2239,8 +2257,10 @@ impl Component for AppUi {
                 });
             }
 
-            Msg::DeviceDetected(text, is_gpu, vram_gb, has_vulkan) => {
+            Msg::DeviceDetected(text, is_gpu, vram_gb, has_vulkan, name, uses_cuda) => {
                 self.device_status = text;
+                self.device_name = name;
+                self.uses_cuda = uses_cuda;
                 self.has_gpu = is_gpu;
                 self.vram_gb = vram_gb;
                 self.has_vulkan = has_vulkan;
@@ -2857,8 +2877,21 @@ impl Component for AppUi {
         let subtitle = {
             let total = self.files.len();
             let mut parts: Vec<String> = vec!["本地转写".to_string(), "离线翻译".to_string()];
-            if let Some(gpu) = gpu_short_name(&self.device_status) {
-                parts.push(format!("{gpu} 加速"));
+            // 加速这一段：型号 + 后端，两者都齐了才写。
+            //   CUDA     → "RTX 5070 CUDA 加速中"
+            //   兼容模式 → "UHD Graphics 630 Vulkan 加速中"
+            //   纯 CPU   → 这段整个不出现
+            if !self.device_name.is_empty() {
+                let accel = if self.uses_cuda {
+                    "CUDA"
+                } else if self.has_vulkan {
+                    "Vulkan"
+                } else {
+                    ""
+                };
+                if !accel.is_empty() {
+                    parts.push(format!("{} {accel} 加速中", short_device(&self.device_name)));
+                }
             }
             if total > 0 {
                 let idx = if self.running {
@@ -3934,5 +3967,30 @@ impl Component for AppUi {
             .drop_policy(drop_policy)
             .on_drop(context.callback(Msg::Dropped))
             .content(root)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::short_device;
+
+    #[test]
+    fn 独显卡型号只保留短名() {
+        assert_eq!(short_device("NVIDIA GeForce RTX 5070"), "RTX 5070");
+        assert_eq!(short_device("NVIDIA GeForce RTX 3060 Laptop GPU"), "RTX 3060 Laptop GPU");
+        assert_eq!(short_device("AMD Radeon RX 7900 XTX"), "RX 7900 XTX");
+    }
+
+    #[test]
+    fn 核显型号也能取到() {
+        // 兼容模式可能落到核显上，以前只认 RTX/GTX/Arc/Radeon，Intel 会被整段丢掉。
+        assert_eq!(short_device("Intel(R) UHD Graphics 630"), "UHD Graphics 630");
+        assert_eq!(short_device("Intel(R) Iris(R) Xe Graphics"), "Iris(R) Xe Graphics");
+    }
+
+    #[test]
+    fn 带括号说明的会被截断() {
+        assert_eq!(short_device("NVIDIA GeForce RTX 5070（已启用 CUDA）"), "RTX 5070");
+        assert_eq!(short_device("   "), "");
     }
 }
