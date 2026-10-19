@@ -59,6 +59,8 @@ pub enum Msg {
     RemoveSelected,
     /// 点了「清空列表」
     ClearList,
+    /// 点了文件列表里的某一行（自绘列表，序号从 0 起）
+    SelectFile(usize),
     /// 勾选框变了：字幕是否直接放到视频旁边
     SetCopyToVideo(bool),
     /// 「强制重新处理」勾选框变化：勾上就要先把已有字幕删掉
@@ -1461,6 +1463,15 @@ fn pill_button(
         .content(face)
 }
 
+/// 普通小按钮：添加文件 / 更改… / 导出完整日志 这类。
+///
+/// 外形规则和底部操作键完全一致（同一个 pill_button），只是配色用中性的
+/// 卡片白 + 浅描边。原因很直接：WinUI 默认按钮是 4px 小圆角，混在胶囊
+/// 按钮中间一看就是"两套控件"，统一之后整个界面只有一种按钮形状。
+fn tap_button(label: &str, on_click: Callback<()>) -> View {
+    pill_button(label, false, CARD, CARD_LINE, INK2, true, on_click)
+}
+
 fn mode_chip(label: &str, selected: bool, enabled: bool, on_click: Callback<()>) -> View {
     // 【为什么是「Border 自绘 + 透明按钮」而不是「给 Button 上色」】
     //   一开始走的是 resource_overrides 改 ButtonBackground / ButtonBorderBrush，
@@ -2362,6 +2373,12 @@ impl Component for AppUi {
                 ));
             }
 
+            Msg::SelectFile(i) => {
+                // 再点一次同一行就取消选中 —— 列表是自绘的，没有 ListView
+                // 帮忙管选中态，这点小交互得自己实现。
+                self.selected_index = if self.selected_index == Some(i) { None } else { Some(i) };
+            }
+
             Msg::RemoveSelected => {
                 match self.selected_index {
                     Some(i) if i < self.files.len() => {
@@ -2763,9 +2780,7 @@ impl Component for AppUi {
             View::from(TextBlock::new().text("").font_size(1.0))
         } else {
             View::from(
-                Button::new()
-                    .on_click(context.message(Msg::BrowseOutputDir))
-                    .content("更改…"),
+                tap_button("更改…", context.message(Msg::BrowseOutputDir)),
             )
         };
 
@@ -2914,16 +2929,41 @@ impl Component for AppUi {
                 // 每行都套一层极薄的 Border：高亮时它是浅橙块，
                 // 不高亮时背景透明 —— 两种情况下内边距一致，
                 // 文字的左边缘才不会在高亮行和普通行之间错位。
+                // 两种"被标记"的状态，优先级：正在处理 > 选中。
+                //   正在处理用浅橙（和原稿一致），选中的行用更中性的浅灰，
+                //   这样同一屏里两种状态不会看混。
+                let is_selected = self.selected_index == Some(i);
                 let bg = if is_current {
                     ACCENT_SOFT
+                } else if is_selected {
+                    SUNK
                 } else {
                     Color::argb(0, 0, 0, 0)
                 };
-                let row = Border::new()
+                let face = Border::new()
                     .background(bg)
-                    .corner_radius(8.0)
+                    .corner_radius(7.0)
                     .padding(Thickness::xy(8.0, 2.0))
                     .content(inner);
+
+                // 每行是一个透明按钮：点击区域交给它，外观全在 face 上。
+                // 这样行高只由我们自己定的字号 + 内边距决定（26px 上下），
+                // 不再受 ListViewItem 那套 40px 起跳的容器样式摆布。
+                let row = Button::new()
+                    .resource_overrides(
+                        ResourceOverrides::new()
+                            .set("ButtonBackground", Color::argb(0, 0, 0, 0))
+                            .set("ButtonBackgroundPointerOver", Color::argb(14, 0, 0, 0))
+                            .set("ButtonBackgroundPressed", Color::argb(26, 0, 0, 0))
+                            .set("ButtonBorderThemeThickness", Thickness::uniform(0.0))
+                            .set("ButtonPadding", Thickness::uniform(0.0)),
+                    )
+                    .horizontal_content_alignment(HorizontalAlignment::Stretch)
+                    // Button 默认 MinHeight 32，会把每行撑到 48px —— 显式压到 22，
+                    // 行高才由里面的字号 + 内边距说了算（约 26px）。
+                    .min_height(22.0)
+                    .on_click(context.callback(move |_: ()| Msg::SelectFile(i)))
+                    .content(face);
 
                 (f.clone(), row.into())
             })
@@ -2932,48 +2972,59 @@ impl Component for AppUi {
         // 文件列表高度：随窗口高度变化，列表在卡片内部滚动。
         // 不限制高度的话 ListView 会无限长，把 Grid 的 STAR 行撑爆，
         // 结果就是整个界面出现外侧滚动条（用户截图反馈的问题）。
-        let list_h = ((self.window_height - 36.0) * 0.32).clamp(120.0, 620.0);
+        // 列表最多占多高：上排卡片大约是可用高度的 1/2，扣掉卡片内边距、
+        // 标题和下面那两行按钮，剩下的才是列表能用的高度。
+        //   系数给小了列表太短，给大了会把按钮顶出卡片（实测 0.32 就会）。
+        let list_h = ((self.window_height - 36.0) * 0.085).clamp(88.0, 620.0);
 
         let list_area: View = if file_items.is_empty() {
             View::from(TextBlock::new().text("（列表为空，点下面的按钮或把文件拖进来）").font_size(13.0))
         } else {
+            // 【为什么不用 ListView】
+            //   ListViewItem 自带 40px 起跳的最小高度，一屏只能放 4 行；
+            //   而且给它设 height / max_height 都压不住 —— 实测它会按内容
+            //   撑开，把下面那行按钮整个顶出卡片。ListView 上也没有
+            //   resource_overrides 去改 ListViewItemMinHeight（E0599）。
+            //   所以列表改成自绘：ScrollViewer + 每行一个透明按钮，
+            //   行高 26px 左右，一屏能放十几行，和原稿的密度对得上。
             View::from(
-                ListView::new()
-                    .selection_mode(ListViewSelectionMode::Extended)
-                    // 【行高改不动】试过给 ListView 加 resource_overrides
-                    //   把 ListViewItemMinHeight 压到 26 —— ListView 上没有
-                    //   这个方法（E0599）。所以每行还是 WinUI 默认的 40 上下
-                    //   再加我们那层 Border 的 4px，一屏大约 5~6 行。
-                    //   想更紧凑只能不用 ListView 自己画行，但那会丢掉多选、
-                    //   键盘导航和 RemoveSelected 的选中态，不划算。
-                    // 用 max_height 而不是 height：
-                    //   height 是写死的固定值，文件少的时候列表下方留一大片空白，
-                    //   文件多的时候又超出卡片被裁；max_height 让它"最多长这么高"，
-                    //   少了就贴合内容，多了才出滚动条。
-                    .max_height(list_h)
-                    .collection_slot(ListViewSlot::Items, file_items),
+                ScrollViewer::new()
+                    // 必须给【确定的】高度。
+                    //   试过 max_height：ScrollViewer 也会按内容撑开，
+                    //   六个文件就把下面那行按钮顶出卡片了。
+                    //   这个系数是按"卡片高度 - 标题 - 按钮行"倒推的经验值，
+                    //   大约能完整放下 4 行；再多的部分靠内部滚动。
+                    .height(list_h)
+                    .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                    .horizontal_scroll_bar_visibility(ScrollBarVisibility::Disabled)
+                    .content(
+                        StackPanel::new()
+                            .spacing(1.0)
+                            // 文件数是动态的，children() 只吃定长元组/数组，
+                            // 所以这里用 keyed_children —— 它接受任意迭代器，
+                            // 顺便给了每行一个稳定的 key（file_0、file_1…），
+                            // 列表重建时不会整段重刷。
+                            .keyed_children(file_items.iter().enumerate().map(|(i, (_, v))| {
+                                KeyedView::new(format!("file_{i}"), v.clone())
+                            })),
+                    ),
             )
         };
 
         // 四个按钮排成 2×2。
         // 一栏只有 660 宽，四个按钮挤一行放不下（实测会被压成不均的两行），
         // 所以明确排成两行两列。
-        let file_buttons = StackPanel::new().spacing(8.0).children((
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(8.0)
-                .children((
-                    Button::new().on_click(context.message(Msg::AddFiles)).content("添加文件"),
-                    Button::new().on_click(context.message(Msg::AddFolder)).content("添加文件夹"),
-                )),
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(8.0)
-                .children((
-                    Button::new().on_click(context.message(Msg::RemoveSelected)).content("移除选中"),
-                    Button::new().on_click(context.message(Msg::ClearList)).content("清空列表"),
-                )),
-        ));
+        // 四个按钮排成【一行】：四个胶囊加起来约 440px，卡片可用宽度 700 出头，
+        // 排两行要多吃掉 48px 高度，全给列表更划算。
+        let file_buttons = StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(8.0)
+            .children((
+                tap_button("添加文件", context.message(Msg::AddFiles)),
+                tap_button("添加文件夹", context.message(Msg::AddFolder)),
+                tap_button("移除选中", context.message(Msg::RemoveSelected)),
+                tap_button("清空列表", context.message(Msg::ClearList)),
+            ));
 
         let files_card = card_x(
             "文件列表",
@@ -3240,9 +3291,7 @@ impl Component for AppUi {
                 // 日志区只有固定几个槽位，翻不上去。加个导出按钮，
                 // 把内存里的完整日志（最多 LOG_KEEP 行）写成文件，
                 // 之后用记事本随便翻 —— 排查"某一步花了多久"就靠它。
-                Button::new()
-                    .on_click(context.message(Msg::ExportLog))
-                    .content("导出完整日志"),
+                tap_button("导出完整日志", context.message(Msg::ExportLog)),
                 inner_box(StackPanel::new().spacing(2.0).children((
                     TextBlock::new().text(slots[0].clone()).font_size(12.0).foreground(INK2),
                     TextBlock::new().text(slots[1].clone()).font_size(12.0).foreground(INK2),
@@ -3343,10 +3392,11 @@ impl Component for AppUi {
             .rows([
                 GridLength::Auto,
                 GridLength::Auto,
-                // 试过 1.35:1 让上排更高（原稿确实如此），但下排的日志区
-                // 就会顶到卡片底边、末行被裁 —— 日志是本程序最常用的区域，
-                // 不能为了像原稿而牺牲它。所以还是 1:1。
-                GridLength::STAR,
+                // 上排 1.15 : 下排 1 —— 只多给一点点。
+                //   拉到 1.35 时下排日志区的末行会被裁（日志是最常看的区域，
+                //   不能为了像原稿牺牲它），1.15 是既不裁日志、上排又能
+                //   多放一行文件的折中。
+                GridLength::Star(1.15),
                 GridLength::STAR,
             ])
             .columns([GridLength::STAR, GridLength::STAR])
