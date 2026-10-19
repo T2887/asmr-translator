@@ -1194,7 +1194,13 @@ impl AppUi {
             // 合计加上标题、按钮、间距就超了，于是【右边冒出纵向滚动条】——
             // 而用户明确要求"默认窗口能把卡片完全显示"。
             // 实测 860 才够。
-            860.0_f64.min(sh * 0.95).max(600.0),
+            // 高度从 860 提到 1000。
+            //
+            // 860 是当年"五张卡片刚好不冒滚动条"的下限，但改版后文件列表
+            // 用了自绘行，一屏只放得下 4 行 —— 而一屏能看见多少文件，是
+            // 这个工具用得顺不顺手的关键。1000 让文件卡多出 ~2 行、日志卡
+            // 也不再贴边。用户是 4K 屏（逻辑高 1600+），放得下。
+            1000.0_f64.min(sh * 0.95).max(600.0),
         )
     }
 
@@ -2975,7 +2981,7 @@ impl Component for AppUi {
         // 列表最多占多高：上排卡片大约是可用高度的 1/2，扣掉卡片内边距、
         // 标题和下面那两行按钮，剩下的才是列表能用的高度。
         //   系数给小了列表太短，给大了会把按钮顶出卡片（实测 0.32 就会）。
-        let list_h = ((self.window_height - 36.0) * 0.085).clamp(88.0, 620.0);
+        let list_h = ((self.window_height - 36.0) * 0.195).clamp(110.0, 720.0);
 
         let list_area: View = if file_items.is_empty() {
             View::from(TextBlock::new().text("（列表为空，点下面的按钮或把文件拖进来）").font_size(13.0))
@@ -3177,16 +3183,16 @@ impl Component for AppUi {
         // 两列排：5 个字段竖着放不进 720 高的窗口（底部会被裁）
         let progress_card = card(
             "进度",
-            StackPanel::new().spacing(8.0).children((
+            StackPanel::new().spacing(6.0).children((
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
                     .spacing(24.0)
                     .children((
-                        StackPanel::new().spacing(8.0).children((
+                        StackPanel::new().spacing(4.0).children((
                             field("当前阶段", &stage_txt),
                             field("已用时间", &elapsed_txt),
                         )),
-                        StackPanel::new().spacing(8.0).children((
+                        StackPanel::new().spacing(4.0).children((
                             field("当前文件预估剩余", &eta_txt),
                             field("总进度", &format!("{:.0}%", self.progress_value)),
                         )),
@@ -3218,12 +3224,29 @@ impl Component for AppUi {
                             ),
                     )
                 },
-                field("当前动作", &live_txt),
+                // live_txt 在跑批时会给出三行（完成 / 正在处理 / 正在加载），
+                // 三行会把卡片底边顶破，这里限两行 + 省略号。
+                StackPanel::new().spacing(3.0).children((
+                    TextBlock::new().text("当前动作").font_size(12.0).foreground(INK2),
+                    TextBlock::new()
+                        .text(live_txt.clone())
+                        .font_size(14.0)
+                        .foreground(INK)
+                        .max_lines(2)
+                        .text_trimming(TextTrimming::CharacterEllipsis),
+                )),
+                // 队列位置和"正在加载模型"这类提示合成一行：
+                //   进度卡这已经是最后一行的高度了，两行会把卡片底边顶破
+                //   （实测窗口 860 逻辑高下，多一行就裁掉最后一个 TextBlock）。
                 TextBlock::new()
-                    .text(queue_txt)
+                    .text(if hint_txt.is_empty() {
+                        queue_txt.clone()
+                    } else {
+                        format!("{queue_txt}  ·  {hint_txt}")
+                    })
                     .font_size(12.0)
-                    .foreground(INK3),
-                TextBlock::new().text(hint_txt).font_size(12.0).foreground(INK3),
+                    .foreground(INK3)
+                    .text_wrapping(TextWrapping::Wrap),
             )),
         3, 1, 1, 1,
         );
@@ -3392,10 +3415,10 @@ impl Component for AppUi {
             .rows([
                 GridLength::Auto,
                 GridLength::Auto,
-                // 上排 1.15 : 下排 1 —— 只多给一点点。
-                //   拉到 1.35 时下排日志区的末行会被裁（日志是最常看的区域，
-                //   不能为了像原稿牺牲它），1.15 是既不裁日志、上排又能
-                //   多放一行文件的折中。
+                // 上排 1.15 : 下排 1。
+                //   窗口高度已经提到 1000 逻辑，上下两排共有 620 左右；
+                //   日志卡（标题 + 导出按钮 + 五行日志）吃 220，再多给它
+                //   也不会用上，所以把富余的高度拨给文件列表。
                 GridLength::Star(1.15),
                 GridLength::STAR,
             ])
