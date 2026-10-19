@@ -1,0 +1,27 @@
+# ── 行尾符：仓库内统一 LF，检出时按平台 ──
+* text=auto eol=lf
+
+# Windows 脚本类保持 CRLF（cmd/PowerShell 对 LF 不敏感，但保持一致更好）
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+*.iss   text eol=crlf
+
+# 源码/文档/SRT 统一 LF
+*.rs    text
+*.py    text
+*.md    text
+*.txt   text
+*.srt   text
+
+# 二进制文件不做任何转换
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.ico   binary
+*.exe   binary
+*.dll   binary
+*.gguf  binary
+*.pt    binary
+*.safetensors binary
+*.onnx  binary
