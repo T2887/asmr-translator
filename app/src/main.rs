@@ -120,7 +120,7 @@ pub(crate) mod center_hook {
     use windows_sys::Win32::Graphics::Dwm::{
         DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_COLOR_NONE,
         DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_TEXT_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE,
-        DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWCP_DONOTROUND,
+        DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWCP_ROUND,
         DWMSBT_MAINWINDOW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -222,24 +222,22 @@ pub(crate) mod center_hook {
             // 窗口边框留一条淡灰 #E5DFD2，让窗口边缘不糊在浅色壁纸上
             set(hwnd, DWMWA_BORDER_COLOR, 0x00D2DFE5);
 
-            // ── 窗口四角：明确不要圆角 ──
+            // ── 窗口四角：圆角 ──
             //
             // 【演进过程，别只看结论】
-            //   ① 一开始是直角 → 用户说「圆角不一致」（卡片 20px 圆角）→
-            //      设 DWMWCP_ROUND，四角变圆。
-            //   ② 用户接着说「四个阴影的角还是方的」。根因：DWM 的阴影是
-            //      按【窗口矩形】模糊的，而圆角半径只有 8px，和阴影模糊
-            //      半径差不多，四角就露出一小块方形阴影。
-            //   ③ 试过 SetWindowRgn 自定义 20px 圆角（阴影会跟着区域走）：
-            //      圆角确实变圆，但 DWM 随即不渲染非客户区，标题栏退化成
-            //      系统蓝条 + 一圈白边，不可用。
-            //   ④ 用户拍板：「搞不定阴影的方角，那就不要阴影了」。
+            //   ① 一直是直角，用户说「圆角不一致」（卡片 20px 圆角）→ ROUND。
+            //   ② 用户说「四个阴影的角还是方的」→ 我误以为是圆角不够大，
+            //      把窗口改成 DONOTROUND 去掉阴影，结果用户明确回复
+            //      「我说的是这些阴影，窗口给我改回圆角」—— 他要的是圆角，
+            //      那圈淡阴影可以接受。所以回到 ROUND。
+            //   ③ 中途试过 SetWindowRgn 自定义 20px 圆角（阴影会跟着区域走），
+            //      但 DWM 会因此不渲染非客户区：标题栏变系统蓝条 + 一圈白边，
+            //      不可用，已放弃（见 apply_round_region 的注释）。
             //
-            // 【现在的做法】DONOTROUND。DWM 对直角窗口不画四周阴影，
-            //   四角干净 —— 拿圆角换掉那块方形阴影，这是用户选的取舍。
-            //   若哪天想要回圆角，把下面这行改成 DWMWCP_ROUND 即可，
-            //   代价就是阴影的方角会重新出现。
-            set(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND as u32);
+            // 【关于阴影】DWM 的窗口阴影按窗口矩形模糊，圆角半径 8px
+            //   （系统固定，改不大），所以四角会有一点点方形阴影。这是
+            //   Win11 对所有圆角窗口的行为，微软自家应用也这样。
+            set(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND as u32);
 
             // 记下句柄（圆角区域方案已放弃，见 apply_round_region 的注释，
             // 但仍留着句柄，以后要配置窗口外观时用得上）
