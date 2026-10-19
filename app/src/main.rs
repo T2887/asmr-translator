@@ -162,6 +162,49 @@ mod center_hook {
 
             // 窗口边框留一条淡灰 #E5DFD2，让窗口边缘不糊在浅色壁纸上
             set(hwnd, DWMWA_BORDER_COLOR, 0x00D2DFE5);
+
+            // ── 窗口 / 任务栏图标 ──
+            //
+            // 【为什么要手动设】
+            //   reactor 的 WindowVisuals 虽然有 icon 字段，但 winui 后端根本
+            //   没用它（后端源码里 icon 只出现在 Button 的 SymbolIcon 分支），
+            //   所以窗口图标一直是 exe 的默认图标 —— 任务栏上那个白方块。
+            //   exe 自身也没有嵌入 RT_GROUP_ICON（项目没有 build.rs），
+            //   于是只能运行时用 WM_SETICON 把 .ico 塞给窗口。
+            //
+            //   任务栏图标有缓存：改完要把程序彻底关掉重开才看得到。
+            unsafe {
+                use windows_sys::Win32::UI::WindowsAndMessaging::{
+                    ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, LoadImageW,
+                    SendMessageW, WM_SETICON,
+                };
+                if let Some(path) = icon_ico_path() {
+                    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+                    let hicon = LoadImageW(
+                        std::ptr::null_mut(),
+                        wide.as_ptr(),
+                        IMAGE_ICON,
+                        0,
+                        0,
+                        LR_LOADFROMFILE | LR_DEFAULTSIZE,
+                    );
+                    if !hicon.is_null() {
+                        let h = hicon as usize;
+                        SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, h as isize);
+                        SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, h as isize);
+                    }
+                }
+            }
+    }
+
+    /// exe 同目录下的 `assets\icon.ico`。
+    ///
+    /// 和 ui.rs 里 `icon_path()` 是同一套查找规则：都按 exe 所在目录找，
+    /// 这样把程序整个目录拷走也能用；只拷 exe 不拷 assets 就退回默认图标。
+    fn icon_ico_path() -> Option<String> {
+        let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+        let p = dir.join("assets").join("icon.ico");
+        p.is_file().then(|| p.to_string_lossy().to_string())
     }
 
     /// 把窗口摆到主显示器正中。
