@@ -56,8 +56,66 @@ use windows_reactor::*;
 //      辅助窗口没有标题。
 
 #[cfg(windows)]
-mod center_hook {
-    use std::sync::atomic::{AtomicBool, Ordering};
+pub(crate) mod center_hook {
+    use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+
+    /// 主窗口句柄。HCBT_ACTIVATE 回调里存进来，之后配置窗口外观
+    /// （圆角区域等）时要用 —— reactor 不对外暴露 hwnd。
+    static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+
+    /// 把窗口裁成圆角矩形。
+    ///
+    /// 【为什么不用 DWM 的 DWMWA_WINDOW_CORNER_PREFERENCE】
+    ///   它能设，但半径是系统写死的（约 8px @100%），而且四角的
+    ///   **阴影**仍按窗口矩形模糊 —— 放大看就是「圆角 + 方形阴影」，
+    ///   用户连着两轮都在说这个。
+    ///   SetWindowRgn 的优先级比 DWM 圆角高，直接把窗口外形换成
+    ///   自定义半径的圆角，DWM 阴影也会跟着这个形状走。
+    ///
+    /// 【半径和卡片对齐】卡片是 20px 圆角，这里也用 20（按 DPI 缩放）。
+    ///
+    /// 【必须跟着尺寸走】Region 是绝对像素，窗口一变大小就得重设，
+    /// 否则四角会错位（窗口变大时角落还是按旧半径圆）。所以这个函数
+    /// 由 view 的 on_window_size 回调调用。
+    /// 【2026-10-20 实验结论：不可用，已停用】
+    ///   SetWindowRgn 确实能做出任意半径的圆角（20px 和卡片对上），
+    ///   但代价是 DWM 不再渲染非客户区：标题栏退化成系统默认的蓝条，
+    ///   窗口边缘还多出一圈白边 —— 比原来的方角更难看。
+    ///   所以圆角还是交回 DWM，半径固定 8px。
+    #[allow(dead_code)]
+    pub fn apply_round_region() {
+        unsafe {
+            use windows_sys::Win32::Foundation::RECT;
+            use windows_sys::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
+            use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+            use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+
+            let hwnd = MAIN_HWND.load(Ordering::Relaxed) as HWND;
+            // HWND 在 windows-sys 0.61 里是 *mut c_void
+            if hwnd.is_null() {
+                return;
+            }
+            let mut r: RECT = std::mem::zeroed();
+            if GetWindowRect(hwnd, &mut r) == 0 {
+                return;
+            }
+            let w = r.right - r.left;
+            let h = r.bottom - r.top;
+            if w <= 0 || h <= 0 {
+                return;
+            }
+            // 20 逻辑像素 → 物理像素
+            let dpi = GetDpiForWindow(hwnd);
+            let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
+            let radius = (20.0 * scale).round().max(2.0) as i32;
+            let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, radius * 2, radius * 2);
+            if !rgn.is_null() {
+                // bredraw = 1：立刻重绘
+                SetWindowRgn(hwnd, rgn, 1);
+            }
+        }
+    }
+
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows_sys::Win32::Graphics::Dwm::{
         DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_COLOR_NONE,
@@ -176,6 +234,10 @@ mod center_hook {
             // 注意必须在窗口显示【之前】设（这里在 HCBT_ACTIVATE 钩子里，
             // 正好赶在第一次绘制前），显示之后再改也能生效，但会闪一下。
             set(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND as u32);
+
+            // 记下句柄（圆角区域方案已放弃，见 apply_round_region 的注释，
+            // 但仍留着句柄，以后要配置窗口外观时用得上）
+            MAIN_HWND.store(hwnd as isize, Ordering::Relaxed);
 
             // ── 窗口 / 任务栏图标 ──
             //
