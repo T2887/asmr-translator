@@ -130,10 +130,23 @@ def pick_device():
         if not integrated(name) and free >= DISCRETE_MIN_FREE_MIB:
             return idx, name
     # 3) 兜底：这台机器没有非 N 的 Vulkan 设备，只能借 N 卡（总比 CPU 快）
+    #
+    #    这里要打一行日志：走到这条分支时，界面上「兼容模式 + <N 卡型号>
+    #    Vulkan 加速中」看起来很像 bug（用户会问「我不是选了兼容模式吗」），
+    #    其实只是这台机器没有核显可用。日志里写清原因，省得以后反复排查。
     for idx, name, _total, free in devices:
         if free >= DISCRETE_MIN_FREE_MIB:
+            print(
+                f"[设备] 没有找到核显/非 N 卡 Vulkan 设备，"
+                f"兼容模式借用 {name}（Vulkan）运行",
+                flush=True,
+            )
             return idx, name
     # 4) CPU
+    print(
+        "[设备] 没有可用的 Vulkan 设备（或空闲显存不足），兼容模式用 CPU 运行",
+        flush=True,
+    )
     return "none", "CPU"
 
 
