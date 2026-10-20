@@ -420,7 +420,9 @@ impl AppUi {
     /// 把一行日志追加到工作目录的 `_运行日志.txt`（失败就静默跳过）。
     fn append_log_file(line: &str) {
         use std::io::Write;
-        let path = format!("{}\\{}", config::work_dir(), "_运行日志.txt");
+        // 日志属于「运行数据」，跟着数据目录走（装 Program Files 时会在
+        // %LOCALAPPDATA% 下），不再写安装目录。
+        let path = format!("{}\\{}", config::data_dir(), "_运行日志.txt");
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -432,7 +434,7 @@ impl AppUi {
 
     /// 把内存里的完整日志导出一份（给「导出日志」按钮用）。
     fn export_log(&mut self) {
-        let path = format!("{}\\{}", config::work_dir(), "_运行日志_导出.txt");
+        let path = format!("{}\\{}", config::data_dir(), "_运行日志_导出.txt");
         let body = self.logs.join("\r\n");
         match std::fs::write(&path, body) {
             Ok(_) => {
@@ -552,7 +554,7 @@ impl AppUi {
 
     /// 队列持久化文件路径。
     fn queue_path() -> std::path::PathBuf {
-        std::path::PathBuf::from(config::work_dir()).join("_file_queue.txt")
+        std::path::PathBuf::from(config::data_dir()).join("_file_queue.txt")
     }
 
     /// 把队列写盘。格式：第 1 行 current_idx，之后每行一个路径。
@@ -1716,12 +1718,24 @@ impl Component for AppUi {
     type Message = Msg;
 
     fn create(_input: &(), context: &ComponentContext<Self>) -> Self {
-        let logs = vec![
+        let mut logs = vec![
             "就绪。点「开始处理」会依次执行四个步骤：".to_string(),
             "  第1步 提取音频 → 第2步 人声检测 → 第3步 分离人声 → 第4步 语音识别翻译".to_string(),
             "".to_string(),
             "先在「文件列表」里添加要处理的视频/音频，再点「开始处理」。".to_string(),
         ];
+
+        // 把「程序在哪、数据写在哪」写进日志。
+        //   装进 Program Files 之后这两处不是同一个地方，用户排查
+        //   「我的字幕/队列去哪了」时第一个要看的就是这行。
+        let wd = config::work_dir();
+        let dd = config::data_dir();
+        if dd == wd {
+            logs.push(format!("[目录] 数据目录：{dd}"));
+        } else {
+            logs.push(format!("[目录] 数据目录：{dd}"));
+            logs.push(format!("[目录] 程序目录不可写（{wd}），运行数据改存到上面这个目录"));
+        }
 
         // 测试后门：设了 ASMR_AUTOSTART 就自动点一次「开始处理」。
         //

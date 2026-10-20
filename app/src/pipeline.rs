@@ -574,7 +574,7 @@ pub fn prepare_0pre_cancellable(
     }
 
     // 写源文件清单（每行一个绝对路径，UTF-8 —— 路径里会有中文）
-    let list_path = format!(r"{}\_input.txt", config::work_dir());
+    let list_path = format!(r"{}\_input.txt", config::data_dir());
     let mut content = String::new();
     for f in files {
         content.push_str(f);
@@ -1069,7 +1069,7 @@ pub fn purge_process_files(include_pre: bool) -> (usize, usize) {
     // 它是 prepare 阶段写在【工作目录根】的那份路径列表，
     // 留着的话下次 a_提取音频.py 会读到过期内容。
     if include_pre {
-        let list_path = format!(r"{}\_input.txt", config::work_dir());
+        let list_path = format!(r"{}\_input.txt", config::data_dir());
         if std::fs::remove_file(&list_path).is_ok() {
             deleted += 1;
         }

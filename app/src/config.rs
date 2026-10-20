@@ -83,6 +83,107 @@ pub fn work_dir() -> &'static str {
     resolve_work_dir()
 }
 
+/// 数据目录：程序运行时要【写】的东西都放在这儿。
+///
+/// 为什么要有它：程序装进 `C:\Program Files` 之后，普通权限对安装目录
+/// 没有写权限，而日志 / 队列 / `3asr\` 原来全写在 exe 旁边 —— 装是装上了，
+/// 一跑就失败（`3asr\` 建不出来，字幕根本没地方落）。
+///
+/// 规则（按顺序）：
+///   1. 环境变量 `ASMR_DATA_DIR` —— 测试或多环境并存时手动指定；
+///   2. 程序目录**可写** → 就用程序目录。便携版 / 开发机 / 装用户目录，
+///      行为和以前完全一样，不会凭空空出一堆 AppData 目录；
+///   3. 程序目录不可写 → `%LOCALAPPDATA%\ASMR自动翻译工具`。
+///
+/// 判定用「真的写一个探针文件」，而不是查 ACL —— 用户目录被重定向到网络盘、
+/// 杀软拦截写入这些情况，查权限位查不出来，试写才可靠。
+pub fn data_dir() -> &'static str {
+    resolve_data_dir()
+}
+
+fn resolve_data_dir() -> &'static str {
+    static DIR: OnceLock<String> = OnceLock::new();
+    DIR.get_or_init(|| {
+        // 1. 环境变量优先（测试用；也方便把数据挪到别的盘）
+        if let Ok(v) = std::env::var("ASMR_DATA_DIR") {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                ensure_runtime_dirs(&v);
+                return v;
+            }
+        }
+
+        // 2. 程序目录可写就直接用 —— 绝大多数情况下走这条
+        //
+        //   但 Program Files 下的「可写」不可信：UAC 文件虚拟化有可能把写入
+        //   重定向到 VirtualStore，探针会「成功」而数据其实落到了别处，之后
+        //   卸载程序目录时数据就跟着蒸发。所以这类目录直接跳过探针走 fallback。
+        //   （Windows 只虚拟化 32 位且没写 manifest 的进程，我们是 64 位 + 有
+        //   manifest，理论上不会命中；但这条判断不花钱，防的是意外。）
+        let base = work_dir();
+        if !is_under_program_files(base) && is_dir_writable(base) {
+            ensure_runtime_dirs(base);
+            return base.to_string();
+        }
+
+        // 3. 装进了只读目录（Program Files 之类）→ 退到 LOCALAPPDATA
+        let fallback = std::env::var("LOCALAPPDATA")
+            .map(|v| PathBuf::from(v).join("ASMR自动翻译工具"))
+            .unwrap_or_else(|_| PathBuf::from(base).join("data"));
+        let _ = std::fs::create_dir_all(&fallback);
+        let fallback = fallback.to_string_lossy().to_string();
+        ensure_runtime_dirs(&fallback);
+        fallback
+    })
+}
+
+/// 试着在 dir 里建一个文件再删掉，判断能不能写。
+fn is_dir_writable(dir: &str) -> bool {
+    let probe = PathBuf::from(dir).join(".asmr_write_probe");
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// 把流水线要用的四个目录先建好。
+///
+/// Python 脚本只会往里写文件，不会自己 create_dir —— 目录不在就报
+/// 「No such file or directory」，而且报在很靠后的阶段，不好排查。
+fn ensure_runtime_dirs(base: &str) {
+    for sub in ["0pre", "1audio", "2vad", "3asr"] {
+        if let Err(e) = std::fs::create_dir_all(PathBuf::from(base).join(sub)) {
+            // 建不出来（网络盘掉线、盘满了、杀软拦截）不能一声不响：
+            // 后面 Python 写文件时会报「No such file or directory」，
+            // 那个报错离真正的原因太远，很难查。
+            eprintln!("[警告] 建目录失败 {base}\\{sub}: {e}");
+        }
+    }
+}
+
+/// 目录是否在 Program Files 下（含 x86 那一份）。
+fn is_under_program_files(dir: &str) -> bool {
+    let norm = |p: &str| p.trim_end_matches('\\').replace('/', "\\").to_lowercase();
+    let d = norm(dir);
+    for var in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
+        if let Ok(p) = std::env::var(var) {
+            let p = norm(&p);
+            if !p.is_empty() && (d == p || d.starts_with(&format!("{p}\\"))) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Python 解释器：优先用工作目录下的 env\python.exe，找不到再退回 PATH。
 pub fn python_exe() -> String {
     // ① 首选：程序自己目录下的内置环境
@@ -771,7 +872,7 @@ pub fn dir_vad() -> String {
     format!(r"{}\2vad", work_dir())
 }
 pub fn dir_asr() -> String {
-    format!(r"{}\3asr", work_dir())
+    format!(r"{}\3asr", data_dir())
 }
 
 /// d_语音识别.py 实际打印的字幕行格式：  [475.93s -> 479.49s]: 文本

@@ -1,3 +1,4 @@
+import os
 import torch
 # ====================== 配置 ======================
 config = {"path": {
@@ -37,6 +38,18 @@ config = {"path": {
 #   注：去掉之后是一次性载入整个音频。2 小时 44.1kHz ≈ 700 MB 内存，
 #       在 16 GB 以上的机器上没问题。# ====================== 设备与精度动态计算 ======================
 }, "device": "cuda" if torch.cuda.is_available() else "cpu"}
+
+# ── 数据目录前缀 ──
+#
+# 4 个中间目录（0pre/1audio/2vad/3asr）是【写】的，装进 Program Files 后
+# 程序目录不可写，Rust 侧会通过 ASMR_DATA_DIR 告诉我们该写到哪。
+# model/ ffmpeg 是【读】的，保持在程序目录（相对 cwd），不加前缀。
+#
+# 不传这个变量时（从命令行直接跑脚本、或便携版）行为完全不变。
+_DATA_DIR = os.environ.get("ASMR_DATA_DIR", "").strip()
+if _DATA_DIR:
+    for _key in ("pre", "audio", "vad", "asr"):
+        config["path"][_key] = os.path.join(_DATA_DIR, config["path"][_key])
 # ─────────────────────────────────────────────────────────────
 # 按【显存大小】自动选精度。
 #

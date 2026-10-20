@@ -238,6 +238,21 @@ pub fn run_script(
         .env("PYTHONIOENCODING", "utf-8")
         .env("PYTHONUTF8", "1")
         .env("PYTHONUNBUFFERED", "1")   // 关掉块缓冲，保证输出实时送出
+        // 数据目录：脚本里的 0pre/1audio/2vad/3asr 是相对路径，而 cwd 是
+        // 程序目录（脚本要能找到 model/、ffmpeg/）。装进 Program Files 时
+        // 程序目录不可写，所以由这个变量把「该往哪写」告诉 Python。
+        .env("ASMR_DATA_DIR", crate::config::data_dir())
+        // 程序目录不可写时（装进了 Program Files），Python 会试着把
+        // __pycache__ 写到脚本旁边，每次启动都失败一次、还刷一行警告。
+        // 这种情况直接关掉字节码缓存；可写时保留，启动能快点。
+        .env(
+            "PYTHONDONTWRITEBYTECODE",
+            if crate::config::data_dir() == crate::config::work_dir() {
+                "0"
+            } else {
+                "1"
+            },
+        )
         .creation_flags(CREATE_NO_WINDOW);
 
     let mut child = cmd

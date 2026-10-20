@@ -42,8 +42,18 @@ from funasr import AutoModel
 from funasr.utils.postprocess_utils import rich_transcription_postprocess
 from silero_vad import get_speech_timestamps, load_silero_vad, read_audio
 
-PRE = "0pre"
-VAD_DIR = "2vad"
+# ── 数据目录前缀 ──
+#
+# 0pre / 2vad / 3asr 都是【写】的。装进 Program Files 时程序目录不可写，
+# Rust 侧会通过 ASMR_DATA_DIR 告诉我们该写到哪；不传时（命令行直跑）行为不变。
+_DATA_DIR = os.environ.get("ASMR_DATA_DIR", "").strip()
+
+
+def _p(name):
+    return os.path.join(_DATA_DIR, name) if _DATA_DIR else name
+
+PRE = _p("0pre")
+VAD_DIR = _p("2vad")
 MODEL = os.path.join("model", "SenseVoiceSmall")
 EXTS = (".flac", ".wav", ".mp3", ".m4a", ".aac", ".ogg")
 

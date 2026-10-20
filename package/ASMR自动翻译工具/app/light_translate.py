@@ -21,8 +21,18 @@ import sys
 import time
 import urllib.request
 
-VAD_DIR = "2vad"
-ASR_DIR = "3asr"
+# ── 数据目录前缀 ──
+#
+# 0pre / 2vad / 3asr 都是【写】的。装进 Program Files 时程序目录不可写，
+# Rust 侧会通过 ASMR_DATA_DIR 告诉我们该写到哪；不传时（命令行直跑）行为不变。
+_DATA_DIR = os.environ.get("ASMR_DATA_DIR", "").strip()
+
+
+def _p(name):
+    return os.path.join(_DATA_DIR, name) if _DATA_DIR else name
+
+VAD_DIR = _p("2vad")
+ASR_DIR = _p("3asr")
 LLAMA = os.path.join("llama", "llama-server.exe")
 MODEL = os.path.join("model", "qwen2.5-1.5b-q4km.gguf")
 
