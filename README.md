@@ -69,7 +69,7 @@ VAD        1.1 秒
 ## 目录结构
 
 ```
-ASMR翻译器-rust/
+ASMR翻译器/
 ├── app/                    Rust 主程序
 │   ├── src/
 │   │   ├── main.rs         入口、窗口居中钩子
