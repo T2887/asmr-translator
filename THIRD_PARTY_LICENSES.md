@@ -58,19 +58,23 @@
 
 ---
 
-## 三、模型权重（**不随本项目分发**）
+## 三、模型权重
 
-本项目**不包含**以下模型文件。它们由使用者自行下载，各自遵守原作者的许可：
+**本仓库（git）不包含任何模型权重** —— `.gitignore` 里排除了 `model/`、`*.ckpt`、`*.onnx`、`*.gguf`、`*.bin`、`*.safetensors`。
 
-| 模型 | 来源 | 说明 |
-|---|---|---|
-| `model_bs_roformer_ep_317_sdr_12.9755.ckpt` | [Ultimate Vocal Remover](https://github.com/Anjok07/ultimatevocalremovergui) 社区 | 人声分离，610 MB |
-| `whisper-large-v2-translate-zh-v0.2-st-ct2` | [4evergr8](https://huggingface.co/4evergr8)（HuggingFace） | 日语→中文翻译转写，2.9 GB |
-| `pyannote/segmentation-3.0` | [pyannote](https://huggingface.co/pyannote/segmentation-3.0) | VAD。**gated model**，需要在 HuggingFace 同意使用条款后下载 |
+**但发布的「运行环境安装包」里打包了这些权重**，这样使用者装完就能用，不需要 HuggingFace 账号、不需要联网下载。它们各自的许可如下：
 
-**特别是 pyannote 的模型**：它是 gated（需申请访问权限）的，**请勿把它的权重文件打包进任何再分发产物**。项目代码通过 `Model.from_pretrained()` 在运行时加载，不内嵌权重。
+| 模型 | 文件 | 大小 | 来源 | 许可证 |
+|---|---|---|---|---|
+| **BS-Roformer**（人声分离） | `model_bs_roformer_ep_317_sdr_12.9755.ckpt` | 610 MB | Ultimate Vocal Remover 社区 | MIT |
+| **whisper-large-v2-translate-zh-v0.2-st-ct2**（识别 + 日→中翻译） | `models--4evergr8--…`（HF cache） | 2.9 GB | [4evergr8](https://huggingface.co/4evergr8) | MIT（基于 OpenAI Whisper 的 MIT 许可派生） |
+| **SenseVoiceSmall**（兼容模式识别） | `SenseVoiceSmall/model.pt` | 893 MB | 阿里 FunAudioLLM | MIT |
+| **Qwen2.5-1.5B-Instruct GGUF**（兼容模式翻译） | `qwen2.5-1.5b-q4km.gguf` | 940 MB | 阿里通义千问 | Apache-2.0 |
+| **pyannote/segmentation-3.0**（VAD） | `models--4evergr8--pyannote-segmentation-3.0`（HF cache） | 5.6 MB | [4evergr8](https://huggingface.co/4evergr8) 的转存版 | MIT |
 
----
+> **关于 pyannote**：官方 `pyannote/segmentation-3.0` 是 gated model（需要登录 HF 并同意条款才能下载），但本项目用的是 `4evergr8` 转存到公开仓库的同一份权重（MIT 许可），随包分发的也是这份缓存。**使用者不需要 HF 账号**。
+>
+> 如果你要自己重新分发，请保留上表的来源与许可说明；如果替换成官方 gated 版本，就需要你自己持有 HF token，并且**不得**把权重再分发出去。
 
 ## 四、其他
 
@@ -92,11 +96,13 @@
 **分发带运行环境的成品**（比如你自己打的安装包）：
 
 ```
-需要额外注意：
 ① ffmpeg —— 如果用的是 GPL 构建（如 gyan.dev 的 full 版），
    分发时要一并提供其源码或源码获取方式
 ② 各个 Python 包 —— 保留它们的 LICENSE 文件
-③ 模型权重 —— 不要分发 pyannote 的 gated 模型
+③ 模型权重 —— 按上面第三节的表格保留来源与许可说明；
+   pyannote 若改用官方 gated 版本，则不得随包分发
+④ 建议在下载页或安装向导里放一句「本软件包含第三方模型，
+   各自遵循其原始许可，详见 THIRD_PARTY_LICENSES.md」
 ```
 
-**本项目附带的 `使用说明.txt` 里已经提醒用户自行确认模型的使用条款。**
+**本项目附带的 `使用说明.txt` 与 `docs/RELEASE.md` 里都已写明模型来源与许可。**
