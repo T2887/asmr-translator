@@ -72,7 +72,7 @@ pub enum Msg {
     /// 用户从资源管理器拖了东西进来
     Dropped(DroppedData),
     /// 设备检测完成，payload 是给界面直接显示的文本
-    DeviceDetected(String, bool, f64, bool, String, String),
+    DeviceDetected(String, bool, f64, f64, bool, String, String),
     /// 切换运行模式
     SetModeFull,
     SetModeLite,
@@ -194,6 +194,9 @@ pub struct AppUi {
     cuda_name: String,
     /// Vulkan 设备名（显示适配器枚举）。空串表示没有 Vulkan 设备。
     vulkan_name: String,
+    /// 剩余显存（GB）。只用来判断「显存是不是被别的程序占满了」，
+    /// 和 has_gpu / vram_gb（总显存）配合，决定设备状态那一行怎么说。
+    vram_free_gb: f64,
     /// 本机有没有可用的 CUDA。detect_device() 检测完置位。
     ///
     /// 用途：没有 N 卡时会回退到 CPU，而 CPU 跑人声分离要慢 30~100 倍
@@ -1750,8 +1753,9 @@ impl Component for AppUi {
         // 后台问一次 CUDA。torch 首次导入要 2~3 秒，不能卡在界面线程里，
         // 所以走 spawn_background，回来时发 Msg::DeviceDetected。
         context.spawn_background(|_token| {
-            let (text, is_gpu, vram, has_vulkan, cuda_name, vulkan_name) = pipeline::detect_device();
-            Msg::DeviceDetected(text, is_gpu, vram, has_vulkan, cuda_name, vulkan_name)
+            let (text, is_gpu, vram, free_gb, has_vulkan, cuda_name, vulkan_name) =
+                pipeline::detect_device();
+            Msg::DeviceDetected(text, is_gpu, vram, free_gb, has_vulkan, cuda_name, vulkan_name)
         });
 
         // 窗口居中的逻辑【不在这里】。
@@ -1828,6 +1832,7 @@ impl Component for AppUi {
             device_status: "检测中…".to_string(),
             cuda_name: String::new(),
             vulkan_name: String::new(),
+            vram_free_gb: 0.0,
             has_gpu: true,
             has_vulkan: false,
             mode: pipeline::RunMode::Full,
@@ -2307,12 +2312,21 @@ impl Component for AppUi {
                 });
             }
 
-            Msg::DeviceDetected(text, is_gpu, vram_gb, has_vulkan, cuda_name, vulkan_name) => {
+            Msg::DeviceDetected(
+                text,
+                is_gpu,
+                vram_gb,
+                free_gb,
+                has_vulkan,
+                cuda_name,
+                vulkan_name,
+            ) => {
                 self.device_status = text;
                 self.cuda_name = cuda_name;
                 self.vulkan_name = vulkan_name;
                 self.has_gpu = is_gpu;
                 self.vram_gb = vram_gb;
+                self.vram_free_gb = free_gb;
                 self.has_vulkan = has_vulkan;
                 // v1.21.1：精简模式的条件放宽为「N 卡显存 ≥ 6 GB」——
                 // 大显存卡也可以主动选精简模式（比如想省显存跑别的程序）。
@@ -2953,7 +2967,31 @@ impl Component for AppUi {
         let device_line: String = if accel_ok {
             format!("GPU：{}（已启用 {accel}）", plain_device_name(accel_name))
         } else if compat {
-            "CPU：未找到可用的 Vulkan 设备".to_string()
+            // 兼容模式拿不到 Vulkan 设备，要分清是哪种情况 —— 用户看着
+            // 「找不到 Vulkan 设备」会以为驱动坏了，其实多半是显存被别的
+            // 程序占光了（模型起不来，llama-server 连设备表都列不出来）。
+            //
+            // 实测触发场景：开着浏览器/游戏，5070 只剩不到 1 GB 空闲。
+            // 阈值 4 GB：兼容模式要同时装下 SenseVoice（转写）+ Qwen2.5-1.5B
+            // q4（翻译）+ 上下文 + Vulkan 驱动开销，保守估 3.5~4.5 GB。
+            // 低于这个数再谈「显存不足」才站得住；高于它还枚举不到设备，
+            // 那就是驱动或 llama-server 的问题，不该往显存上赖。
+            if self.has_gpu && self.vram_free_gb > 0.0 && self.vram_free_gb < 4.0 {
+                let who = plain_device_name(&self.cuda_name);
+                if who.is_empty() {
+                    format!(
+                        "GPU（剩余显存 {:.1} GB，低于兼容模式要求，已切换至 CPU 推理）",
+                        self.vram_free_gb
+                    )
+                } else {
+                    format!(
+                        "GPU：{who}（剩余显存 {:.1} GB，低于兼容模式要求，已切换至 CPU 推理）",
+                        self.vram_free_gb
+                    )
+                }
+            } else {
+                "CPU：未找到可用的 Vulkan 设备".to_string()
+            }
         } else {
             self.device_status.clone()
         };

@@ -203,7 +203,7 @@ pub fn detect_vulkan_devices() -> Vec<String> {
 ///   · CUDA 但显存 < 6 GB        → 兼容模式
 ///   · 没有 CUDA 但有 Vulkan     → 兼容模式（走 llama.cpp）
 ///   · 什么都没有                → 兼容模式（纯 CPU）
-pub fn detect_device() -> (String, bool, f64, bool, String, String) {
+pub fn detect_device() -> (String, bool, f64, f64, bool, String, String) {
     // 这段 Python 的缩进是语法的一部分，改的时候注意别动前面的空格。
     // 最外层不能有缩进。
     let code = r#"
@@ -216,7 +216,28 @@ try:
             gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
         except Exception:
             gb = 0.0
-        print('GPU:' + name + '|' + ('%.1f' % gb))
+        # 剩余显存：用来区分「这台机器本来就没有 Vulkan」和「显存被别的程序占满了」。
+        # 总显存再大，也可能一时被占光 —— 那是两个完全不同的问题，文案不能混。
+        #
+        # ★ 优先问 nvidia-smi，不用 torch.cuda.mem_get_info：
+        #   WDDM 下 torch 报的是「CUDA 层还没分配出去的量」，把系统/别的进程
+        #   已经占用但没走 CUDA 分配器的显存也算成「可用」。实测同一时刻
+        #   nvidia-smi 只剩 997 MiB、torch 报 7.2 GB —— 差 7 倍，拿它判断
+        #   「够不够」等于没判断。
+        free_gb = 0.0
+        try:
+            import subprocess as _sp
+            _o = _sp.run(
+                ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5)
+            free_gb = float(_o.stdout.strip().splitlines()[0]) / 1024.0
+        except Exception:
+            try:
+                _fb, _ = torch.cuda.mem_get_info(0)
+                free_gb = _fb / (1024 ** 3)
+            except Exception:
+                free_gb = 0.0
+        print('GPU:' + name + '|' + ('%.1f' % gb) + '|' + ('%.1f' % free_gb))
     else:
         print('CPU')
 except Exception:
@@ -231,9 +252,19 @@ except Exception:
         Ok(s) if s.starts_with("GPU:") => {
             // 格式：GPU:<名字>|<显存GB>
             let rest = s[4..].trim();
-            let (name, vram) = match rest.split_once('|') {
-                Some((n, v)) => (n.trim(), v.trim().parse::<f64>().unwrap_or(0.0)),
-                None => (rest, 0.0),
+            // 格式：<名字>|<总显存GB>|<剩余显存GB>
+            let (name, vram, free_gb) = match rest.split_once('|') {
+                Some((n, v)) => {
+                    let (tot, free) = match v.split_once('|') {
+                        Some((a, b)) => (
+                            a.trim().parse::<f64>().unwrap_or(0.0),
+                            b.trim().parse::<f64>().unwrap_or(0.0),
+                        ),
+                        None => (v.trim().parse::<f64>().unwrap_or(0.0), 0.0),
+                    };
+                    (n.trim(), tot, free)
+                }
+                None => (rest, 0.0, 0.0),
             };
             // 阈值和 settings.py 的 _NEED_F16_MIB（8289 MiB）保持一致：
             // float16 峰值 4265 + 基线 3000 + 预留 1024 = 8289 MiB ≈ 8.1 GB
@@ -248,7 +279,7 @@ except Exception:
                 format!("GPU：{name}（已启用 CUDA）")
             };
             let vulkan_name = vulkan.join(" / ");
-            (text, true, vram, has_vulkan, name.to_string(), vulkan_name)
+            (text, true, vram, free_gb, has_vulkan, name.to_string(), vulkan_name)
         }
         // 没有 CUDA：不再说「CPU 慢 50 倍」，而是走兼容模式。
         Ok(s) if s == "CPU" => {
@@ -260,11 +291,12 @@ except Exception:
             // 兼容模式副标题要写「<显卡/核显型号> Vulkan 加速中」，
             // 型号从显示适配器枚举里拿；纯 CPU 就留空，副标题不显示这段。
             let vulkan_name = vulkan.join(" / ");
-            (text, false, 0.0, has_vulkan, String::new(), vulkan_name)
+            (text, false, 0.0, 0.0, has_vulkan, String::new(), vulkan_name)
         }
         Ok(other) => (
             format!("未知（检测失败：{other}）"),
             false,
+            0.0,
             0.0,
             has_vulkan,
             String::new(),
@@ -280,6 +312,7 @@ except Exception:
             (
                 format!("未知（{msg}）"),
                 false,
+                0.0,
                 0.0,
                 has_vulkan,
                 String::new(),
