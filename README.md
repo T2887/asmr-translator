@@ -44,14 +44,14 @@ Windows 桌面程序：**Rust + WinUI 3**（界面）+ **Python**（AI 推理）
 
 ## 硬件要求
 
-**必须有 NVIDIA 显卡。**
+**有 NVIDIA 显卡最好**（能用 CUDA，最快）。没有也能跑 —— AMD / Intel 核显走「兼容模式」（Vulkan 或 CPU），只是慢。
 
 | 显存 | 状态 | 说明 |
 |---|---|---|
 | **≥ 8.1 GB** | 全速（float16） | 峰值约 7.3 GB，给其他程序留 5 GB |
 | **6 ~ 8.1 GB** | 精简模式（int8） | 峰值约 5 GB，识别慢约 20%，个别词可能不准 |
 | **< 6 GB** | **只能用 CPU** | 程序会弹窗确认，同意则跑（慢 50 倍），不同意则退出 |
-| AMD / Intel | 不支持 | PyTorch / ONNX Runtime / CTranslate2 在 Windows 上都没有可用的 A 卡后端 |
+| AMD / Intel 核显 | **兼容模式** | 走 llama.cpp 的 Vulkan 后端（SenseVoice + Qwen），比 CUDA 慢，但能出结果 |
 
 **显存实测（RTX 5070 12GB，5 分钟音频）**：
 
@@ -86,7 +86,7 @@ VAD        1.1 秒
 ## 目录结构
 
 ```
-ASMR翻译器/
+asmr-translator/
 ├── app/                    Rust 主程序
 │   ├── src/
 │   │   ├── main.rs         入口、窗口居中钩子
@@ -114,7 +114,9 @@ ASMR翻译器/
 
 ## 如何搭起来
 
-**本项目不包含模型权重和 Python 环境**，需要自己准备。
+**本仓库不包含模型权重和 Python 环境** —— 普通使用者请直接下安装包（见上面的「下载安装」），不用看这一节。
+
+下面是从源码自己搭的流程，需要自己准备环境和模型。
 
 ### 1. 准备 Python 环境
 
@@ -185,7 +187,7 @@ m = WhisperModel("4evergr8/whisper-large-v2-translate-zh-v0.2-st-ct2",
 大小     5.6 MB
 ```
 
-**⚠ 这是 gated model，必须先申请访问权限**：
+**⚠ 官方仓库是 gated model**，直接下载要先申请访问权限：
 
 ```
 1. 登录 HuggingFace
@@ -195,7 +197,9 @@ m = WhisperModel("4evergr8/whisper-large-v2-translate-zh-v0.2-st-ct2",
 5. 程序里加载时传 token，或者设置环境变量 HF_TOKEN
 ```
 
-**⚠ 请勿把它的权重文件打包进任何再分发产物** —— gated model 的条款不允许。程序是运行时用 `Model.from_pretrained()` 加载的，不内嵌权重。
+**但本项目用的是 `4evergr8/pyannote-segmentation-3.0` —— 同一份权重转存到公开仓库的版本（MIT）**，不需要 token、不需要申请。发布的「运行环境安装包」里缓存的就是这一份。
+
+如果你坚持用**官方 gated 版本**，那就需要自己申请 token，并且**不要**把它的权重打包进任何再分发产物。
 
 ---
 
@@ -236,7 +240,7 @@ cargo build --release
 >
 > **贡献代码时请不要引入 GPL / AGPL 系的依赖**，否则会破坏整个项目的许可。
 
-**模型权重不在本仓库内**，各自遵守原作者的许可。特别是 `pyannote/segmentation-3.0` 是 gated model，**不要把它打包进任何再分发产物**。
+**模型权重不在本仓库（git）内**，各自遵守原作者的许可。它们被打包在「运行环境安装包」里随程序分发（详见 THIRD_PARTY_LICENSES.md 第三节），其中 pyannote 用的是公开转存版而非官方 gated 版。
 
 ---
 
@@ -258,7 +262,7 @@ cargo build --release
 
 ## 已知限制
 
-- **只支持 NVIDIA 显卡**（AMD 在 Windows 上没有可用的加速后端）
+- **CUDA 加速只支持 NVIDIA 显卡**；AMD / Intel 核显走兼容模式（Vulkan / CPU），明显更慢
 - **4 GB 及以下显存**只能跑 CPU 模式，速度约为 GPU 的 1/50
 - **Whisper large-v2 比 v3 更适合日语**（v3 改了 mel 特征，在长音频和噪声上更容易产生幻觉）
 - 模型加载每步各一次（4 个独立进程），约占总时间的 70%。合并成单进程能再省 5-6 秒/文件，但改动较大，暂未做

@@ -94,14 +94,14 @@
 
 界面整体换成了浅色暖调（米白纸面 + 赤陶橙），窗口标题栏、弹窗、按钮全部统一；文件列表支持「已完成打勾 / 正在处理高亮 / 长文件名省略」；提示弹窗改成自绘的浅色模态；日志和预览各加到 8 行；兼容模式的设备状态和加速后端会根据所选模式实时切换。
 
-完整改动见仓库的提交记录。
+完整改动见 [提交记录](https://github.com/T2887/asmr-translator/commits/main)。
 
 ---
 
 ## 许可证
 
-- **本项目代码**：MIT（见仓库根目录的 `LICENSE`）
-- **第三方组件与模型**：各有自己的许可证，详见仓库根目录的 `THIRD_PARTY_LICENSES.md`
+- **本项目代码**：MIT（见 [LICENSE](https://github.com/T2887/asmr-translator/blob/main/LICENSE)）
+- **第三方组件与模型**：各有自己的许可证，详见 [THIRD_PARTY_LICENSES.md](https://github.com/T2887/asmr-translator/blob/main/THIRD_PARTY_LICENSES.md)
 
 运行环境包里打包了以下模型权重（都是 MIT 或更宽松的许可），再分发时请保留各自的许可声明：
 
