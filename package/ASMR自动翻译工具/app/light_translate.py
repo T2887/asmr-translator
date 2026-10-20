@@ -76,10 +76,9 @@ def free_port():
 
 
 def pick_device():
-    """兼容模式：优先【非 NVIDIA】的 Vulkan 设备（核显 / AMD / Intel），
-    NVIDIA 只作兜底；都不满足 → CPU。
+    """兼容模式：优先【非 NVIDIA】的 Vulkan 设备，NVIDIA 只作兜底；都不满足 → CPU。
 
-    【为什么不再「独显优先」（2026-10-20 改）】
+    【为什么不吃 N 卡（2026-10-20 定）】
       用户原话：「我选了兼容模式，这里为什么还是 5070？兼容模式不应该是
       工作在显存不足 6G 的 N 卡、非 N 独显和核显吗？」。
       对：兼容模式的定位就是「不吃 N 卡」—— 显存留给别的 GPU 任务。
@@ -89,7 +88,7 @@ def pick_device():
     【为什么还留着 NVIDIA 兜底】
       纯 N 卡且没有核显的机器（不少台式机）上，如果硬性排除 N 卡，
       就只剩 CPU，翻译会慢到没法用。所以顺序是：
-        核显 → 非 N 独显 → N 卡（兜底）→ CPU
+        非 N 独显 → 核显 → N 卡（兜底）→ CPU
 
     显存安全空间（沿用 v1.21 规则）：
       · 1.5B 模型约 1.5 GB（权重 + 上下文），另留 1 GB 余量。
@@ -121,9 +120,40 @@ def pick_device():
     if not devices:
         return "none", "CPU"
 
-    def integrated(name: str) -> bool:
+    # 核显 / 独显判定：先看名字里的强力信号，名字没信号再看显存大小。
+    #
+    #   【为什么不只看名字（千问评审 2026-10-20 指出）】
+    #     纯关键词会漏判两类真实型号：
+    #       · "AMD Radeon 780M"      —— 核显，但名字里既没 RX 也没 Graphics
+    #       · "Intel Iris Xe MAX"    —— 独显，但命中 "iris" 会被当成核显
+    #     所以加了白名单，并用显存兜底：核显报的是【共享内存】，
+    #     total 常常上万 MiB（这台机器核显报 32147 MiB），独显是实打实的容量。
+    #
+    #   【为什么不直接用千问的「total < 8192 就是独显」】
+    #     8 GB 内存的机器，核显可能只报 4~8 GB → 会被误判成独显。
+    #     反过来「核显一定报得很大」也不成立。所以显存只在名字没命中时兜底。
+    def integrated(name: str, total: int) -> bool:
         low = name.lower()
-        return any(k in low for k in ("uhd graphics", "iris", "vega", "radeon(tm) graphics"))
+        # ① 独显强力信号（放在最前，先排除）
+        if any(
+            k in low
+            for k in (
+                "rx ", "rx(", "radeon pro", "arc a", "arc b", "arc(tm) a", "arc(tm) b",
+                "xe max", "quadro", "geforce", "rtx", "tesla",
+            )
+        ):
+            return False
+        # ② 核显强力信号
+        if any(
+            k in low
+            for k in (
+                "uhd graphics", "iris", "vega", "radeon(tm) graphics", "radeon graphics",
+                "780m", "760m", "740m", "680m", "660m",
+            )
+        ):
+            return True
+        # ③ 名字没信号 → 看显存：共享内存才可能报到 16 GB 以上
+        return total > 16384
 
     def nvidia(name: str) -> bool:
         low = name.lower()
@@ -131,13 +161,20 @@ def pick_device():
 
     non_nvidia = [d for d in devices if not nvidia(d[1])]
 
-    # 1) 核显（非 N 卡里找）：共享内存够就用
-    for idx, name, _total, free in non_nvidia:
-        if integrated(name) and free >= INTEGRATED_MIN_FREE_MIB:
+    # 1) 非 N 卡独显（AMD / Intel Arc）—— 独显算力远高于核显，优先用
+    #
+    #    【顺序为什么是独显在前（2026-10-20 用户纠正）】
+    #    用户原话：「如果是 AMD 独显或者 intel 独显这些，还是优先选用独显的」。
+    #    之前把核显排第一，本意是「不跟 N 卡抢显存」，但在【AMD / Intel
+    #    独显】的机器上就变成了「放着独显不用，让核显慢慢跑」，明显不对。
+    #    所以只有「N 卡 vs 核显」的场合才偏向核显；同样是独显，
+    #    非 N 的独显该排在核显前面。
+    for idx, name, total, free in non_nvidia:
+        if not integrated(name, total) and free >= DISCRETE_MIN_FREE_MIB:
             return idx, name
-    # 2) 非 N 卡独显（AMD / Intel Arc）
-    for idx, name, _total, free in non_nvidia:
-        if not integrated(name) and free >= DISCRETE_MIN_FREE_MIB:
+    # 2) 核显（非 N 卡里找）：共享内存够就用
+    for idx, name, total, free in non_nvidia:
+        if integrated(name, total) and free >= INTEGRATED_MIN_FREE_MIB:
             return idx, name
     # 3) 兜底：这台机器没有非 N 的 Vulkan 设备，只能借 N 卡（总比 CPU 快）
     #

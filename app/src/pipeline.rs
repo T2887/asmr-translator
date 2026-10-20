@@ -136,7 +136,7 @@ pub fn detect_vulkan_devices() -> Vec<String> {
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
     text.push_str(&String::from_utf8_lossy(&out.stderr));
 
-    let mut devices: Vec<String> = Vec::new();
+    let mut devices: Vec<(String, u64)> = Vec::new();
     for line in text.lines() {
         let t = line.trim();
         let Some(rest) = t.strip_prefix("Vulkan") else {
@@ -151,17 +151,25 @@ pub fn detect_vulkan_devices() -> Vec<String> {
         //   "AMD Radeon(TM) Graphics (32147 MiB, 30539 MiB free)"，
         //   按第一个 '(' 切会得到 "AMD Radeon"，型号丢了。
         //   改成找【最后一个 " (" 且其后是数字】的位置。
-        let name = match tail.rfind(" (") {
+        //
+        //   顺手把总显存也解析出来：核显 / 独显的名字关键词有漏判
+        //   （见下面 is_integrated 的注释），显存是兜底判据。
+        let (name, total) = match tail.rfind(" (") {
             Some(i) if tail[i + 2..].starts_with(|c: char| c.is_ascii_digit()) => {
-                tail[..i].trim().to_string()
+                let vram = tail[i + 2..]
+                    .split(|c: char| !c.is_ascii_digit())
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                (tail[..i].trim().to_string(), vram)
             }
-            _ => tail.trim().to_string(),
+            _ => (tail.trim().to_string(), 0),
         };
         if name.is_empty() {
             continue;
         }
-        if !devices.contains(&name) {
-            devices.push(name);
+        if !devices.iter().any(|(n, _)| n == &name) {
+            devices.push((name, total));
         }
     }
 
@@ -173,11 +181,58 @@ pub fn detect_vulkan_devices() -> Vec<String> {
             .iter()
             .any(|k| low.contains(k))
     };
-    let non_nvidia: Vec<String> = devices.iter().filter(|n| !is_nvidia(n)).cloned().collect();
+    // 核显判定要和 Python 侧 integrated() 保持一致 —— 副标题里排第一个的
+    // 就是 pick_device() 会选中的那块卡，两处说的必须是同一块。
+    //
+    // 【为什么独显排前（2026-10-20 用户纠正）】
+    //   用户原话：「如果是 AMD 独显或者 intel 独显这些，还是优先选用独显的」。
+    //   原来核显排第一，在 AMD / Intel 独显的机器上会放着独显不用。
+    //   顺序：非 N 独显 → 核显 → （N 卡兜底，已在上面的 filter 里排除）。
+    //
+    //   判定规则见 light_translate.py 的 integrated()：名字里的强力信号优先
+    //   （"780M" 是核显、"Iris Xe MAX" 是独显，纯关键词会判错），
+    //   名字都没命中时才用显存兜底。
+    let is_integrated = |name: &str, total: u64| -> bool {
+        let low = name.to_lowercase();
+        if [
+            "rx ", "rx(", "radeon pro", "arc a", "arc b", "arc(tm) a", "arc(tm) b", "xe max",
+            "quadro", "geforce", "rtx", "tesla",
+        ]
+        .iter()
+        .any(|k| low.contains(k))
+        {
+            return false;
+        }
+        if [
+            "uhd graphics",
+            "iris",
+            "vega",
+            "radeon(tm) graphics",
+            "radeon graphics",
+            "780m",
+            "760m",
+            "740m",
+            "680m",
+            "660m",
+        ]
+        .iter()
+        .any(|k| low.contains(k))
+        {
+            return true;
+        }
+        total > 16384
+    };
+    let mut non_nvidia: Vec<(String, u64)> = devices
+        .iter()
+        .filter(|(n, _)| !is_nvidia(n))
+        .cloned()
+        .collect();
+    // 稳定排序：独显（false → 0）在前，核显（true → 1）在后。
+    non_nvidia.sort_by_key(|(n, t)| u8::from(is_integrated(n, *t)));
     if non_nvidia.is_empty() {
-        devices
+        devices.into_iter().map(|(n, _)| n).collect()
     } else {
-        non_nvidia
+        non_nvidia.into_iter().map(|(n, _)| n).collect()
     }
 }
 

@@ -1,4 +1,4 @@
-# ASMR 自动翻译工具 v1.24.0
+# ASMR 自动翻译工具 v1.24.1
 
 把日语 ASMR 音声 / 视频批量翻译成中文字幕（`.chs.srt`），字幕直接生成在源文件旁边，播放器可以自动加载。
 
@@ -29,7 +29,7 @@
 
 | 文件 | SHA256 |
 |---|---|
-| ASMR-Translator-Setup.exe | `25252a660bbabd8b6964776044a68c89d0c198d08484ea47e462ce146053968e` |
+| ASMR-Translator-Setup.exe | `32533b0ccde0e3124f4b95ad3bd50d12173ca85787f51e2c207a785b99a0359c` |
 | 运行环境.zip | `4f5c9fdc5360da728c9d7aa8b31db0e15caa32b531e633199bf215b0f087681d` |
 
 网盘文件夹里另有一份 `SHA256SUMS.txt`，包含解压后 5 个文件各自的校验值。
@@ -127,7 +127,18 @@
 
 ---
 
-## 这一版改了什么（v1.24.0）
+## 这一版改了什么（v1.24.1）
+
+**兼容模式选卡顺序修正。** 原来的顺序是「核显 → 非 N 独显 → N 卡兜底 → CPU」，
+本意是「别跟 N 卡抢显存」，但副作用是：一台装了 AMD RX 或 Intel Arc 独立显卡的
+机器，兼容模式会放着独显不用、让核显慢慢跑。现在改成「**非 N 独显 → 核显 → N 卡
+兜底 → CPU**」——「不吃 N 卡」这条只对 N 卡成立，不该顺带把独显也降级。
+
+顺带修了核显 / 独显的判定：`AMD Radeon 780M` 这类 APU 核显名字里既没有 RX 也没有
+Graphics，以前会漏判成独显；`Intel Iris Xe MAX` 是独显，以前会被 `iris` 误判成核显。
+名字都没命中时按显存大小兜底（核显报的是共享内存，经常上万 MiB）。
+
+## 上一版改了什么（v1.24.0）
 
 **能装进 `C:\Program Files` 了。** 改动在程序内部：把「程序目录」和「运行数据目录」拆开 ——
 程序目录（exe、脚本、Python 环境、模型）只读，日志和中间文件落到 `%LOCALAPPDATA%`。
@@ -139,8 +150,6 @@ Vulkan 设备时，界面写「CPU：未找到可用的 Vulkan 设备」，看�
 「剩余显存 x.x GB，低于兼容模式要求，已切换至 CPU 推理」。顺带修了剩余显存的取法 ——
 WDDM 下 `torch` 报的可用显存会高估好几倍（实测 nvidia-smi 报 988 MiB、torch 报 7.2 GB），
 改用 `nvidia-smi` 读数。
-
-完整改动见 [提交记录](https://github.com/T2887/asmr-translator/commits/main)。
 
 完整改动见 [提交记录](https://github.com/T2887/asmr-translator/commits/main)。
 
