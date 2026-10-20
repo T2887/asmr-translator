@@ -13,26 +13,29 @@
 | 包 | 内容 | 大小 | 下载位置 |
 |---|---|---|---|
 | **ASMR-Translator-Setup.exe**（主程序安装包） | 程序本体 + 界面 + llama.cpp | 17 MB | 👉 本页下方 Assets |
-| **运行环境.zip** | Python 环境 + 全部模型权重 | 6.2 GB | 👉 百度网盘 |
+| **运行环境.zip** | Python 环境 + 全部模型权重 | 6.2 GB | 👉 百度网盘 / 夸克网盘 |
 
 > GitHub 的附件不支持中文文件名（会被剥成 `1_.exe`），所以主程序包在这里叫
 > `ASMR-Translator-Setup.exe`。**它就是「主程序安装包」**，先装它。
 
-**运行环境包（百度网盘）**：
-链接 <https://pan.baidu.com/s/1O8gv32IN4WmfHrgHraQbGw?pwd=c98a>　提取码 `c98a`
+**运行环境包（两个网盘任选一个，内容一样）**：
 
-> 下载后**先解压**，里面是 5 个文件：
+| 网盘 | 链接 | 提取码 |
+|---|---|---|
+| 百度网盘 | <https://pan.baidu.com/s/1AgEJHFfEvH7OsD6CAWr_nw?pwd=fttb> | `fttb` |
+| 夸克网盘 | <https://pan.quark.cn/s/be07b47c4fdd?pwd=yHcp> | `yHcp` |
+
+> 下载下来是一个 **`运行环境.zip`，先解压**，里面是 5 个文件：
 > `2_运行环境_安装包.exe` + `2_运行环境_安装包-1.bin` ~ `-4.bin`
 > 这 5 个文件必须**放在同一个文件夹**再安装（少一个，安装程序会报「找不到下一个分卷」）。
->
+
 **校验值**（想确认没传坏，Windows 上用 `certutil -hashfile 文件名 SHA256` 算一下对比）：
 
 | 文件 | SHA256 |
 |---|---|
 | ASMR-Translator-Setup.exe | `32533b0ccde0e3124f4b95ad3bd50d12173ca85787f51e2c207a785b99a0359c` |
-| 运行环境.zip | `4f5c9fdc5360da728c9d7aa8b31db0e15caa32b531e633199bf215b0f087681d` |
 
-网盘文件夹里另有一份 `SHA256SUMS.txt`，包含解压后 5 个文件各自的校验值。
+网盘文件夹里另有一份 `SHA256SUMS.txt`，包含解压后 5 个文件各自的校验值，解压后可以逐个对照。
 
 ---
 

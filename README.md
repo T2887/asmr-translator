@@ -15,7 +15,7 @@ Windows 桌面程序：**Rust + WinUI 3**（界面）+ **Python**（AI 推理）
 | 包 | 内容 | 大小 | 下载 |
 |---|---|---|---|
 | **ASMR-Translator-Setup.exe**（主程序安装包） | 程序本体 + 界面 + llama.cpp | 17 MB | 👉 [Releases](../../releases) 页面的 Assets |
-| **运行环境.zip**（解压后 5 个文件） | Python 环境 + 全部模型权重 | 6.2 GB | 百度网盘（链接见 Release 说明） |
+| **运行环境.zip**（解压后 5 个文件） | Python 环境 + 全部模型权重 | 6.2 GB | 百度网盘 / 夸克网盘（链接见 [Release 说明](docs/RELEASE.md)） |
 
 两个包都装到 `C:\Program Files\ASMR自动翻译工具`（安装时会弹一次管理员授权）。
 日志和中间文件在 `%LOCALAPPDATA%\ASMR自动翻译工具\`，字幕仍旧直接生成在视频旁边。
