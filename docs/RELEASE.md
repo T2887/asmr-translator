@@ -12,8 +12,11 @@
 
 | 包 | 内容 | 大小 | 下载位置 |
 |---|---|---|---|
-| **1_主程序_安装包.exe** | 程序本体 + 界面 + llama.cpp | 17 MB | 👉 本页下方 Assets |
+| **ASMR-Translator-Setup.exe**（主程序安装包） | 程序本体 + 界面 + llama.cpp | 17 MB | 👉 本页下方 Assets |
 | **运行环境.zip** | Python 环境 + 全部模型权重 | 6.2 GB | 👉 百度网盘 |
+
+> GitHub 的附件不支持中文文件名（会被剥成 `1_.exe`），所以主程序包在这里叫
+> `ASMR-Translator-Setup.exe`。**它就是「主程序安装包」**，先装它。
 
 **运行环境包（百度网盘）**：
 链接 <https://pan.baidu.com/s/1O8gv32IN4WmfHrgHraQbGw?pwd=c98a>　提取码 `c98a`
@@ -28,7 +31,7 @@
 
 ## 安装
 
-1. 双击 `1_主程序_安装包.exe` → 一路下一步（**不需要管理员权限**）
+1. 双击 `ASMR-Translator-Setup.exe`（主程序安装包）→ 一路下一步（**不需要管理员权限**）
 2. 解压 `运行环境.zip`，双击里面的 `2_运行环境_安装包.exe` → 一路下一步（同样不需要管理员权限）
 
 先装哪个都行。两个包装到同一个目录 `%LOCALAPPDATA%\ASMR自动翻译工具`，共用同一个卸载入口。

@@ -75,3 +75,7 @@ _归档/
 
 # ── 百度网盘上传中的临时标记 ──
 *.baiduyun.uploading.cfg
+
+# ── GitHub Release 专用的英文名副本（内容与 1_主程序_安装包.exe 相同）──
+package/安装包/ASMR-Translator-Setup.exe
+
