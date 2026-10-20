@@ -182,7 +182,7 @@ for _idx, audio_path in enumerate(audio_files, 1):
             vad_result = vad_pipeline(audio_path)
 
         # 5. 生成 SRT
-        # 用自己的 srt_util（pysrt 是 GPLv3，会让整个项目被迫传染）
+        # 用项目自带的 srt_util 写时间轴
         _rows = []
         for idx, (segment, _, _) in enumerate(vad_result.itertracks(yield_label=True), start=1):
             _rows.append((float(segment.start), float(segment.end), f"Speech_{idx}"))

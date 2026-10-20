@@ -1,15 +1,10 @@
-"""极简 SRT 读写 —— 用来替换 pysrt。
+"""极简 SRT 读写，无第三方依赖。
 
-为什么不用 pysrt：
-  pysrt 是 GPLv3。GPLv3 有传染性：只要项目里 import 了它，
-  整个项目就必须以 GPLv3 发布，不能选 MIT。
+只做两件事：
+  ① 生成 SRT 文本文件
+  ② 读出 VAD 的 SRT 时间轴
 
-  而我们在这里只用到 pysrt 的两件事：
-    ① 生成 SRT 文本文件
-    ② 读出 VAD 的 SRT 时间轴
-  自己写 60 行就够，而且没有任何第三方依赖。
-
-对外接口（刻意做得和 pysrt 的常用子集对应，方便替换）：
+对外接口：
     write_srt(path, rows)      rows = [(start_sec, end_sec, text), ...]
     read_srt(path)             -> [(start_sec, end_sec, text), ...]
 
@@ -50,8 +45,8 @@ def write_srt(path, rows):
     rows = [(start_sec, end_sec, text), ...]
     text 里如果有换行，会被保留成多行字幕（SRT 允许）。
 
-    写文件用 UTF-8 无 BOM、换行统一成 \\n —— 和之前 pysrt 的行为一致，
-    也避免 Windows 上出现 \\r\\n 导致某些播放器显示异常。
+    写文件用 UTF-8 无 BOM、换行统一成 \\n，
+    避免 Windows 上出现 \\r\\n 导致某些播放器显示异常。
     """
     with io.open(path, "w", encoding="utf-8", newline="\n") as f:
         for i, (a, b, text) in enumerate(rows, 1):

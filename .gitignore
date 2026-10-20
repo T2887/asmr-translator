@@ -72,3 +72,6 @@ tools/preview/
 
 # ── 归档（旧 exe / 旧日志，不进版本库）──
 _归档/
+
+# ── 百度网盘上传中的临时标记 ──
+*.baiduyun.uploading.cfg

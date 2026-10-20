@@ -54,7 +54,7 @@
 | **ONNX Runtime** | MIT | ONNX 推理 |
 | **pyannote.audio** | MIT | 语音活动检测 |
 
-> **注**：项目曾使用 `pysrt`（GPLv3）生成字幕文件。GPLv3 具有传染性，会使整个项目被迫以 GPLv3 发布。为了能以 MIT 发布，已改为使用项目自带的 `app/srt_util.py`（无第三方依赖，约 60 行）。
+> **注**：字幕读写使用项目自带的 `app/srt_util.py`，无任何第三方依赖。
 
 ---
 

@@ -99,7 +99,7 @@ asmr-translator/
 │   ├── c_人声检测.py
 │   ├── d_语音识别.py
 │   ├── e_字幕整理.py       字幕时间轴整理（也能 --batch 批量修旧字幕）
-│   ├── srt_util.py         自写的 SRT 读写（替代 GPL 的 pysrt）
+│   ├── srt_util.py         SRT 读写（自带实现，无第三方依赖）
 │   ├── events.py           结构化事件（@@EV@@ 行，给 Rust 侧读进度/字幕）
 │   ├── 词表.txt            固定错译替换表（每行 错误=>正确，可自己加）
 │   ├── asmr词汇.txt        ASMR 常用日语词表（参考用，非默认热词）
@@ -126,8 +126,6 @@ env\Scripts\activate
 pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
 pip install audio-separator[cpu] faster-whisper pyannote.audio librosa soundfile pydub pyyaml
 ```
-
-**注意**：`pysrt` **不要装** —— 项目已经用自带的 `srt_util.py` 替代了它（见下方「许可证」一节）。
 
 ### 2. 准备模型
 
@@ -236,9 +234,7 @@ cargo build --release
 
 第三方组件的许可见 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)。
 
-> **关于 `pysrt`**：项目早期用 `pysrt` 生成字幕，但它是 **GPLv3**，具有传染性 —— 只要 import 它，整个项目就必须以 GPLv3 发布。为了能以 MIT 发布，已经改成项目自带的 `app/srt_util.py`（约 60 行，无第三方依赖）。
->
-> **贡献代码时请不要引入 GPL / AGPL 系的依赖**，否则会破坏整个项目的许可。
+> **贡献代码时请不要引入 GPL / AGPL 系的依赖** —— 这类许可证有传染性，会让整个项目被迫换许可证。字幕读写用的是项目自带的 `app/srt_util.py`，没有任何第三方依赖。
 
 **模型权重不在本仓库（git）内**，各自遵守原作者的许可。它们被打包在「运行环境安装包」里随程序分发（详见 THIRD_PARTY_LICENSES.md 第三节），其中 pyannote 用的是公开转存版而非官方 gated 版。
 
