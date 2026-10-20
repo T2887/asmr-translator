@@ -29,8 +29,8 @@
 
 | 文件 | SHA256 |
 |---|---|
-| ASMR-Translator-Setup.exe | `58ba2c9b27b7c10a79b972d92d395fb1de4d0a6c3ec93034f67ef0e7dc995a1f` |
-| 运行环境.zip | `7023c0b7873fdf96a2a62537780884186d1068933bc0ea633c14ebc4cb4594d9` |
+| ASMR-Translator-Setup.exe | `25252a660bbabd8b6964776044a68c89d0c198d08484ea47e462ce146053968e` |
+| 运行环境.zip | `4f5c9fdc5360da728c9d7aa8b31db0e15caa32b531e633199bf215b0f087681d` |
 
 网盘文件夹里另有一份 `SHA256SUMS.txt`，包含解压后 5 个文件各自的校验值。
 
