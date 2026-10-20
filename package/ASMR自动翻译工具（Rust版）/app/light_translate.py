@@ -66,13 +66,24 @@ def free_port():
 
 
 def pick_device():
-    """优先独显（但要留足显存安全空间），显存不够就退核显，最后 CPU。
+    """兼容模式：优先【非 NVIDIA】的 Vulkan 设备（核显 / AMD / Intel），
+    NVIDIA 只作兜底；都不满足 → CPU。
 
-    安全空间规则（v1.21）：
-      · 独显：空闲显存 ≥ 3 GB 才用。1.5B 模型约 1.5 GB（权重 + 上下文），
-        留 1.5 GB 余量，避免把用户其他程序挤掉（显存不足会触发驱动重置）。
-      · 核显：共享系统内存，要求 ≥ 3 GB 空闲。
-      · 都不满足 → CPU。
+    【为什么不再「独显优先」（2026-10-20 改）】
+      用户原话：「我选了兼容模式，这里为什么还是 5070？兼容模式不应该是
+      工作在显存不足 6G 的 N 卡、非 N 独显和核显吗？」。
+      对：兼容模式的定位就是「不吃 N 卡」—— 显存留给别的 GPU 任务。
+      原来的策略是「谁显存多用谁」，在有 5070 的机器上兼容模式照样把
+      模型塞进 5070，和模式说明自相矛盾。
+
+    【为什么还留着 NVIDIA 兜底】
+      纯 N 卡且没有核显的机器（不少台式机）上，如果硬性排除 N 卡，
+      就只剩 CPU，翻译会慢到没法用。所以顺序是：
+        核显 → 非 N 独显 → N 卡（兜底）→ CPU
+
+    显存安全空间（沿用 v1.21 规则）：
+      · 1.5B 模型约 1.5 GB（权重 + 上下文），另留 1 GB 余量。
+      · 核显共享系统内存，同样要求 ≥ 2.5 GB 空闲。
     """
     # 1.5B 模型约 1.5 GB（权重+上下文），再留约 1 GB 余量。
     DISCRETE_MIN_FREE_MIB = 2560
@@ -104,15 +115,25 @@ def pick_device():
         low = name.lower()
         return any(k in low for k in ("uhd graphics", "iris", "vega", "radeon(tm) graphics"))
 
-    # 1) 独显：空闲显存够才用
-    for idx, name, _total, free in devices:
-        if not integrated(name) and free >= DISCRETE_MIN_FREE_MIB:
-            return idx, name
-    # 2) 核显：共享内存够才用
-    for idx, name, _total, free in devices:
+    def nvidia(name: str) -> bool:
+        low = name.lower()
+        return any(k in low for k in ("nvidia", "geforce", "rtx", "quadro", "tesla"))
+
+    non_nvidia = [d for d in devices if not nvidia(d[1])]
+
+    # 1) 核显（非 N 卡里找）：共享内存够就用
+    for idx, name, _total, free in non_nvidia:
         if integrated(name) and free >= INTEGRATED_MIN_FREE_MIB:
             return idx, name
-    # 3) CPU
+    # 2) 非 N 卡独显（AMD / Intel Arc）
+    for idx, name, _total, free in non_nvidia:
+        if not integrated(name) and free >= DISCRETE_MIN_FREE_MIB:
+            return idx, name
+    # 3) 兜底：这台机器没有非 N 的 Vulkan 设备，只能借 N 卡（总比 CPU 快）
+    for idx, name, _total, free in devices:
+        if free >= DISCRETE_MIN_FREE_MIB:
+            return idx, name
+    # 4) CPU
     return "none", "CPU"
 
 

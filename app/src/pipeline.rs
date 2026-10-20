@@ -100,42 +100,84 @@ use crate::srt;
 /// 不起进程、不加载模型。设备名的用途只有两个：状态栏显示、
 /// 判断「有没有非 N 卡设备」。
 pub fn detect_vulkan_devices() -> Vec<String> {
-    use windows_sys::Win32::Graphics::Gdi::{
-        EnumDisplayDevicesW, DISPLAY_DEVICE_ACTIVE, DISPLAY_DEVICEW,
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    // 【为什么改用 llama-server --list-devices】
+    //
+    //   原来用 EnumDisplayDevicesW 枚举 —— 它只列出「接了显示输出」的适配器。
+    //   这台机器显示器插在 5070 上，AMD 核显没接输出，于是枚举不到它，
+    //   副标题就写成了「RTX 5070 Vulkan 加速中」；可 light_translate.py 的
+    //   pick_device() 走的是 llama.cpp，它明明能看到 AMD Radeon(TM) Graphics
+    //   并把模型放上去 —— 界面和实际打架，用户一眼就看出来了。
+    //
+    //   现在两边同源：都问 llama.cpp（同一个 exe、同一份设备列表）。
+    //   用 CREATE_NO_WINDOW 起，不会闪黑框；llama 目录不存在时返回空。
+    let exe = std::path::PathBuf::from(config::work_dir())
+        .join("llama")
+        .join("llama-server.exe");
+    if !exe.is_file() {
+        return Vec::new();
+    }
+
+    let out = std::process::Command::new(&exe)
+        .arg("--list-devices")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let Ok(out) = out else {
+        return Vec::new();
     };
 
-    let mut devices = Vec::new();
-    let mut idx: u32 = 0;
-    loop {
-        let mut dd: DISPLAY_DEVICEW = unsafe { std::mem::zeroed() };
-        dd.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
-        let ok = unsafe { EnumDisplayDevicesW(std::ptr::null(), idx, &mut dd, 0) };
-        if ok == 0 {
-            break;
-        }
-        idx += 1;
+    // llama.cpp 有时把设备表打到 stderr，两头都收。
+    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
 
-        // 千问评审：不要用 ATTACHED_TO_DESKTOP 过滤（无头/远程/多屏时会漏），
-        // 用 ACTIVE 判断设备是否启用即可。
-        if dd.StateFlags & DISPLAY_DEVICE_ACTIVE == 0 {
+    let mut devices: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix("Vulkan") else {
             continue;
-        }
-        let name = String::from_utf16_lossy(&dd.DeviceString)
-            .trim()
-            .to_string();
+        };
+        // "0: NVIDIA GeForce RTX 5070 (11943 MiB, 11175 MiB free)"
+        let Some((_idx, tail)) = rest.split_once(':') else {
+            continue;
+        };
+        // 名字后面跟着 "(总显存 MiB, 空闲 MiB free)"，要去掉。
+        //   不能用 split('(') —— AMD 核显的名字里就有括号：
+        //   "AMD Radeon(TM) Graphics (32147 MiB, 30539 MiB free)"，
+        //   按第一个 '(' 切会得到 "AMD Radeon"，型号丢了。
+        //   改成找【最后一个 " (" 且其后是数字】的位置。
+        let name = match tail.rfind(" (") {
+            Some(i) if tail[i + 2..].starts_with(|c: char| c.is_ascii_digit()) => {
+                tail[..i].trim().to_string()
+            }
+            _ => tail.trim().to_string(),
+        };
         if name.is_empty() {
-            continue;
-        }
-        // 虚拟/基本显示适配器不是真实 GPU，排掉。
-        let low = name.to_lowercase();
-        if low.contains("basic display") || low.contains("remote") || low.contains("virtual") {
             continue;
         }
         if !devices.contains(&name) {
             devices.push(name);
         }
     }
-    devices
+
+    // 兼容模式「不吃 N 卡」：只要还有非 N 的 Vulkan 设备（核显 / AMD /
+    // Intel），就只报它们。这和 light_translate.py 的 pick_device() 同序。
+    let is_nvidia = |name: &str| {
+        let low = name.to_lowercase();
+        ["nvidia", "geforce", "rtx", "quadro", "tesla"]
+            .iter()
+            .any(|k| low.contains(k))
+    };
+    let non_nvidia: Vec<String> = devices.iter().filter(|n| !is_nvidia(n)).cloned().collect();
+    if non_nvidia.is_empty() {
+        devices
+    } else {
+        non_nvidia
+    }
 }
 
 /// 检测这台机器能不能用 CUDA。

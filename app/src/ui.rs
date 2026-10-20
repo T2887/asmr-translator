@@ -1303,7 +1303,13 @@ const WARN: Color = Color::rgb(0xa4, 0x44, 0x2c); // 警告文字
 /// 只做"去厂商前缀 + 截掉括号说明"两件事，不动型号本身 —— 型号随设备变，
 /// 任何写死的映射表都迟早对不上。核显（Intel / AMD 集显）走同一条路，
 /// 不再像以前那样只认 RTX/GTX/Arc/Radeon，认不出就整段消失。
-fn short_device(name: &str) -> &str {
+fn short_device(name: &str) -> String {
+    // 商标符号对用户没意义，先去掉：
+    //   "AMD Radeon(TM) Graphics" → "AMD Radeon Graphics"
+    // 注意只去 "(TM)" / "(R)" 这两个，别的括号（Intel(R)/Iris(R)）不动。
+    let cleaned = name.trim().replace("(TM)", "").replace("(tm)", "");
+    let cleaned = cleaned.replace("(R)", "").replace("(r)", "");
+    let name = cleaned.trim();
     let mut s = name.trim();
     // 前缀可能叠着（"AMD Radeon ..." 先剥 AMD 再剥 Radeon 也行），循环剥。
     for prefix in [
@@ -1325,7 +1331,15 @@ fn short_device(name: &str) -> &str {
     let end = s
         .find(|c| matches!(c, '（' | '）' | '，'))
         .unwrap_or(s.len());
-    s[..end].trim()
+    let s = s[..end].trim();
+
+    // "AMD Radeon Graphics"（核显）剥完前缀只剩 "Graphics"，反而看不懂了，
+    // 这里给回 "Radeon Graphics"。独显 "AMD Radeon RX 7900 XTX" 不受影响。
+    if s == "Graphics" {
+        "Radeon Graphics".to_string()
+    } else {
+        s.to_string()
+    }
 }
 
 /// 具体控件（Border/StackPanel/...），View 上没有这些方法（E0599）。
@@ -4000,21 +4014,24 @@ mod tests {
 
     #[test]
     fn 独显卡型号只保留短名() {
-        assert_eq!(short_device("NVIDIA GeForce RTX 5070"), "RTX 5070");
-        assert_eq!(short_device("NVIDIA GeForce RTX 3060 Laptop GPU"), "RTX 3060 Laptop GPU");
-        assert_eq!(short_device("AMD Radeon RX 7900 XTX"), "RX 7900 XTX");
+        assert_eq!(short_device("NVIDIA GeForce RTX 5070"), "RTX 5070".to_string());
+        assert_eq!(short_device("NVIDIA GeForce RTX 3060 Laptop GPU"), "RTX 3060 Laptop GPU".to_string());
+        assert_eq!(short_device("AMD Radeon RX 7900 XTX"), "RX 7900 XTX".to_string());
     }
 
     #[test]
     fn 核显型号也能取到() {
         // 兼容模式可能落到核显上，以前只认 RTX/GTX/Arc/Radeon，Intel 会被整段丢掉。
-        assert_eq!(short_device("Intel(R) UHD Graphics 630"), "UHD Graphics 630");
-        assert_eq!(short_device("Intel(R) Iris(R) Xe Graphics"), "Iris(R) Xe Graphics");
+        assert_eq!(short_device("Intel(R) UHD Graphics 630"), "UHD Graphics 630".to_string());
+        // 商标符号 (R) 被剥掉后更干净，这是有意的行为
+        assert_eq!(short_device("Intel(R) Iris(R) Xe Graphics"), "Iris Xe Graphics".to_string());
     }
 
     #[test]
     fn 带括号说明的会被截断() {
-        assert_eq!(short_device("NVIDIA GeForce RTX 5070（已启用 CUDA）"), "RTX 5070");
-        assert_eq!(short_device("   "), "");
+        assert_eq!(short_device("NVIDIA GeForce RTX 5070（已启用 CUDA）"), "RTX 5070".to_string());
+        assert_eq!(short_device("   "), String::new());
+        // 核显：AMD 集成显卡的名字带 (TM)，剥完前缀不能只剩 "Graphics"
+        assert_eq!(short_device("AMD Radeon(TM) Graphics"), "Radeon Graphics".to_string());
     }
 }
