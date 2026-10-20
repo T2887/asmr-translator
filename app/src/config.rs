@@ -552,7 +552,7 @@ pub fn python_exe() -> String {
 ///
 /// 1.12.1 相对 1.12 的变化：
 ///   · 【开源合规】删掉源码里所有硬编码的本机绝对路径。
-///     config.rs 里原来有 D:\ASMRASR、D:\ASMR翻译器-rust\package\...
+///     config.rs 里原来有 D:\ASMRASR、D:\ASMR翻译器\package\...
 ///     这些开发机专用路径，别人 clone 下来会指向不存在的目录，
 ///     报出来的错误和真实原因无关。
 ///     现在工作目录兜底到 exe 所在目录，Python 解释器支持

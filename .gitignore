@@ -69,3 +69,6 @@ _*.log
 
 # ── 图标预览图（由 tools/make_icon.py --preview 生成）──
 tools/preview/
+
+# ── 归档（旧 exe / 旧日志，不进版本库）──
+_归档/
