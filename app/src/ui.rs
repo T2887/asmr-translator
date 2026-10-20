@@ -600,7 +600,16 @@ impl AppUi {
         if files.is_empty() {
             return None;
         }
-        let idx = idx.min(files.len());
+        // 索引已经到头 = 上一轮全部处理完了。
+        //
+        //   不做这个判断的后果实测过：85 个文件跑完后重启，
+        //   照样弹「恢复上次的队列？（85 个文件，处理到第 86 个）」——
+        //   用户一脸问号。既然没有"下一个"了，队列就没有存在的意义，
+        //   顺手删掉，以后启动不再问。
+        if idx >= files.len() {
+            let _ = std::fs::remove_file(Self::queue_path());
+            return None;
+        }
         Some((files, idx))
     }
 
