@@ -1303,6 +1303,19 @@ const WARN: Color = Color::rgb(0xa4, 0x44, 0x2c); // 警告文字
 /// 只做"去厂商前缀 + 截掉括号说明"两件事，不动型号本身 —— 型号随设备变，
 /// 任何写死的映射表都迟早对不上。核显（Intel / AMD 集显）走同一条路，
 /// 不再像以前那样只认 RTX/GTX/Arc/Radeon，认不出就整段消失。
+/// 设备全名：只去商标符号（(TM) / (R)），保留厂商和型号。
+///
+/// 「设备状态」那一行要显示完整型号，但 `AMD Radeon(TM) Graphics` 带着
+/// 商标标记既难看、和全量模式的 `NVIDIA GeForce RTX 5070` 格式也不一致。
+fn plain_device_name(name: &str) -> String {
+    name.replace("(TM)", "")
+        .replace("(tm)", "")
+        .replace("(R)", "")
+        .replace("(r)", "")
+        .trim()
+        .to_string()
+}
+
 fn short_device(name: &str) -> String {
     // 商标符号对用户没意义，先去掉：
     //   "AMD Radeon(TM) Graphics" → "AMD Radeon Graphics"
@@ -2920,12 +2933,11 @@ impl Component for AppUi {
         //   兼容模式    → Vulkan：Radeon Graphics
         //                 （必须是核显/非 N 卡的名字，和副标题同一个来源）
         //   兼容但没有 Vulkan → 老老实实写 CPU
+        // 两种模式用同一套格式：GPU：<设备全名>（已启用 <后端>）
+        //   全量 / 精简 → GPU：NVIDIA GeForce RTX 5070（已启用 CUDA）
+        //   兼容模式    → GPU：AMD Radeon Graphics（已启用 Vulkan）
         let device_line: String = if accel_ok {
-            if compat {
-                format!("{accel}：{}", short_device(accel_name))
-            } else {
-                format!("GPU：{accel_name}（已启用 {accel}）")
-            }
+            format!("GPU：{}（已启用 {accel}）", plain_device_name(accel_name))
         } else if compat {
             "CPU：未找到可用的 Vulkan 设备".to_string()
         } else {
