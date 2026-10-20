@@ -2894,34 +2894,50 @@ impl Component for AppUi {
             None => View::from(TextBlock::new().text("").font_size(1.0)),
         };
 
+        // 当前该用哪块设备、哪个后端 —— 副标题和「设备状态」共用这一份，
+        // 免得两处各算各的、说成两块不同的卡（用户已经指出过一次）。
+        //
+        //   后端跟着【当前选中的模式】走，不是跟着检测结果走：
+        //     · 全量 / 精简 → CUDA   （torch 跑，卡名用 torch 报的）
+        //     · 兼容模式    → Vulkan （llama.cpp 跑，卡名用 llama 报的设备名，
+        //                              已排除 N 卡）
+        let compat = self.mode == pipeline::RunMode::Compat;
+        let (accel_name, accel) = if compat {
+            (
+                self.vulkan_name.as_str(),
+                if self.has_vulkan { "Vulkan" } else { "" },
+            )
+        } else {
+            (
+                self.cuda_name.as_str(),
+                if self.cuda_name.is_empty() { "" } else { "CUDA" },
+            )
+        };
+        let accel_ok = !accel_name.is_empty() && !accel.is_empty();
+
+        // 「设备状态」那一行：
+        //   全量 / 精简 → GPU：NVIDIA GeForce RTX 5070（已启用 CUDA）
+        //   兼容模式    → Vulkan：Radeon Graphics
+        //                 （必须是核显/非 N 卡的名字，和副标题同一个来源）
+        //   兼容但没有 Vulkan → 老老实实写 CPU
+        let device_line: String = if accel_ok {
+            if compat {
+                format!("{accel}：{}", short_device(accel_name))
+            } else {
+                format!("GPU：{accel_name}（已启用 {accel}）")
+            }
+        } else if compat {
+            "CPU：未找到可用的 Vulkan 设备".to_string()
+        } else {
+            self.device_status.clone()
+        };
+
         // 副标题：「本地转写 · 离线翻译 · RTX 5070 加速 · 第 56 / 137 个文件」
-        //   显卡短名从 device_status 里抠（"兼容模式（Vulkan: NVIDIA GeForce
-        //   RTX 5070）" → "RTX 5070"），检测中或纯 CPU 时这一段直接不出现。
         let subtitle = {
             let total = self.files.len();
             let mut parts: Vec<String> = vec!["本地转写".to_string(), "离线翻译".to_string()];
-            // 加速这一段：型号 + 后端，两者都齐了才写。
-            //
-            // 后端跟着【当前选中的模式】走，不是跟着检测结果走：
-            //   · 全量 / 精简 → CUDA     （torch 跑，卡名用 torch 报的）
-            //   · 兼容模式    → Vulkan   （llama.cpp 跑，卡名用显示适配器名）
-            // 用户在界面上把模式切到兼容模式，哪怕这台机器 CUDA 好好的，
-            // 模型也确实是跑在 Vulkan 上的 —— 副标题必须跟着变
-            // （用户实测反馈：切了兼容模式，标题还写着 CUDA）。
-            let compat = self.mode == pipeline::RunMode::Compat;
-            let (name, accel) = if compat {
-                (
-                    self.vulkan_name.as_str(),
-                    if self.has_vulkan { "Vulkan" } else { "" },
-                )
-            } else {
-                (
-                    self.cuda_name.as_str(),
-                    if self.cuda_name.is_empty() { "" } else { "CUDA" },
-                )
-            };
-            if !name.is_empty() && !accel.is_empty() {
-                parts.push(format!("{} {accel} 加速中", short_device(name)));
+            if accel_ok {
+                parts.push(format!("{} {accel} 加速中", short_device(accel_name)));
             }
             if total > 0 {
                 let idx = if self.running {
@@ -3041,7 +3057,7 @@ impl Component for AppUi {
                                         .vertical_alignment(VerticalAlignment::Center)
                                         .content(TextBlock::new().text("").font_size(1.0)),
                                     TextBlock::new()
-                                        .text(&self.device_status)
+                                        .text(&device_line)
                                         .font_size(14.0)
                                         .foreground(INK),
                                 )),
