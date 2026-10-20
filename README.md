@@ -259,6 +259,6 @@ cargo build --release
 ## 已知限制
 
 - **CUDA 加速只支持 NVIDIA 显卡**；AMD / Intel 核显走兼容模式（Vulkan / CPU），明显更慢
-- **4 GB 及以下显存**只能跑 CPU 模式，速度约为 GPU 的 1/50
+- **显存低于 6 GB 的 N 卡**会落到兼容模式：转写用 SenseVoice、翻译用 llama.cpp 的 **Vulkan** 后端，比 CUDA 慢但远没到「不可用」；只有机器上连 Vulkan 设备都没有时才退回纯 CPU，那才是最慢的一档
 - **Whisper large-v2 比 v3 更适合日语**（v3 改了 mel 特征，在长音频和噪声上更容易产生幻觉）
 - 模型加载每步各一次（4 个独立进程），约占总时间的 70%。合并成单进程能再省 5-6 秒/文件，但改动较大，暂未做

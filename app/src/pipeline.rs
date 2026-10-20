@@ -61,7 +61,8 @@ pub enum RunMode {
     Compat,
 }
 
-/// 兼容模式的流水线：CPU 转写 + 内置 llama.cpp 翻译。
+/// 兼容模式的流水线：SenseVoice 转写 + 内置 llama.cpp 翻译
+/// （后者优先走 Vulkan，机器上没有 Vulkan 设备时才退回纯 CPU）。
 ///
 /// 4 个阶段编号和全量模式一致，进度体系不用改：
 ///   1 提取音频（复用 a 脚本）
