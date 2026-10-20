@@ -50,7 +50,7 @@ Windows 桌面程序：**Rust + WinUI 3**（界面）+ **Python**（AI 推理）
 |---|---|---|
 | **≥ 8.1 GB** | 全速（float16） | 峰值约 7.3 GB，给其他程序留 5 GB |
 | **6 ~ 8.1 GB** | 精简模式（int8） | 峰值约 5 GB，识别慢约 20%，个别词可能不准 |
-| **< 6 GB** | **只能用 CPU** | 程序会弹窗确认，同意则跑（慢 50 倍），不同意则退出 |
+| **< 6 GB** | **兼容模式** | 自动切到 SenseVoice + Qwen（Vulkan 后端），比 CUDA 慢，但能出结果 |
 | AMD / Intel 核显 | **兼容模式** | 走 llama.cpp 的 Vulkan 后端（SenseVoice + Qwen），比 CUDA 慢，但能出结果 |
 
 **显存实测（RTX 5070 12GB，5 分钟音频）**：
