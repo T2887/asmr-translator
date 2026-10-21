@@ -115,7 +115,9 @@ pub fn tidy(cues: &[Cue], words: &[(String, String)]) -> (Vec<Cue>, usize) {
     for (i, c) in cues.iter().enumerate() {
         let a = c.start;
         let n = c.text.chars().filter(|ch| !ch.is_whitespace()).count() as f64;
-        let cap = a + (0.9 * n + 0.8).max(1.0);
+        // 常数项 2.0（原 0.8）：第 4 步 d_语音识别.py 会按 VAD 段末把 end
+        // 补长最多 1.2 秒；这里若仍用 0.8，短句会被再切回去，补长等于白做。
+        let cap = a + (0.9 * n + 2.0).max(1.0);
         let mut b = c.end.min(cap);
         if let Some(next) = cues.get(i + 1) {
             if next.start > a {
@@ -210,7 +212,7 @@ mod tests {
         ];
         let (out, shrunk) = tidy(&cues, &[]);
         assert_eq!(shrunk, 1);
-        assert!(out[0].end <= 0.0 + 0.9 * 2.0 + 0.8 + 0.001);
+        assert!(out[0].end <= 0.0 + 0.9 * 2.0 + 2.0 + 0.001);
     }
 
     #[test]

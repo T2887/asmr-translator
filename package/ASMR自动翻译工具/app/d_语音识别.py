@@ -183,23 +183,55 @@ import re as _re
 #   · 该字幕 start 所在 VAD 段的结尾 —— 真实语音边界，跨静音就截这里
 # 最后再夹到"下一条字幕 start"之前，保证不重叠。
 # ─────────────────────────────────────────────────────────────
+def _speech_tail(start, vad_subs, gap=0.5, max_span=15.0):
+    """返回「从 start 这一口气说到哪」：start 所在段起，向后把间隔
+    <= gap 的段连起来，取最后一个段末。
+
+    ASMR 里一口气说好几句、中间几乎不换气时，VAD 会切成很多小段。
+    只看 start 所在的那一段，就会把「话还没说完」的地方当成句尾。
+    v1.24.2 实测：191 条字幕里 29 条（15.2%）的 end 早于本条覆盖范围
+    内最后一个语音段末，最多早 4.17 秒 —— 用户听到的就是这句抱怨。
+    """
+    idx = None
+    for i, seg in enumerate(vad_subs):
+        if seg[0] - 0.25 <= start <= seg[1] + 0.25:
+            idx = i
+            break
+    if idx is None:
+        return None
+    tail = vad_subs[idx][1]
+    for seg in vad_subs[idx + 1:]:
+        va, vb = seg[0], seg[1]
+        if va - tail <= gap and vb - start <= max_span:
+            tail = vb
+        else:
+            break
+    return tail
+
+
 def _cap_row_end(start, end, text, vad_subs):
-    """给一条字幕算最长合理的 end；vad_subs 是原始音频上的 VAD 段。"""
+    """给一条字幕算合理的 end；vad_subs 是原始音频上的 VAD 段。
+
+    v1.24.2 改了两处：
+      · 段末不再只看 start 所在那一段，而是用 _speech_tail 把同一口气的
+        连续段连起来（一句话被 VAD 切碎时不至于提前收尾）
+      · 原来「只缩不伸」（end 一律 min(end, cap)），导致 whisper 偏早的
+        end 原封不动写盘；现在允许把 end 补到段末，单条最多补 1.2 秒，
+        差值超过 2 秒的多半是 ASR 漏词/误检，保持原样不硬补。
+    """
     n = len(text.replace(" ", ""))
     low = 0.30 * n + 0.6
     high = 0.90 * n + 0.8
     cap = start + high
 
-    # 找覆盖 start 的 VAD 段。允许 0.25 秒误差 —— whisper 的 start
-    # 映射回来偶尔会偏一点，卡死在边界上会一条都找不到。
-    seg_end = None
-    for va, vb, _t in vad_subs:
-        if va - 0.25 <= start <= vb + 0.25:
-            seg_end = vb
-            break
+    seg_end = _speech_tail(start, vad_subs)
     if seg_end is not None:
         # 段尾是真实语音结束；但不早于"正常语速该有的时长"
         cap = min(cap, max(seg_end, start + low))
+        if end < seg_end and seg_end - end <= 2.0:
+            # 补到段末，单条最多补 1.2 秒（千问评审建议 0.8；取 1.2 是
+            # 为了覆盖诊断里 0.87~1.59 秒那批的主要分布）
+            end = max(end, min(seg_end, end + 1.2))
 
     return min(end, cap)
 

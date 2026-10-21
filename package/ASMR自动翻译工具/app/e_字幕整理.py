@@ -94,6 +94,25 @@ def _apply_words(text, pairs):
 
 # ── 时间轴整理 ──────────────────────────────────────────────
 
+def _speech_tail(start, vad_segs, gap=0.5, max_span=15.0):
+    """从 start 所在段起向后连段，返回同一口气说到最后的段末。"""
+    idx = None
+    for i, seg in enumerate(vad_segs):
+        if seg[0] - 0.25 <= start <= seg[1] + 0.25:
+            idx = i
+            break
+    if idx is None:
+        return None
+    tail = vad_segs[idx][1]
+    for seg in vad_segs[idx + 1:]:
+        va, vb = seg[0], seg[1]
+        if va - tail <= gap and vb - start <= max_span:
+            tail = vb
+        else:
+            break
+    return tail
+
+
 def _cap_end(start, end, text, vad_segs, relax=1.0):
     """给一条字幕算最长合理的 end。
 
@@ -108,13 +127,13 @@ def _cap_end(start, end, text, vad_segs, relax=1.0):
     high = (0.90 * n + 0.8) * relax
     cap = start + high
 
-    seg_end = None
-    for va, vb in vad_segs:
-        if va - 0.25 <= start <= vb + 0.25:
-            seg_end = vb
-            break
+    # v1.24.2：段末改成「同一口气连起来之后的段末」，并且允许把 whisper
+    # 偏早的 end 补到段末（最多 1.2 秒）。与 d_语音识别.py 保持一致。
+    seg_end = _speech_tail(start, vad_segs)
     if seg_end is not None:
         cap = min(cap, max(seg_end, start + low))
+        if end < seg_end and seg_end - end <= 2.0:
+            end = max(end, min(seg_end, end + 1.2))
     return min(end, cap)
 
 
