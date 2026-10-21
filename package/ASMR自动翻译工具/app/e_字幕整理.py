@@ -92,6 +92,60 @@ def _apply_words(text, pairs):
     return text
 
 
+_REPEAT_WHITELIST = {
+    # ASMR 的正常拟声叠词（「ABAB」形状），折了会丢语义（千问评审指出）
+    "咕嘟", "咕噜", "扑通", "叮咚", "吧唧", "哗啦", "滴答", "呼噜", "啪嗒", "咔嚓",
+    "咕叽", "啾啾", "啵啵", "噗噗", "嗡嗡", "沙沙", "簌簌", "潺潺", "呼呼", "咚咚",
+    "砰砰", "啪啪", "嗒嗒", "嘶嘶", "哼哼", "哈哈",
+}
+
+
+def _collapse_repeats(text, max_len=4):
+    """折叠相邻重复片段：`欢迎欢迎` → `欢迎`（v1.24.3）。
+
+    为什么需要：第 4 步开着 initial_prompt / hotwords 时，whisper 会把碎段
+    合并成更流畅的长句（实测 22 条 → 11 条，字幕质量明显更好），代价是在
+    块拼接边界重复吐出同一段词：
+        「哎呀 欢迎欢迎 欢迎来到我的保健室」← 日语只说了一次「欢迎」
+    分别只开 prompt 或只开 hotwords 都能触发 —— 所以不能靠关掉它们来修，
+    关掉字幕会碎成一条一条的。
+
+    规则：
+      · 只折叠**重复单元长度 >= 2** 的（「谢谢 / 看看 / 嗯嗯」这种单字重复
+        单元天然进不了循环，不动）
+      · 单元长度上限 4（原 8；长句重复罕见，折了反而丢内容）
+      · 白名单里的拟声叠词跳过
+      · 连续重复多次一次折成一份
+    与 srt.rs 的 collapse_repeats 等价。
+    """
+    cs = list(text)
+    n = len(cs)
+    out = []
+    i = 0
+    while i < n:
+        hit = False
+        for l in range(min(max_len, (n - i) // 2), 1, -1):
+            if cs[i:i + l] == cs[i + l:i + 2 * l]:
+                if "".join(cs[i:i + l]) in _REPEAT_WHITELIST:
+                    break          # 正常拟声叠词，整串保留
+                k = 2
+                while i + (k + 1) * l <= n and cs[i:i + l] == cs[i + k * l:i + (k + 1) * l]:
+                    k += 1
+                # 重复之后紧跟「的 / 地 / 得 / 着」的是正常叠词
+                # （一抖一抖的 / 大口大口地 / biubiu地 / 摩擦摩擦的）；
+                # 重复幻觉后面跟的是新内容或句尾（欢迎欢迎 欢迎来到…）。
+                if i + k * l < n and cs[i + k * l] in "的地得着":
+                    break
+                out.extend(cs[i:i + l])
+                i += k * l
+                hit = True
+                break
+        if not hit:
+            out.append(cs[i])
+            i += 1
+    return "".join(out)
+
+
 # ── 时间轴整理 ──────────────────────────────────────────────
 
 def _speech_tail(start, vad_segs, gap=0.5, max_span=15.0):
@@ -157,8 +211,8 @@ def tidy_rows(rows, vad_segs, relax=1.0, wordlist=None):
         if nb < b - 0.01:
             shrunk += 1
         before += b - a
-        # 词表替换在这里做：流水线和 --batch 都会经过这一步。
-        out.append((a, nb, _apply_words(t, wordlist)))
+        # 词表替换 + 折叠重复（v1.24.3）：流水线和 --batch 都会经过这一步。
+        out.append((a, nb, _collapse_repeats(_apply_words(t, wordlist))))
     after = sum(b - a for a, b, _ in out)
     return out, shrunk, before, after
 

@@ -107,7 +107,73 @@ pub fn apply_words(text: &str, words: &[(String, String)]) -> String {
     out
 }
 
-/// 字幕整理：时长上限 + 不压到下一句 + 最少 0.4 秒 + 词表替换。
+/// 这些重复单元在 ASMR 里是正常的拟声/叠词，**不折叠**（千问评审指出）。
+///
+/// 例：`咕嘟咕嘟`、`啵啵啵啵`、`哈哈哈哈` 都是「ABAB」形状，正是音声的核心
+/// 内容；不列白名单会被折成 `咕嘟` / `啵啵` / `哈哈`，语义就丢了。
+/// 注意：这里放的是**重复单元**（如 `咕嘟`），不是整串。
+const REPEAT_WHITELIST: [&str; 26] = [
+    "咕嘟", "咕噜", "扑通", "叮咚", "吧唧", "哗啦", "滴答", "呼噜", "啪嗒", "咔嚓",
+    "咕叽", "啾啾", "啵啵", "噗噗", "嗡嗡", "沙沙", "簌簌", "潺潺", "呼呼", "咚咚",
+    "砰砰", "啪啪", "嗒嗒", "嘶嘶", "哼哼", "哈哈",
+];
+
+/// 折叠相邻重复片段：`欢迎欢迎` → `欢迎`（v1.24.3）
+///
+/// 为什么需要：第 4 步开着 `initial_prompt` / `hotwords` 时，whisper 会把
+/// 碎段合并成更流畅的长句（22 条 → 11 条，字幕质量明显更好），代价是在
+/// 块拼接边界重复吐出同一段词。实测：
+///   「哎呀 欢迎欢迎 欢迎来到我的保健室」← 日语只说了一次「欢迎」
+/// 分别只开 prompt 或只开 hotwords 都能触发，所以不能靠关掉它们来修
+/// —— 关掉字幕会碎成一条一条的。
+///
+/// 规则：
+///   · 只折叠**重复单元长度 ≥2** 的（`谢谢`/`看看`/`嗯嗯` 这种单字重复单元
+///     根本进不了循环，天然不动）
+///   · 单元长度上限 4（原 8；长句重复罕见，折了反而丢内容）
+///   · 白名单里的拟声叠词跳过（见 REPEAT_WHITELIST）
+///   · 连续重复多次（`欢迎欢迎欢迎`）一次折成一份
+pub fn collapse_repeats(text: &str) -> String {
+    let cs: Vec<char> = text.chars().collect();   // 用字符向量，避免 &str 切片的 UTF-8 边界 panic
+    let n = cs.len();
+    let mut out: Vec<char> = Vec::with_capacity(n);
+    let mut i = 0usize;
+    while i < n {
+        let mut hit = false;
+        let mut l = ((n - i) / 2).min(4);
+        while l >= 2 {
+            if cs[i..i + l] == cs[i + l..i + 2 * l] {
+                let piece: String = cs[i..i + l].iter().collect();
+                if REPEAT_WHITELIST.contains(&piece.as_str()) {
+                    break;   // 正常拟声叠词，整串保留
+                }
+                let mut k = 2usize;
+                while i + (k + 1) * l <= n && cs[i..i + l] == cs[i + k * l..i + (k + 1) * l] {
+                    k += 1;
+                }
+                // 重复之后紧跟「的 / 地 / 得 / 着」的是正常叠词：
+                //   「一抖一抖的」「大口大口地」「biubiu地」「摩擦摩擦的」
+                // 而重复幻觉后面跟的是新内容或句尾：
+                //   「欢迎欢迎 欢迎来到…」「享受了 享受了 无论…」「细致地 细致地」
+                if matches!(cs.get(i + k * l), Some('的') | Some('地') | Some('得') | Some('着')) {
+                    break;
+                }
+                out.extend_from_slice(&cs[i..i + l]);
+                i += k * l;
+                hit = true;
+                break;
+            }
+            l -= 1;
+        }
+        if !hit {
+            out.push(cs[i]);
+            i += 1;
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// 字幕整理：时长上限 + 不压到下一句 + 最少 0.4 秒 + 词表替换 + 折叠重复。
 /// 返回 (整理后的 cues, 被收缩的条数)。与 e_字幕整理.py 的规则一致。
 pub fn tidy(cues: &[Cue], words: &[(String, String)]) -> (Vec<Cue>, usize) {
     let mut out = Vec::with_capacity(cues.len());
@@ -131,7 +197,7 @@ pub fn tidy(cues: &[Cue], words: &[(String, String)]) -> (Vec<Cue>, usize) {
         out.push(Cue {
             start: a,
             end: b,
-            text: apply_words(&c.text, words),
+            text: collapse_repeats(&apply_words(&c.text, words)),
         });
     }
     (out, shrunk)
@@ -230,6 +296,57 @@ mod tests {
         assert_eq!(parse_time("23:59:59,999"), Some(23.0 * 3600.0 + 59.0 * 60.0 + 59.999));
         assert_eq!(fmt_time(0.0), "00:00:00,000");
         assert_eq!(fmt_time(86399.999), "23:59:59,999");
+    }
+
+    #[test]
+    fn collapse_repeats_folds_doubled_word() {
+        assert_eq!(
+            collapse_repeats("哎呀 欢迎欢迎 欢迎来到我的保健室"),
+            "哎呀 欢迎 欢迎来到我的保健室"
+        );
+        assert_eq!(collapse_repeats("欢迎欢迎欢迎"), "欢迎");
+        assert_eq!(collapse_repeats("我知道了我知道了"), "我知道了");
+    }
+
+    #[test]
+    fn collapse_repeats_keeps_normal_reduplication() {
+        // 单字重复单元（谢谢 / 看看 / 慢慢 / 嗯嗯）不是重复幻觉，不能动
+        assert_eq!(collapse_repeats("谢谢 看看 慢慢来"), "谢谢 看看 慢慢来");
+        assert_eq!(collapse_repeats("嗯嗯 痒痒的"), "嗯嗯 痒痒的");
+        assert_eq!(collapse_repeats("高高兴兴"), "高高兴兴");
+        // 「ABAB + 的/地」是正常叠词，必须原样（这是降低误伤的关键判据）
+        assert_eq!(collapse_repeats("喂 别一抖一抖的"), "喂 别一抖一抖的");
+        assert_eq!(collapse_repeats("大口大口地吞下去了"), "大口大口地吞下去了");
+        assert_eq!(collapse_repeats("biubiu地尽情地射精吧"), "biubiu地尽情地射精吧");
+        assert_eq!(collapse_repeats("我会好好地挖挖耳朵 摩擦摩擦的"),
+                   "我会好好地挖挖耳朵 摩擦摩擦的");
+        assert_eq!(collapse_repeats(""), "");
+        assert_eq!(collapse_repeats("普通的一句话"), "普通的一句话");
+    }
+
+    #[test]
+    fn collapse_repeats_keeps_whitelisted_onomatopoeia() {
+        // ASMR 的拟声叠词是「ABAB」形状，必须原样保留（千问评审）
+        assert_eq!(collapse_repeats("咕嘟咕嘟"), "咕嘟咕嘟");
+        assert_eq!(collapse_repeats("啵啵啵啵"), "啵啵啵啵");
+        assert_eq!(collapse_repeats("哈哈哈哈"), "哈哈哈哈");
+        assert_eq!(collapse_repeats("扑通扑通地跳"), "扑通扑通地跳");
+    }
+
+    #[test]
+    fn collapse_repeats_ignores_long_units() {
+        // 重复单元超过 4 字不再折叠（长句被说两遍罕见，折了会丢内容）
+        assert_eq!(collapse_repeats("今天我们很开心今天我们很开心"),
+                   "今天我们很开心今天我们很开心");
+    }
+
+    #[test]
+    fn tidy_collapses_repeats() {
+        let (out, _) = tidy(
+            &[Cue { start: 0.0, end: 5.0, text: "哎呀 欢迎欢迎 欢迎来到我的保健室".into() }],
+            &[],
+        );
+        assert_eq!(out[0].text, "哎呀 欢迎 欢迎来到我的保健室");
     }
 
     #[test]
