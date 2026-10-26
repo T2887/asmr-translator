@@ -830,7 +830,20 @@ pub fn python_exe() -> String {
 ///     temperature=0、以及「不注入 VAD 段改用内置 silero」，01 恒 1 处、04 恒 3 处
 ///     重复；连「prompt 与 hotwords 都不带」在 04 上仍是 3 处。所以只能后处理。
 ///   · e_字幕整理.py 同步该规则，两处逻辑保持一致。
-pub const APP_VERSION: &str = "1.24.3";
+/// 1.24.4：修「Win10 双击打不开」。
+///   · 报错「无法定位程序输入点 AddPackageDependency 于动态链接库 ...exe 上」。
+///     根因：windows-reactor 0.100 把 Win11 专有的
+///     api-ms-win-appmodel-runtime-l1-1-5.dll 里两个函数做成【静态导入】，
+///     Win10 加载器找不到它，进程在 main 之前就退出 —— 编译期完全看不出来。
+///   · 解法：链接器加 /DELAYLOAD（延迟加载，用到才解析），再在 bootstrap
+///     里加运行时探测：有原生 API（Win11）照旧走；没有（Win10）改走微软
+///     官方 Bootstrap DLL（Microsoft.WindowsAppRuntime.Bootstrap.dll 的
+///     MddBootstrapInitialize）。
+///   · 安装包附带 Bootstrap DLL；Win10 用户还需装一次 Windows App Runtime
+///     2.x（安装说明里有官方下载地址）。
+///   · 自包含分支只在 manifest 标记与运行时文件都齐全时才走，缺文件自动
+///     回退 Bootstrap，不会再「一步都不走」直接 panic。
+pub const APP_VERSION: &str = "1.24.4";
 
 /// 窗口标题
 pub fn app_title() -> String {

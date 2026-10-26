@@ -79,3 +79,7 @@ _归档/
 # ── GitHub Release 专用的英文名副本（内容与 1_主程序_安装包.exe 相同）──
 package/安装包/ASMR-Translator-Setup.exe
 
+
+# ── Win10 兼容性测试目录与临时交付包（不进版本库）──
+_win10_test/
+_win10_补丁/

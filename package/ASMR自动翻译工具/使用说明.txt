@@ -1,4 +1,4 @@
-﻿ASMR 日语语音 → 中文翻译  v1.24.3
+ASMR 日语语音 → 中文翻译  v1.24.3
 ==================================================
 
 【安装：两个安装包，装到同一个目录】
@@ -109,6 +109,11 @@
   · 全量/精简模式：NVIDIA 显卡（CUDA），显存 ≥ 6 GB（推荐 8 GB+）
   · 兼容模式：CPU + 核显/独显（Vulkan），或纯 CPU
   · Windows 10 / 11 64 位
+    ★ Win10 用户注意：第一次启动如果弹「无法定位程序输入点
+      AddPackageDependency」，说明系统缺 Windows App Runtime。
+      装一次微软官方运行时即可（约 120 MB）：
+      https://aka.ms/windowsappsdk/2.5/latest/windowsappruntimeinstall-x64.exe
+      装完再双击程序就能开。Win11 一般自带，不需要装。
   · 磁盘：安装约 10 GB；处理时还要临时空间（建议留 20 GB）
   · 不需要自己装 Python / 模型 / ffmpeg
 

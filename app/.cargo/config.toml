@@ -1,0 +1,8 @@
+[target.x86_64-pc-windows-msvc]
+# Win10 上没有 AddPackageDependency（仅 Win11 22H2+），
+# 延迟加载后，运行时走 self-contained 分支就不会去解析它。
+# delayimp.lib 提供 __delayLoadHelper2。
+rustflags = [
+  "-C", "link-arg=/DELAYLOAD:api-ms-win-appmodel-runtime-l1-1-5.dll",
+  "-C", "link-arg=delayimp.lib",
+]
