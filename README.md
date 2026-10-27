@@ -4,17 +4,19 @@
 
 **全程离线**，不上传任何文件。
 
-Windows 桌面程序：**Rust + WinUI 3**（界面）+ **Python**（AI 推理）。
+Windows 桌面程序：**Rust + egui**（界面，v1.25 起自绘）+ **Python**（AI 推理）。
+
+界面自绘之后不再依赖 Windows App Runtime / VC++ 运行库：**Win10、Win11 双击即跑**。
 
 ---
 
 ## 下载安装（普通使用者看这里）
 
-程序分**两个包**，两个都要下、都要装 —— 这样升级时只需要重下 17 MB，而不是 6 GB。
+程序分**两个包**，两个都要下、都要装 —— 这样升级时只需要重下 19 MB，而不是 6 GB。
 
 | 包 | 内容 | 大小 | 下载 |
 |---|---|---|---|
-| **主程序安装包** | 程序本体 + 界面 + llama.cpp | 17 MB | 👉 [Releases](../../releases) 的 Assets，或百度 / 夸克网盘（链接见 [Release 说明](docs/RELEASE.md)） |
+| **主程序安装包** | 程序本体 + 界面 + llama.cpp | 19 MB | 👉 [Releases](../../releases) 的 Assets，或百度 / 夸克网盘（链接见 [Release 说明](docs/RELEASE.md)） |
 | **运行环境.zip**（解压后 5 个文件） | Python 环境 + 全部模型权重 | 6.2 GB | 百度网盘 / 夸克网盘（链接见 [Release 说明](docs/RELEASE.md)） |
 
 两个包都装到 `C:\Program Files\ASMR自动翻译工具`（安装时会弹一次管理员授权）。

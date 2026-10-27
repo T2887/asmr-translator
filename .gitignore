@@ -88,3 +88,4 @@ _win10_补丁/
 _proto_egui/target*/
 _smoke/
 _proto_egui/patch_*.py
+_models/
