@@ -36,6 +36,10 @@ if _shutil.which("ffmpeg") is None:
     ffmpeg_downloader.add_path()
 
 pre_dir = config["path"]["pre"]      # "0pre"
+# 目录不存在就建出来：这个目录正常由安装程序创建，但如果被手动删掉/清空过，
+# 下面的 ffmpeg 会静默写不进去（脚本只看退出码看不出来），第 2 步就会报
+# 「0pre 里没有找到视频文件」——很难查。exist_ok 幂等，没有副作用。
+os.makedirs(pre_dir, exist_ok=True)
 # 支持的文件类型（v1.7.2：原来是 ("mp4", "mkv") 两种，
 # 用户把 FLAC 音声拖进来时会被当成"不是视频"跳过，第1步扫描 0pre 得到 0 个、
 # 退出码 1、整批中止 —— 但纯音频本来就是这个工具的主要用途之一。）

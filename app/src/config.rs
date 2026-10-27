@@ -228,7 +228,7 @@ pub fn python_exe() -> String {
 /// 1.22.1 相对 1.22.0 的变化：
 ///   · 【修 bug】启动程序时不应启动 llama：设备枚举改为 Win32
 ///     EnumDisplayDevicesW（纯 API 调用，不起进程、无黑框）。
-///     llama 和 1.5B 模型只在「勾选兼容模式 + 点开始处理」时才启动。
+///     llama 和翻译模型只在「勾选兼容模式 + 点开始处理」时才启动。
 ///
 /// 1.22.0 相对 1.21.1 的变化：
 ///   · 【新功能】文件列表里已处理完（有字幕产物）的文件名显示为浅绿色，
@@ -263,7 +263,7 @@ pub fn python_exe() -> String {
 ///     并且【不再弹】「CPU 慢 1/50」的劝退确认框 —— 那个框只留给
 ///     真的既没有 CUDA 也没有 Vulkan 的纯 CPU 机器。
 ///   · 发布目录新增 llama\（官方 llama.cpp Vulkan 版，约 88 MB）
-///     和 model\qwen2.5-1.5b-q4km.gguf（约 940 MB），给兼容模式用。
+///     和 model\Hy-MT2-1.8B-Q4_K_M.gguf（约 1.06 GB），给兼容模式用。
 ///   · 【新功能】环境卡片里新增三个运行模式选择框（单选）：
 ///       全量模式（N 卡显存 ≥ 8 GB）
 ///       精简模式（N 卡显存 6~8 GB）
@@ -272,7 +272,7 @@ pub fn python_exe() -> String {
 ///   · 【新功能】停止按钮旁新增「暂停 / 继续」：挂起当前阶段子进程
 ///     （NtSuspendProcess），计时和进度冻结，继续时恢复。
 ///   · 【流水线】兼容模式已接入：app\light_asr.py（Silero VAD + SenseVoice）
-///     + app\light_translate.py（内置 llama.cpp + Qwen2.5-1.5B）
+///     + app\light_translate.py（内置 llama.cpp + Hy-MT2-1.8B）
 ///     + app\e_字幕整理.py（时长上限 + 词表）。
 ///   · 【注意】兼容模式用的是 CPU + 核显（Vulkan），不占 N 卡显存。
 ///

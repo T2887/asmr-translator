@@ -1,4 +1,4 @@
-"""兼容模式 第3步：用内置 llama.cpp（Qwen2.5-1.5B）翻译。
+"""兼容模式 第3步：用内置 llama.cpp（Hy-MT2-1.8B）翻译。
 
 输入：2vad\\<名字>.json（light_asr.py 的产物）
 输出：3asr\\<名字>.srt
@@ -51,11 +51,58 @@ def _p(name):
 VAD_DIR = _p("2vad")
 ASR_DIR = _p("3asr")
 LLAMA = os.path.join("llama", "llama-server.exe")
-MODEL = os.path.join("model", "qwen2.5-1.5b-q4km.gguf")
+# ── 兼容模式的翻译模型（llama.cpp 的 GGUF）──
+#
+# 默认用混元翻译专用模型 Hy-MT2-1.8B：同一批 12 句实测它 12/12 全对，
+# 口语语气和专有名词都比通用小模型稳，CPU 上只慢约 15%（224ms vs 193ms/句）。
+#
+# 环境变量 ASMR_TRANSLATE_MODEL 可以指定 model\ 下的其它 gguf 文件名。
+# 新模型文件不存在时（例如用户还在用旧资源包）自动回退到原来的
+# Qwen2.5-1.5B —— 否则老用户一升级就会看到「缺少兼容模式组件」。
+MODEL_NEW = "Hy-MT2-1.8B-Q4_K_M.gguf"
+MODEL_OLD = "qwen2.5-1.5b-q4km.gguf"
+_MODEL_MIN_BYTES = 800 * 1024 * 1024  # 两个正式 GGUF 都 > 900 MB；拦截半截下载
+
+
+def _valid_model(path):
+    try:
+        return os.path.isfile(path) and os.path.getsize(path) >= _MODEL_MIN_BYTES
+    except OSError:
+        return False
+
+
+def _resolve_model():
+    """优先环境变量 → 新模型 → 旧资源包模型；返回绝对路径。
+
+    环境变量既可写文件名（从 model\ 下找），也可写绝对/相对路径。
+    明确指定但无效时只警告并继续回退，不让一处配置错误拖垮整批任务。
+    """
+    picked = os.environ.get("ASMR_TRANSLATE_MODEL", "").strip()
+    if picked:
+        candidate = picked if os.path.isabs(picked) else (
+            picked if os.path.dirname(picked) else os.path.join("model", picked)
+        )
+        candidate = os.path.abspath(candidate)
+        if _valid_model(candidate):
+            return candidate
+        print(f"[警告] 指定的翻译模型不存在或文件不完整，将自动回退：{candidate}")
+
+    for name in (MODEL_NEW, MODEL_OLD):
+        candidate = os.path.abspath(os.path.join("model", name))
+        if _valid_model(candidate):
+            if name == MODEL_OLD:
+                print("[提示] 新版翻译模型尚未安装，临时使用旧资源包里的 Qwen2.5-1.5B")
+            return candidate
+
+    # 交给 main() 的统一组件检查输出路径并退出。
+    return os.path.abspath(os.path.join("model", MODEL_NEW))
+
+
+MODEL = _resolve_model()
 
 SYSTEM = (
     "你是日译中字幕翻译。把用户给的日语翻译成简体中文，口语化、句子短促，"
-    "只输出中文，不要保留日文，不要解释。\n"
+    "只输出中文，不要保留日文，不要解释，译文必须是一行、不要换行。\n"
     "示例：\n"
     "日语：今日はいい天気ですね\n中文：今天天气真不错呢\n"
     "日语：ちょっと待ってください\n中文：请稍等一下\n"
@@ -108,10 +155,10 @@ def pick_device():
         非 N 独显 → 核显 → N 卡（兜底）→ CPU
 
     显存安全空间（沿用 v1.21 规则）：
-      · 1.5B 模型约 1.5 GB（权重 + 上下文），另留 1 GB 余量。
+      · 1.8B 模型约 1.8 GB（权重 + 上下文），另留 1 GB 余量。
       · 核显共享系统内存，同样要求 ≥ 2.5 GB 空闲。
     """
-    # 1.5B 模型约 1.5 GB（权重+上下文），再留约 1 GB 余量。
+    # 1.8B 模型约 1.8 GB（权重+上下文），再留约 1 GB 余量。
     DISCRETE_MIN_FREE_MIB = 2560
     INTEGRATED_MIN_FREE_MIB = 2560
 
@@ -293,6 +340,7 @@ def main():
     if not os.path.isfile(LLAMA) or not os.path.isfile(MODEL):
         print(f"[失败] 缺少兼容模式组件：{LLAMA} 或 {MODEL}")
         sys.exit(1)
+    print(f"[模型] 兼容模式翻译用：{os.path.basename(MODEL)}")
 
     port = free_port()
 

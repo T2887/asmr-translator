@@ -179,7 +179,8 @@ WDDM 下 `torch` 报的可用显存会高估好几倍（实测 nvidia-smi 报 98
 | BS-Roformer（UVR 社区版） | 人声分离 | MIT |
 | whisper-large-v2-translate-zh（4evergr8） | 语音识别 + 日→中翻译 | MIT |
 | SenseVoiceSmall | 兼容模式的语音识别 | MIT |
-| Qwen2.5-1.5B（GGUF 量化） | 兼容模式的翻译 | Apache-2.0 |
+| Hy-MT2-1.8B（GGUF Q4_K_M） | 兼容模式的翻译 | Apache-2.0 |
+| Qwen2.5-1.5B（GGUF 量化） | 兼容模式的翻译（旧资源包回退） | Apache-2.0 |
 | pyannote/segmentation-3.0（4evergr8 缓存） | VAD | MIT |
 
 > 模型权重来自 HuggingFace 上的公开仓库，已缓存进安装包，**使用者不需要 HF 账号、不需要联网下载**。

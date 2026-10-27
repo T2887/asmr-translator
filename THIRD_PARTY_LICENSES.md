@@ -69,7 +69,8 @@
 | **BS-Roformer**（人声分离） | `model_bs_roformer_ep_317_sdr_12.9755.ckpt` | 610 MB | Ultimate Vocal Remover 社区 | MIT |
 | **whisper-large-v2-translate-zh-v0.2-st-ct2**（识别 + 日→中翻译） | `models--4evergr8--…`（HF cache） | 2.9 GB | [4evergr8](https://huggingface.co/4evergr8) | MIT（基于 OpenAI Whisper 的 MIT 许可派生） |
 | **SenseVoiceSmall**（兼容模式识别） | `SenseVoiceSmall/model.pt` | 893 MB | 阿里 FunAudioLLM | MIT |
-| **Qwen2.5-1.5B-Instruct GGUF**（兼容模式翻译） | `qwen2.5-1.5b-q4km.gguf` | 940 MB | 阿里通义千问 | Apache-2.0 |
+| **Hy-MT2-1.8B GGUF**（兼容模式翻译） | `Hy-MT2-1.8B-Q4_K_M.gguf` | 1.06 GB | 腾讯混元 | Apache-2.0 |
+| **Qwen2.5-1.5B-Instruct GGUF**（旧资源包回退时使用） | `qwen2.5-1.5b-q4km.gguf` | 940 MB | 阿里通义千问 | Apache-2.0 |
 | **pyannote/segmentation-3.0**（VAD） | `models--4evergr8--pyannote-segmentation-3.0`（HF cache） | 5.6 MB | [4evergr8](https://huggingface.co/4evergr8) 的转存版 | MIT |
 
 > **关于 pyannote**：官方 `pyannote/segmentation-3.0` 是 gated model（需要登录 HF 并同意条款才能下载），但本项目用的是 `4evergr8` 转存到公开仓库的同一份权重（MIT 许可），随包分发的也是这份缓存。**使用者不需要 HF 账号**。

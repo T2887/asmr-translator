@@ -67,7 +67,7 @@ pub enum RunMode {
 /// 4 个阶段编号和全量模式一致，进度体系不用改：
 ///   1 提取音频（复用 a 脚本）
 ///   2 语音转写（Silero VAD + SenseVoice）
-///   3 翻译（内置 llama.cpp + Qwen2.5-1.5B）
+///   3 翻译（内置 llama.cpp + Hy-MT2-1.8B）
 ///   4 字幕整理（复用 e 脚本：时长上限 + 词表）
 pub const STAGES_COMPAT: [(usize, &str, &str); 4] = [
     (1, "app/a_提取音频.py", "第1步 提取音频"),
@@ -93,7 +93,7 @@ use crate::srt;
 
 /// 枚举本机的显示适配器名称（AMD / Intel / NVIDIA）。
 ///
-/// ★ 刻意【不调用 llama-server】：用户明确要求，llama 和 1.5B 模型
+/// ★ 刻意【不调用 llama-server】：用户明确要求，llama 和翻译模型
 ///   只在「勾选兼容模式 + 点开始处理」时才启动。启动程序时调
 ///   `llama-server --list-devices` 会闪一个黑框，也违背这个要求。
 ///
