@@ -29,7 +29,8 @@ pub fn read_srt(path: &Path) -> Result<Vec<Cue>, String> {
         let Some(start) = parse_time(a) else { continue };
         let Some(end) = parse_time(b) else { continue };
         let body: Vec<&str> = lines.collect();
-        let text = body.join(" ").trim().to_string();
+        // 保留换行：双语字幕是「日文原文一行 + 中文一行」，合并成一行就毁了两行排版。
+        let text = body.join("\n").trim().to_string();
         if !text.is_empty() {
             cues.push(Cue { start, end, text });
         }
@@ -105,6 +106,23 @@ pub fn apply_words(text: &str, words: &[(String, String)]) -> String {
         }
     }
     out
+}
+
+/// 整理一条字幕的正文（词表替换 + 折叠重复）。
+///
+/// 双语字幕（兼容模式勾了「生成日文字幕」但没勾「日文单独成文件」）是
+/// 「日文原文一行 + 中文一行」：**词表只能作用在最后一行（译文）上**。
+/// 词表是按中文写的（`卑处 => 秘书`），套到日文原文行上会把原文改坏，
+/// 而原文正是这份双语字幕存在的意义。
+pub fn tidy_text(text: &str, words: &[(String, String)]) -> String {
+    match text.rsplit_once('\n') {
+        None => collapse_repeats(&apply_words(text, words)),
+        Some((head, last)) => format!(
+            "{}\n{}",
+            head,
+            collapse_repeats(&apply_words(last, words))
+        ),
+    }
 }
 
 /// 这些重复单元在 ASMR 里是正常的拟声/叠词，**不折叠**（千问评审指出）。
@@ -197,7 +215,7 @@ pub fn tidy(cues: &[Cue], words: &[(String, String)]) -> (Vec<Cue>, usize) {
         out.push(Cue {
             start: a,
             end: b,
-            text: collapse_repeats(&apply_words(&c.text, words)),
+            text: tidy_text(&c.text, words),
         });
     }
     (out, shrunk)
@@ -226,6 +244,13 @@ pub fn tidy_dir(srt_dir: &Path, app_dir: &Path) -> Vec<String> {
     let mut total = 0usize;
     for p in &paths {
         let name = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        // 日文字幕（兼容模式勾了「额外生成日文字幕」的产物）不参与中文整理：
+        //   · 词表是「中文错译修正表」，套到日文上只会改坏；
+        //   · 时间轴本来就与中文字幕逐条一致，不需要再收一遍。
+        if name.to_lowercase().ends_with(".jpn.srt") {
+            logs.push(format!("[整理] 跳过日文字幕：{name}"));
+            continue;
+        }
         let stem = Path::new(&name)
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
@@ -288,6 +313,73 @@ mod tests {
             &[("卑处".to_string(), "秘书".to_string())],
         );
         assert_eq!(out[0].text, "秘书");
+    }
+
+    // 「额外生成日文字幕」的产物不参与中文整理：
+    //   · 词表是中文错译修正表，套到日文上只会改坏；
+    //   · 它的时间轴本来就与中文字幕逐条一致，不需要再收一遍。
+    #[test]
+    fn tidy_dir_skips_jpn_subtitle() {
+        let dir = std::env::temp_dir().join("asmr_srt_jpn_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let jp = dir.join("第一集.jpn.srt");
+        let jp_body = "1\n00:00:01,000 --> 00:00:02,000\n卑处だよ\n";
+        std::fs::write(&jp, jp_body).unwrap();
+        let zh = dir.join("第一集.srt");
+        std::fs::write(&zh, "1\n00:00:01,000 --> 00:00:02,000\n卑处\n").unwrap();
+        std::fs::write(dir.join("词表.txt"), "卑处 => 秘书\n").unwrap();
+
+        let logs = tidy_dir(&dir, &dir);
+
+        assert_eq!(
+            std::fs::read_to_string(&jp).unwrap(),
+            jp_body,
+            "日文字幕必须原样保留（不能被中文词表改）"
+        );
+        assert!(
+            std::fs::read_to_string(&zh).unwrap().contains("秘书"),
+            "中文字幕仍要按词表整理"
+        );
+        assert!(
+            logs.iter().any(|l| l.contains("跳过日文字幕")),
+            "日志里应说明跳过了日文字幕：{logs:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 行内双语（兼容模式勾了「生成日文字幕」但没勾「日文单独成文件」）：
+    // 一条字幕两行，日文原文在上、中文在下。
+    //   词表是中文错译修正表，只能动最后一行（译文）；
+    //   把原文行也替换掉，这份双语字幕就没有存在意义了。
+    #[test]
+    fn tidy_text_only_touches_last_line() {
+        let cues = vec![Cue {
+            start: 0.0,
+            end: 2.0,
+            text: "卑处です\n我是卑处".into(),
+        }];
+        let (out, _) = tidy(&cues, &[("卑处".to_string(), "秘书".to_string())]);
+        assert_eq!(out[0].text, "卑处です\n我是秘书");
+    }
+
+    // 双语字幕的两行排版不能在读文件时被合并成一行（曾经是 join(" ")）。
+    #[test]
+    fn read_srt_keeps_inner_newline() {
+        let dir = std::env::temp_dir().join("asmr_srt_bilingual_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.srt");
+        std::fs::write(&p, "1\n00:00:01,000 --> 00:00:02,000\nお姉さん\n姐姐\n").unwrap();
+
+        let cues = read_srt(&p).unwrap();
+
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].text, "お姉さん\n姐姐");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

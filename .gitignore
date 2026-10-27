@@ -83,3 +83,8 @@ package/安装包/ASMR-Translator-Setup.exe
 # ── Win10 兼容性测试目录与临时交付包（不进版本库）──
 _win10_test/
 _win10_补丁/
+
+# egui 版编译产物 / 本地测试素材
+_proto_egui/target*/
+_smoke/
+_proto_egui/patch_*.py

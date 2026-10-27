@@ -1,0 +1,25 @@
+[package]
+name = "asmr_proto_egui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+regex = "1"
+rfd = "0.17"
+# 拿原生窗口句柄给 DWM 设圆角（eframe 的 CreationContext::window_handle 返回它的类型）
+raw-window-handle = "0.6"
+# backend.rs 里用 GetModuleHandleA/GetProcAddress/OpenProcess 挂起恢复子进程；
+# Graphics_Dwm 用来给无边框窗口设 Win11 圆角
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

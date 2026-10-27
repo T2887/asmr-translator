@@ -63,6 +63,57 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// 调 taskkill。这比把 Child 塞进 Arc<Mutex<>> 再和读管道线程抢所有权简单得多。
 static CURRENT_PID: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
 
+/// 「精简模式」开关。
+///
+/// 背景：Python 侧的 compute_type（float16 / int8_float16）原本只由
+/// settings.py 按【显存大小】决定 —— 12 GB 的卡永远走 float16，
+/// 于是界面上选「精简模式」是个空操作（实测用户选了显存占用纹丝不动）。
+/// 现在把界面选的模式通过环境变量 ASMR_LITE 传进去，settings.py 认它。
+///
+/// 为什么用环境变量而不是命令行参数：compute_type 是 settings.py 在
+/// 【模块导入时】定的，那些脚本根本不接收参数；环境变量是唯一不用改
+/// 脚本调用约定的注入点。
+///
+/// 用 AtomicBool 而不是普通 static：run_stage 在后台线程里设置它，
+/// 而 run_script 也在（另一个）后台线程里读。虽然没有并发写，
+/// 但跨线程共享可变状态必须用原子类型，否则是未定义行为。
+static LITE_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 设置精简模式（true = 让 Python 强制走 int8 量化）。
+/// 每次开跑一个阶段前由 `pipeline::run_stage` 设置，子进程继承。
+pub fn set_lite_mode(on: bool) {
+    LITE_MODE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 「额外生成日文字幕」开关（只对兼容模式有意义）。
+///
+/// 打开后兼容模式的第 3 步（light_translate.py）会带上日文原文：
+///   · 关着 JPN_SEPARATE → 写进中文那一份里，一条字幕两行（日文在上、中文在下）
+///   · 开着 JPN_SEPARATE → 额外再写一份纯日文的 `<名字>.jpn.srt`
+///
+/// 日文原文就是 SenseVoice 识别出、本来就要送进翻译的那段文本，所以
+/// 打开它对速度【没有任何影响】（全量/精简模式没有日文原文可用，
+/// 界面会把开关禁掉）。
+static JPN_SUB: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 「日文单独成文件」子开关（只在 JPN_SUB 打开时有意义）。
+///
+/// 关着（默认）：日文原文并进中文那份 `<名字>.chs.srt`，一条字幕两行。
+/// 开着：中文归中文，日文额外写 `<名字>.jpn.srt` —— `.jpn` 是播放器认的
+/// 语言代码（PotPlayer 等按 ISO 639-2 找外挂字幕：`.chs` 中文、`.jpn` 日文），
+/// 两份字幕会同时被加载、可以随时切换。
+static JPN_SEPARATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 设置是否生成日文字幕（子进程通过 ASMR_JPN_SUB 读到）。
+pub fn set_jpn_sub(on: bool) {
+    JPN_SUB.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 设置日文是单独成文件、还是并进中文文件（子进程通过 ASMR_JPN_SEPARATE 读到）。
+pub fn set_jpn_separate(on: bool) {
+    JPN_SEPARATE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// 强杀当前正在跑的子进程（连同它的子进程树）。
 ///
 /// 对应 Python 版的 proc.terminate() + taskkill /F /T /PID。
@@ -242,6 +293,36 @@ pub fn run_script(
         // 程序目录（脚本要能找到 model/、ffmpeg/）。装进 Program Files 时
         // 程序目录不可写，所以由这个变量把「该往哪写」告诉 Python。
         .env("ASMR_DATA_DIR", crate::config::data_dir())
+        // 界面选的运行模式 → 传给 Python（见 LITE_MODE 的注释）。
+        // 每次都给值（"0"/"1"）而不是只在精简时设，这样切换模式后
+        // 下一个阶段的子进程不会残留上一次的设置。
+        .env(
+            "ASMR_LITE",
+            if LITE_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+                "1"
+            } else {
+                "0"
+            },
+        )
+        // 是否写日文字幕（见 JPN_SUB 的注释）。
+        // 同样每次都给值，避免上一个阶段/上一次运行设置残留。
+        .env(
+            "ASMR_JPN_SUB",
+            if JPN_SUB.load(std::sync::atomic::Ordering::Relaxed) {
+                "1"
+            } else {
+                "0"
+            },
+        )
+        // 日文是单独成文件还是并进中文（见 JPN_SEPARATE 的注释）。
+        .env(
+            "ASMR_JPN_SEPARATE",
+            if JPN_SEPARATE.load(std::sync::atomic::Ordering::Relaxed) {
+                "1"
+            } else {
+                "0"
+            },
+        )
         // 程序目录不可写时（装进了 Program Files），Python 会试着把
         // __pycache__ 写到脚本旁边，每次启动都失败一次、还刷一行警告。
         // 这种情况直接关掉字节码缓存；可写时保留，启动能快点。

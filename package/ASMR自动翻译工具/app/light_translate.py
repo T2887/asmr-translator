@@ -27,6 +27,23 @@ import urllib.request
 # Rust 侧会通过 ASMR_DATA_DIR 告诉我们该写到哪；不传时（命令行直跑）行为不变。
 _DATA_DIR = os.environ.get("ASMR_DATA_DIR", "").strip()
 
+# ── 日文字幕（用户在界面上勾选的两级开关）──
+#
+# 主开关 ASMR_JPN_SUB 打开后，日文原文（就是送进翻译的那段 SenseVoice 文本，
+# 也就是 2vad\<名字>.json 里的 text）会一起写进字幕；日文不需要模型额外
+# 产出，所以打开它【没有任何额外耗时】，也不改提示词、不影响译文质量。
+#
+# 子开关 ASMR_JPN_SEPARATE 决定日文放哪儿：
+#   · 关（默认）→ 写进中文那一份里，一条字幕两行：日文原文在上、中文在下。
+#     播放器不用切字幕轨，一眼能对着原文看。
+#   · 开 → 中文归中文，**额外**再写一份纯日文的 `<名字>.jpn.srt`，时间轴与
+#     中文完全一致。`.jpn` 是播放器认的语言代码（PotPlayer 等按 ISO 639-2
+#     找外挂字幕：`.chs` 中文、`.jpn` 日文），两份都会被自动加载、可随时切换。
+JPN_SUB = os.environ.get("ASMR_JPN_SUB", "0").strip() == "1"
+JPN_SEPARATE = os.environ.get("ASMR_JPN_SEPARATE", "0").strip() == "1"
+# 日文并进中文那一份（行内双语）
+JPN_INLINE = JPN_SUB and not JPN_SEPARATE
+
 
 def _p(name):
     return os.path.join(_DATA_DIR, name) if _DATA_DIR else name
@@ -241,13 +258,22 @@ def fmt_time(t):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+def _one_line(s):
+    """压成单行：SRT 一条字幕里除了我们故意加的那一个换行，不能再有换行，
+    否则字幕块会被切断（模型偶尔会吐多行、日文里也可能带换行）。"""
+    return " ".join(str(s).split())
+
+
 def tidy_rows(rows):
     """时长上限 + 不压到下一句 + 最少 0.4 秒（与 e_字幕整理.py 一致）。"""
     out = []
     for i, r in enumerate(rows):
         a = float(r["start"])
         b = float(r["end"])
+        # 行内双语是按两行的字数撑时长（日文那一行也要读完）
         n = len(r.get("zh", ""))
+        if JPN_INLINE:
+            n = max(n, len(r.get("jp", "")))
         cap = a + max(1.0, 0.9 * n + 0.8)
         b = min(b, cap)
         if i + 1 < len(rows):
@@ -303,6 +329,17 @@ def main():
                 print("[失败] llama-server 启动超时")
                 sys.exit(1)
         print("llama-server 就绪", flush=True)
+        print(
+            "[字幕] 日文字幕："
+            + (
+                "单独成文件（额外写一份 <名字>.jpn.srt）"
+                if JPN_SEPARATE
+                else "并进中文（每条字幕两行：日文在上、中文在下）"
+                if JPN_SUB
+                else "关闭（只写中文）"
+            ),
+            flush=True,
+        )
 
         os.makedirs(ASR_DIR, exist_ok=True)
         total = len(files)
@@ -326,19 +363,46 @@ def main():
                     continue
                 if not zh:
                     continue
-                done.append({"start": r["start"], "end": r["end"], "zh": zh})
+                done.append({"start": r["start"], "end": r["end"], "zh": zh, "jp": text})
                 print(f"[{float(r['start']):.2f}s -> {float(r['end']):.2f}s]: {zh}", flush=True)
 
             tidy = tidy_rows(done)
             lines = []
             for i, r in enumerate(tidy, 1):
+                zh = _one_line(r["zh"])
+                if JPN_INLINE:
+                    # 一条字幕两行：日文原文在上、中文在下。两条都用 \n 分隔，
+                    # 中间不能再有空行（空行会切断 SRT 块）。
+                    jp = _one_line(r.get("jp", ""))
+                    body = f"{jp}\n{zh}" if jp else zh
+                else:
+                    body = zh
                 lines.append(
-                    f"{i}\n{fmt_time(r['start'])} --> {fmt_time(r['end'])}\n{r['zh']}\n"
+                    f"{i}\n{fmt_time(r['start'])} --> {fmt_time(r['end'])}\n{body}\n"
                 )
             out = os.path.join(ASR_DIR, stem + ".srt")
             with open(out, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines))
             print(f"  写入 {len(lines)} 条 -> {out}", flush=True)
+
+            if JPN_SUB and JPN_SEPARATE:
+                # 额外一份纯日文，时间轴与中文完全一致。
+                #   文件名必须带 `.jpn` 语言代码，播放器才会当成「另一种语言的字幕」
+                #   自动加载；写成 `<名字>.jp.srt` 播放器认不出（`.jp` 是国家码，
+                #   不是语言码），写成 `<名字>.srt` 又会和某种播放器的默认字幕抢位置。
+                jp_lines = []
+                for r in tidy:
+                    jp = _one_line(r.get("jp", ""))
+                    if not jp:
+                        continue          # 没识别出日文的段跳过（编号要连续，见下）
+                    jp_lines.append(
+                        f"{len(jp_lines) + 1}\n"
+                        f"{fmt_time(r['start'])} --> {fmt_time(r['end'])}\n{jp}\n"
+                    )
+                jp_out = os.path.join(ASR_DIR, stem + ".jpn.srt")
+                with open(jp_out, "w", encoding="utf-8") as f:
+                    f.write("\n".join(jp_lines))
+                print(f"  写入 {len(jp_lines)} 条日文字幕 -> {jp_out}", flush=True)
             ok += 1
 
             pct = idx * 100.0 / total

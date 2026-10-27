@@ -21,7 +21,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use windows_reactor::CancellationToken;
+use crate::cancel::CancellationToken;
 
 use crate::backend;
 
@@ -520,6 +520,18 @@ fn finalize_subtitles_in(
         //   输出目录也是 3asr 时，这就是原地改名 —— 每跑一轮多一级
         //   `.chs`，实测滚到 252 个字符、超出 MAX_PATH，之后每轮整理
         //   都报 os error 123，还把这一轮真正要搬的字幕一起拖下水。
+        // 【语言代码】先摘出来，最后按原语言拼回目标名。
+        //
+        //   `xxx.chs.srt` → stem=`xxx`，lang=chs
+        //   `xxx.jpn.srt` → stem=`xxx`，lang=jpn
+        //
+        //   兼容模式勾了「额外生成日文字幕」时会多出 `.jpn.srt`，
+        //   不认它的话会被改成 `xxx.jpn.chs.srt` —— 播放器认不出这是字幕。
+        let mut lang = "chs";
+        if stem.to_lowercase().ends_with(".jpn") {
+            stem.truncate(stem.len() - 4);
+            lang = "jpn";
+        }
         while stem.to_lowercase().ends_with(".chs") {
             stem.truncate(stem.len() - 4);
         }
@@ -547,7 +559,7 @@ fn finalize_subtitles_in(
             None => (dest_dir.to_string(), false),
         };
 
-        let dst = format!(r"{dst_dir}\{stem}.chs.srt");
+        let dst = format!(r"{dst_dir}\{stem}.{lang}.srt");
 
         // 目标已存在就先删掉 —— rename 在 Windows 上不会覆盖
         if dst != path.to_string_lossy() && std::path::Path::new(&dst).exists() {
@@ -571,7 +583,7 @@ fn finalize_subtitles_in(
                     ));
                 } else {
                     kept += 1;
-                    logs.push(format!("[字幕] {fname} → {stem}.chs.srt（无对应视频，放进输出目录）"));
+                    logs.push(format!("[字幕] {fname} → {stem}.{lang}.srt（无对应视频，放进输出目录）"));
                 }
             }
             Err(e) => {
@@ -580,7 +592,7 @@ fn finalize_subtitles_in(
                     Ok(_) => {
                         let _ = std::fs::remove_file(&path);
                         moved += 1;
-                        logs.push(format!("[字幕] {fname} → {stem}.chs.srt（跨卷复制）"));
+                        logs.push(format!("[字幕] {fname} → {stem}.{lang}.srt（跨卷复制）"));
                     }
                     Err(e2) => {
                         failed += 1;
@@ -824,6 +836,17 @@ pub fn run_stage(
 ) -> StageResult {
     let (_, script, _) = stages(mode)[stage - 1];
     let marker = ready_marker(mode, stage);
+
+    // ★ 把界面选的运行模式传给 Python（环境变量 ASMR_LITE）。
+    //
+    //   以前 Python 侧的 compute_type 只按【显存大小】决定（settings.py），
+    //   12 GB 的卡永远 float16 —— 于是界面上选「精简模式」是个空操作，
+    //   实测用户选了显存占用纹丝不动（11.4/12.0 GB）。
+    //   现在用户手动选精简 = 明确要求省显存，settings.py 认这个变量，
+    //   强制走 int8_float16（识别显存约 4.0 GB → 2.0 GB，慢约 20%）。
+    //
+    //   每个阶段开跑前都设一次，保证切换模式后立刻生效。
+    backend::set_lite_mode(mode == RunMode::Lite);
 
     // ★ 纯 Rust 阶段（不 spawn Python）：v1.21 起字幕整理走这里。
     //   日志行直接产出，进度/ETA 不参与（整理只要几十毫秒）。
@@ -1105,6 +1128,31 @@ mod tests {
 
         let content = std::fs::read_to_string(vid.join("第四集.chs.srt")).unwrap();
         assert_eq!(content, "新字幕", "旧文件应被新字幕覆盖");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // 日文字幕（兼容模式勾了「额外生成日文字幕」）必须保住 `.jpn` 语言代码：
+    //   播放器靠它把两份字幕认成「同一部片的两种语言」。
+    //   不认的话会被改成 `xxx.jpn.chs.srt` —— 播放器再也认不出这是日文字幕。
+    #[test]
+    fn jpn_suffix_is_kept() {
+        let (root, srt, vid) = make_scene("jpn");
+
+        std::fs::write(srt.join("第一集.jpn.srt"), "日本語の字幕").unwrap();
+        let files = vec![vid.join("第一集.mp4").to_string_lossy().to_string()];
+
+        let logs =
+            finalize_subtitles_in(&srt.to_string_lossy(), &vid.to_string_lossy(), &files, true);
+
+        assert!(
+            vid.join("第一集.jpn.srt").is_file(),
+            "日文字幕应改名成 <视频名>.jpn.srt；日志: {logs:?}"
+        );
+        assert!(
+            !vid.join("第一集.jpn.chs.srt").exists(),
+            "不能把 .jpn 又拼上 .chs"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

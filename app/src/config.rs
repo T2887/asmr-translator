@@ -843,7 +843,24 @@ pub fn python_exe() -> String {
 ///     2.x（安装说明里有官方下载地址）。
 ///   · 自包含分支只在 manifest 标记与运行时文件都齐全时才走，缺文件自动
 ///     回退 Bootstrap，不会再「一步都不走」直接 panic。
-pub const APP_VERSION: &str = "1.24.4";
+/// 1.25：界面整体换成自绘的轻量 UI（egui），彻底不依赖 Windows App Runtime。
+///   · 起因：1.24.4 虽然能在 Win10 上跑起来，但前提是装 120 MB 的
+///     Windows App Runtime，且 exe 旁边要有 Bootstrap DLL；换台没装过的
+///     机器、或者那个 DLL 丢了，还是打不开。
+///   · 现在整个界面用 egui 重画（单文件 exe 约 6.3 MB），只依赖系统自带的
+///     Win32 API：Win10 双击即跑，不需要 Windows App Runtime、不需要
+///     VC++ 运行库、也不需要 Bootstrap DLL。
+///   · 界面与 WinUI 版保持一致：同一套色板与卡片布局、自绘标题栏
+///     （拖动 / 双击最大化 / 最小化 / 关闭）、拖边拉伸、DWM 圆角、
+///     130ms 过渡动画、文件拖放、列表选中。
+///   · 新增「生成日文字幕」（仅兼容模式）：勾选后每条字幕中文上面加一行
+///     日文原文；再勾「日文单独成文件」则额外写一份 <名字>.jpn.srt，
+///     播放器可随时切换中 / 日。
+///   · 新增「精简模式」按界面选择强制 int8 量化（此前只按显存判断，
+///     12 GB 卡上选精简等于没选）。
+///   · 进度与剩余时间沿用 WinUI 的估算口径（四步加权 + 当前文件单独估算）。
+///   · 流水线（app\ 下的 Python 脚本与 Rust 后端）与 1.24.4 完全一致。
+pub const APP_VERSION: &str = "1.25";
 
 /// 窗口标题
 pub fn app_title() -> String {

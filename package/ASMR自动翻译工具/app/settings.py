@@ -98,6 +98,24 @@ if config["device"] == "cuda":
               f"低于 6 GB 的最低要求")
         print(f"           人声分离需要约 2.5 GB 显存，装不下，已退回 CPU")
         print(f"           速度会慢很多（约为 GPU 的 1/50）")
+    elif os.environ.get("ASMR_LITE") == "1":
+        # 用户在界面上【手动选了「精简模式」】—— 这是明确要求省显存，
+        # 不再看显存够不够，一律走 int8。
+        #
+        # 为什么需要这条分支：上面那套阈值只看【显存大小】，12 GB 的卡
+        # 永远走 float16 —— 于是界面上选「精简模式」是个空操作，
+        # 实测用户选了之后显存占用纹丝不动（11.4/12.0 GB）。
+        # 界面选精简 = 想留显存给别的程序（游戏、浏览器、视频），不是
+        # 因为跑不动，所以必须让用户的选择真正生效。
+        config["compute_type"] = "int8_float16"
+        config["lite_mode"] = True
+        _gb = _total_mib / 1024 if _total_mib else 0.0
+        print(f"[精简模式] 已按你的选择强制 int8 量化（界面里选的，"
+              f"不看显存大小）")
+        if _gb:
+            print(f"           当前显存共 {_gb:.1f} GB，识别阶段占用约 2.0 GB"
+                  f"（float16 时约 4.0 GB）")
+        print(f"           代价：识别速度慢约 20%、个别词可能不够准确")
     elif 0 < _total_mib < _NEED_F16_MIB:
         config["compute_type"] = "int8_float16"
         config["lite_mode"] = True

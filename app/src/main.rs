@@ -12,6 +12,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod backend;
+mod cancel;
 mod config;
 mod pipeline;
 mod srt;
