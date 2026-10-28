@@ -71,6 +71,13 @@ import shutil as _shutil_disk
 _GB = 1024 ** 3
 _PER_FILE_GB = 2.7
 _SAFETY = 1.3
+# 容差：剩余空间和预估需求只差一点点时不判死。
+# 实测踩过 —— 界面打印「需要 3.5 GB，当前可用 3.5 GB」却当场中止，
+# 因为底下是 3.51 对 3.48，只差 30 MB；四舍五入到一位小数后用户
+# 根本看不出差别，只会觉得程序无缘无故不让跑。
+# 0.3 GB 的容差足够吸收「刚好卡在临界点」的情况，而真正的空间不足
+# （差几百 MB 以上）照样拦得住。
+_TOLERANCE_GB = 0.3
 
 try:
     _n_files = len([
@@ -80,11 +87,12 @@ try:
     _need_gb = _n_files * _PER_FILE_GB * _SAFETY
     _work_root = os.path.abspath(".")
     _free_gb = _shutil_disk.disk_usage(_work_root).free / _GB
-    print(f"磁盘检查: 待处理 {_n_files} 个，预计需要 {_need_gb:.1f} GB，当前可用 {_free_gb:.1f} GB")
-    if _free_gb < _need_gb:
+    print(f"磁盘检查: 待处理 {_n_files} 个，预计需要 {_need_gb:.2f} GB，当前可用 {_free_gb:.2f} GB")
+    if _free_gb + _TOLERANCE_GB < _need_gb:
         print("=" * 60)
         print("[中止] 磁盘空间不足")
-        print(f"       需要约 {_need_gb:.1f} GB，可用 {_free_gb:.1f} GB")
+        print(f"       需要约 {_need_gb:.2f} GB，可用 {_free_gb:.2f} GB"
+              f"（还差 {_need_gb - _free_gb:.2f} GB）")
         print("=" * 60)
         sys.exit(1)
 except SystemExit:

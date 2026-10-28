@@ -130,6 +130,10 @@ fn run_all(
             }
         }
 
+        // 本文件这次处理的起点：产物兜底时用它区分「本次新产出的字幕」
+        // 和「上一轮残留的旧字幕」（否则真失败会被误判成成功）。
+        let file_start = std::time::SystemTime::now();
+
         // 阶段间共享的实时通道（和 ui.rs 里那套一模一样）
         let live: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
         let ready = Arc::new(AtomicBool::new(false));
@@ -192,12 +196,28 @@ fn run_all(
             });
 
             if r.code != 0 {
-                log(
-                    &tx,
-                    format!("[失败] 第{stage}步退出码 = {}，流水线中止", r.code),
-                );
-                failed = true;
-                break;
+                // 【产物兜底】最后一个阶段正常写完字幕、却在进程退出时崩掉
+                // （实测 0xC0000409 = -1073740791，torch/ctranslate2 的析构里）。
+                // 字幕已经是好的，按失败处理会让用户白等十几分钟还拿不到字幕，
+                // 所以这里先看 3asr 有没有产物：有就继续走 tidy + finalize。
+                // 不限制阶段号：兼容模式出字幕的是第 3 步（翻译），
+                // 全量/精简是第 4 步（识别），只靠时间戳判定更通用。
+                if pipeline::has_any_subtitle_for(&file, file_start) {
+                    log(
+                        &tx,
+                        format!(
+                            "[警告] 第{stage}步退出码 = {}（进程收尾时崩溃），但字幕已生成，继续整理归位",
+                            r.code
+                        ),
+                    );
+                } else {
+                    log(
+                        &tx,
+                        format!("[失败] 第{stage}步退出码 = {}，流水线中止", r.code),
+                    );
+                    failed = true;
+                    break;
+                }
             }
             // 换阶段：清掉上一阶段残留
             if let Ok(mut f) = frac.lock() {

@@ -24,6 +24,12 @@ mod worker;
 
 use eframe::egui;
 use pipeline::RunMode;
+
+// 标称 6/8 GB 的显卡，CUDA 可管理容量可能因驱动和固件预留略低于整档。
+// 各给约 4% 容差；启动前另有 3/5 GB【当前空余】门槛负责安全兜底。
+const LITE_TOTAL_MIN_MIB: f64 = 5888.0; // 5.75 GiB，兼容标称 6 GB 卡
+const FULL_TOTAL_MIN_MIB: f64 = 7885.0; // 约 7.70 GiB，兼容标称 8 GB 卡
+use std::os::windows::process::CommandExt;
 use egui::{
     epaint::Shadow, Align, Align2, Color32, FontFamily, FontId, Frame, Label, Layout, Margin, Rect,
     RichText, ScrollArea, Sense, Stroke, Ui, Vec2,
@@ -94,9 +100,27 @@ struct App {
     /// Vulkan 设备名（llama 报的，已排除 N 卡），空串 = 没测到
     vulkan_name: String,
     has_vulkan: bool,
-    /// 独显剩余显存 GB（兼容模式下判断「显存不足」用）
+    /// 独显剩余显存 GB（nvidia-smi 的当前快照；0.0 = 读取失败）
     vram_free_gb: f64,
+    /// 点「开始」前正在后台刷新剩余显存。刷新完成后再决定是否真正启动，
+    /// 避免设备检测后的旧快照放过已被其他程序占满的显卡。
+    vram_refresh_rx: Option<std::sync::mpsc::Receiver<f64>>,
+    /// 刷新通过后下一帧真正启动。和 CPU 确认框的 pending_start 分开，
+    /// 防止 start() 再次刷新形成循环。
+    pending_start_after_vram: bool,
     has_gpu: bool,
+    /// 显卡总显存（GB）。0.0 = 没有 GPU 或读不出来
+    vram_gb: f64,
+    /// 是否正在显示「只能跑在 CPU 上」的确认框
+    show_cpu_warning: bool,
+    /// 用户已经确认过「就用 CPU 跑」—— 确认一次后不再弹
+    cpu_ok: bool,
+    /// 弹窗里点了「仍然继续」→ 下一帧开头再真正开跑。
+    /// 不在 ui() 里直接调 start()：egui 是即时模式，绘制过程中改一大批状态
+    /// 并启动后台线程容易踩到「画到一半数据变了」，推迟到帧开头最稳。
+    pending_start: bool,
+    /// 上一次帧里窗口上是否悬着被拖入的文件（只用于打一行诊断日志）
+    drop_hover_seen: bool,
     work_dir: String,
     data_dir: String,
     out_dir: String,
@@ -174,7 +198,14 @@ impl Default for App {
             vulkan_name: String::new(),
             has_vulkan: false,
             vram_free_gb: 0.0,
+            vram_refresh_rx: None,
+            pending_start_after_vram: false,
             has_gpu: false,
+            vram_gb: 0.0,
+            show_cpu_warning: false,
+            cpu_ok: false,
+            pending_start: false,
+            drop_hover_seen: false,
             work_dir: work,
             data_dir: data,
             // 取消勾选「放视频旁边」时这一项会显示出来，所以默认就得是真实目录
@@ -235,9 +266,18 @@ impl App {
     /// （逐个调 add_path 的话，拖 100 个文件就是 100 次全量重写 `_file_queue.txt`。）
     fn add_paths(&mut self, paths: &[String]) {
         let before = self.files.len();
+        // 被扩展名挡下来的文件不能默默丢掉 —— 用户拖进来却「什么都没发生」
+        // 是最难自己排查的一类问题，所以下面会单独打一行说明。
+        let mut skipped: Vec<String> = Vec::new();
         for p in paths {
             for f in config::expand_dropped_path(p) {
                 if !config::is_video_audio(&f) {
+                    skipped.push(
+                        std::path::Path::new(&f)
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| f.clone()),
+                    );
                     continue;
                 }
                 if self.files.iter().any(|r| r.path == f) {
@@ -256,6 +296,16 @@ impl App {
         }
         let n = self.files.len() - before;
         self.push_log(format!("[列表] 新增 {n} 个，共 {} 个文件", self.files.len()));
+        if !skipped.is_empty() {
+            let head: Vec<String> = skipped.iter().take(3).cloned().collect();
+            let more = if skipped.len() > 3 { " …" } else { "" };
+            self.push_log(format!(
+                "[列表] 跳过 {} 个不支持的文件：{}{}（支持 mp4/mkv/avi/mov/wmv/flv/webm/m4v/ts/mpg/mpeg + flac/wav/mp3/m4a/aac/ogg/opus/wma）",
+                skipped.len(),
+                head.join("、"),
+                more
+            ));
+        }
         if n > 0 {
             self.save_queue();
         }
@@ -435,12 +485,96 @@ impl App {
             .unwrap_or_else(|| "——".to_string())
     }
 
+    /// 已知剩余显存时，当前模式能否安全启动。
+    /// 总显存门槛（全量 8.0 / 精简 6.0 GB）判断硬件能力；这里判断当前余量：
+    /// 全量峰值约 4 GB + 1 GB 安全余量，精简约 2 GB + 1 GB安全余量。
+    /// 兼容模式不走 CUDA 主流水线，不受这个检查限制。
+    fn selected_mode_has_free_vram(&self) -> bool {
+        if self.vram_free_gb <= 0.0 {
+            return true; // 读取失败时不误杀；后端仍会给出真实 OOM 错误
+        }
+        match self.mode {
+            RunMode::Full => self.vram_free_gb >= 5.0,
+            RunMode::Lite => self.vram_free_gb >= 3.0,
+            RunMode::Compat => true,
+        }
+    }
+
+    /// 轻量刷新 NVIDIA 当前空余显存（不导入 torch，不阻塞 UI）。
+    fn refresh_free_vram_before_start(&mut self) {
+        if !self.has_gpu || matches!(self.mode, RunMode::Compat) {
+            self.pending_start_after_vram = true;
+            return;
+        }
+        if self.vram_refresh_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.vram_refresh_rx = Some(rx);
+        self.push_log("[显存] 正在刷新当前空余显存…");
+        std::thread::spawn(move || {
+            let free = std::process::Command::new("nvidia-smi")
+                .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
+                .creation_flags(0x08000000)
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .and_then(|s| s.lines().next()?.trim().parse::<f64>().ok())
+                .map(|mib| mib / 1024.0)
+                .unwrap_or(0.0);
+            let _ = tx.send(free);
+        });
+    }
+
     fn start(&mut self) {
         if self.running {
             return;
         }
         if self.files.is_empty() {
             self.push_log("[提示] 文件列表是空的，先用「添加文件」选几个");
+            return;
+        }
+        // 运行环境（env\python.exe）是整条流水线的前提。既没有内置环境、也没通过
+        // ASMR_PYTHON 指定时，config::python_exe() 会退回裸名字 "python" 交给 PATH
+        // 解析 —— 在没装 Python 的机器上会命中微软商店的占位 stub，子进程退出码
+        // 9009（cmd 的「命令找不到」），用户完全看不懂。这里提前把原因说清楚。
+        // 实测来源：朋友覆盖安装时把主程序装到了新目录，运行环境还在旧目录。
+        // 注意只在「最终会退回裸 python」时拦：env 存在或设了 ASMR_PYTHON 都放行，
+        // 免得误杀自己配了 Python 的用户。
+        if config::python_exe() == "python" {
+            let py = std::path::Path::new(&config::work_dir()).join(r"env\python.exe");
+            self.push_log(format!("[环境缺失] 找不到运行环境：{}", py.display()));
+            self.push_log(format!(
+                "[环境缺失] 请把「2_运行环境_安装包」装到同一个目录：{}",
+                config::work_dir()
+            ));
+            self.push_log(
+                "[环境缺失] 如果你自己装了 Python，可设置环境变量 ASMR_PYTHON 指向 python.exe 后重开程序",
+            );
+            return;
+        }
+        // 点击开始时先轻量刷新一次 nvidia-smi；设备检测时的快照可能早已过期。
+        // 刷新完成后 pump() 会把 pending_start_after_vram 置上，再进来继续。
+        if self.has_gpu && !matches!(self.mode, RunMode::Compat) && !self.pending_start_after_vram {
+            self.refresh_free_vram_before_start();
+            return;
+        }
+        self.pending_start_after_vram = false;
+        if !self.selected_mode_has_free_vram() {
+            let need = if matches!(self.mode, RunMode::Full) { 5.0 } else { 3.0 };
+            self.push_log(format!(
+                "[显存不足] {}需要至少约 {need:.1} GB 空余显存，当前只有 {:.1} GB，已阻止启动。请关闭占用显存的程序，或改用兼容模式。",
+                self.mode_name(), self.vram_free_gb
+            ));
+            return;
+        }
+        // 无 N 卡、显存不足 6 GB、而且没有 Vulkan 设备 → 只能跑 CPU，先弹窗确认一次
+        // （照 app/src/ui.rs:1892-1901）。放在任何状态被改动之前：用户点「取消」
+        // 后界面和没点过一样，不会停在半启动状态。
+        let no_cuda = !self.has_gpu
+            || (self.vram_gb > 0.0 && self.vram_gb * 1024.0 < LITE_TOTAL_MIN_MIB);
+        if no_cuda && !self.has_vulkan && !self.cpu_ok {
+            self.show_cpu_warning = true;
             return;
         }
         // 先在不可变借用里把「谁已经有字幕」算出来，再进 iter_mut 循环 ——
@@ -812,6 +946,38 @@ impl App {
     // ── 每帧收事件 ──
 
     fn pump(&mut self, ctx: &egui::Context) {
+        // 点开始前的轻量显存刷新结果（nvidia-smi，不导入 torch）。
+        if self.vram_refresh_rx.is_some() {
+            let got = self.vram_refresh_rx.as_ref().map(|rx| rx.try_recv());
+            match got {
+                Some(Ok(free)) => {
+                    self.vram_refresh_rx = None;
+                    if free > 0.0 {
+                        self.vram_free_gb = free;
+                        let vram_mib = self.vram_gb * 1024.0;
+                        self.full_ok = self.has_gpu
+                            && (self.vram_gb <= 0.0 || vram_mib >= FULL_TOTAL_MIN_MIB)
+                            && free >= 5.0;
+                        self.lite_ok = self.has_gpu
+                            && (self.vram_gb <= 0.0 || vram_mib >= LITE_TOTAL_MIN_MIB)
+                            && free >= 3.0;
+                        self.push_log(format!("[显存] 当前空余显存：{free:.1} GB"));
+                    } else {
+                        self.push_log("[显存] 无法刷新空余显存，将按设备检测结果继续");
+                    }
+                    // 自动延续刚才那次「开始」，用户不必再点第二次。
+                    self.pending_start_after_vram = true;
+                    self.pending_start = true;
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                    self.vram_refresh_rx = None;
+                    self.push_log("[显存] 刷新线程异常结束，将按设备检测结果继续");
+                    self.pending_start_after_vram = true;
+                    self.pending_start = true;
+                }
+                _ => {}
+            }
+        }
         // 设备检测结果（后台线程）
         if self.device_rx.is_some() {
             let got = self.device_rx.as_ref().map(|rx| rx.try_recv());
@@ -824,19 +990,56 @@ impl App {
                 Some(Ok((text, is_gpu, vram, free, vulkan, cuda_name, vk_name))) => {
                 self.device_rx = None;
                 self.device_text = text.clone();
-                self.full_ok = is_gpu && (vram <= 0.0 || vram >= 8.1);
-                self.lite_ok = is_gpu && (vram <= 0.0 || vram >= 6.0);
+                // 阈值与 Python settings.py 共用同一口径：标称 6/8 GB 卡各给约 4%
+                // 容差，避免驱动/固件预留后显示 6.0/8.0 GB 却被后台误判。当前空余
+                // 显存仍单独要求精简 3 GB、全量 5 GB，负责真正的 OOM 安全兜底。
+                let vram_mib = vram * 1024.0;
+                let free_unknown = free <= 0.0;
+                // 总显存判断硬件资格；当前空余显存判断此刻是否安全启动。
+                // 全量约 4 GB 峰值 + 1 GB 余量，精简约 2 GB + 1 GB 余量。
+                self.full_ok = is_gpu
+                    && (vram <= 0.0 || vram_mib >= FULL_TOTAL_MIN_MIB)
+                    && (free_unknown || free >= 5.0);
+                self.lite_ok = is_gpu
+                    && (vram <= 0.0 || vram_mib >= LITE_TOTAL_MIN_MIB)
+                    && (free_unknown || free >= 3.0);
                 self.cuda_name = cuda_name.clone();
                 self.vulkan_name = vk_name.clone();
                 self.has_vulkan = vulkan;
                 self.vram_free_gb = free;
+                self.vram_gb = vram;
                 self.has_gpu = is_gpu;
-                // 当前模式在这台机器上跑不动 → 自动退到兼容模式
-                if (self.mode == RunMode::Full && !self.full_ok)
-                    || (self.mode == RunMode::Lite && !self.lite_ok)
-                {
+                // 显存 < 8.1 GB → 自动进精简模式（照 app/src/ui.rs:2354-2366）。
+                // 8.1 GB 是 settings.py 算出来的门槛：识别 float16 峰值 4.2 GB
+                // + 系统基线 2.9 GB + 安全余量 1 GB。低于它时 Python 侧会把
+                // compute_type 换成 int8_float16，这里负责把「为什么」讲清楚。
+                if is_gpu && vram > 0.0 && vram < 8.1 {
+                    self.push_log(format!(
+                        "[精简模式] 当前显卡只有 {vram:.1} GB 显存，为保证你的其他程序正常运行，识别环节将工作在精简模式。"
+                    ));
+                    self.push_log(
+                        "[精简模式] 具体做法：把语音识别的计算精度从 float16 降到 int8，显存占用减半（约 4.0 GB → 2.0 GB）。",
+                    );
+                    self.push_log("[精简模式] 代价：识别速度慢约 20%，个别词可能不够准确。");
+                }
+                // 当前模式不安全：优先降到仍可运行的精简模式，否则兼容模式。
+                if self.mode == RunMode::Full && !self.full_ok {
+                    if self.lite_ok {
+                        self.mode = RunMode::Lite;
+                        self.push_log(format!(
+                            "[模式] 当前空余显存只有 {free:.1} GB（全量需约 5.0 GB），已自动切到精简模式"
+                        ));
+                    } else {
+                        self.mode = RunMode::Compat;
+                        self.push_log(format!(
+                            "[模式] 当前空余显存只有 {free:.1} GB（全量需约 5.0 GB、精简需约 3.0 GB），已自动切到兼容模式"
+                        ));
+                    }
+                } else if self.mode == RunMode::Lite && !self.lite_ok {
                     self.mode = RunMode::Compat;
-                    self.push_log("[模式] 本机不满足该模式，已自动切到兼容模式");
+                    self.push_log(format!(
+                        "[模式] 当前空余显存只有 {free:.1} GB（精简需约 3.0 GB），已自动切到兼容模式"
+                    ));
                 }
                 self.push_log(format!("[设备] {text}"));
                 self.push_log(format!(
@@ -1066,6 +1269,13 @@ impl App {
 /// 而边缘热区本身不需要参与 egui 的交互系统。
 fn resize_hotspots(ctx: &egui::Context) {
     use egui::{CursorIcon, ResizeDirection};
+
+    // 正拖着文件往窗口里来的时候，绝对不能在边缘抢「拖边改大小」——
+    // OLE 拖放和系统 resize 的模态循环会互相打断，表现就是
+    // 「拖文件到窗口边缘，窗口开始变大小，文件没放进去」。
+    if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+        return;
+    }
 
     const B: f32 = 6.0; // 热区厚度（逻辑点）
     let (r, mut p) = ctx.input(|i| (i.viewport_rect(), i.pointer.hover_pos()));
@@ -1671,6 +1881,13 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.pump(&ctx);
 
+        // 「只能用 CPU」弹窗确认过了 → 现在才真正开跑
+        // （推迟到帧开头，避免在绘制途中改一大批状态并启动后台线程）
+        if self.pending_start {
+            self.pending_start = false;
+            self.start();
+        }
+
         // 首帧按显示器尺寸校准窗口大小。
         //
         // 口径与 WinUI 版 preferred_window_size() 完全一致：
@@ -1697,6 +1914,19 @@ impl eframe::App for App {
         // ── 拖放进来的文件 ──
         // egui 0.37 起 DroppedFile 是个 trait（取路径用 .path() 而不是字段），
         // 而且是 Arc<dyn DroppedFile> —— 事件只在落下的那一帧出现。
+        //
+        // 下面这行「悬停」诊断是给排障用的：Windows 的 OLE 拖放分两步
+        // （DragEnter 悬停 → Drop 落下），如果拖进来毫无反应，先看日志里
+        // 有没有「鼠标正带着 N 个文件悬停」——
+        // 有 → 事件到了窗口，问题在本程序的落点处理；
+        // 没有 → 拖放事件根本没进窗口（系统/权限/窗口句柄层面的问题）。
+        let hover_n = ctx.input(|i| i.raw.hovered_files.len());
+        if hover_n > 0 && !self.drop_hover_seen {
+            self.drop_hover_seen = true;
+            self.push_log(format!("[拖放] 鼠标正带着 {hover_n} 个文件悬停在窗口上"));
+        } else if hover_n == 0 && self.drop_hover_seen {
+            self.drop_hover_seen = false;
+        }
         let dropped: Vec<String> = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -1705,6 +1935,7 @@ impl eframe::App for App {
                 .collect()
         });
         if !dropped.is_empty() {
+            self.push_log(format!("[拖放] 收到 {} 个路径", dropped.len()));
             if self.running {
                 // worker 拿的是「下标 + 路径」快照，运行中改列表会让它认错行；
                 // 所以处理期间不收新文件（停下再加）。
@@ -2255,8 +2486,10 @@ impl eframe::App for App {
                                             .add_filter(
                                                 "音视频",
                                                 &[
-                                                    "mp4", "mkv", "mov", "avi", "webm", "wav", "mp3", "flac",
-                                                    "m4a", "aac", "ogg",
+                                                    "mp4", "mkv", "avi", "mov", "wmv", "flv",
+                                                    "webm", "m4v", "ts", "mpg", "mpeg", "flac",
+                                                    "wav", "mp3", "m4a", "aac", "ogg", "opus",
+                                                    "wma",
                                                 ],
                                             )
                                             .pick_files()
@@ -2492,21 +2725,14 @@ impl eframe::App for App {
         if self.show_restore_dialog {
             let n = self.pending_queue.len();
             let idx = self.pending_idx.min(n);
-            let r = ctx.input(|i| i.viewport_rect());
-            // 半透明遮罩：把底下的界面压暗，也顺手吃掉点击
-            // （弹窗没处理掉之前不该能点别的地方）。
-            let p = ctx.layer_painter(egui::LayerId::new(
-                egui::Order::Foreground,
-                egui::Id::new("restore_dim"),
-            ));
-            p.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0x1f, 0x1e, 0x1d, 96));
-
+            // 用 egui 自带的 Modal：遮罩由它画在弹窗【下面】，还会挡住底下的输入。
+            // 之前是手画 layer_painter 遮罩 + Area 卡片 —— 同一图层内的先后不保证，
+            // 实测弹窗被自己的遮罩压暗了，而且遮罩不接收点击（能点到后面的按钮）。
             let mut do_restore = false;
             let mut do_clear = false;
-            egui::Area::new(egui::Id::new("restore_modal"))
-                .order(egui::Order::Foreground)
-                .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                .show(&ctx, |ui| {
+            egui::Modal::new(egui::Id::new("restore_modal"))
+                .backdrop_color(Color32::from_rgba_unmultiplied(0x1f, 0x1e, 0x1d, 96))
+                .frame(
                     Frame::new()
                         .fill(CARD)
                         .corner_radius(12.0)
@@ -2517,8 +2743,9 @@ impl eframe::App for App {
                             blur: 30,
                             spread: 0,
                             color: Color32::from_rgba_unmultiplied(0x1f, 0x1e, 0x1d, 40),
-                        })
-                        .show(ui, |ui| {
+                        }),
+                )
+                .show(&ctx, |ui| {
                             ui.set_width(400.0);
                             ui.label(
                                 RichText::new("恢复上次的队列？")
@@ -2564,13 +2791,94 @@ impl eframe::App for App {
                                     do_clear = true;
                                 }
                             });
-                        });
                 });
             if do_restore {
                 self.restore_queue();
             }
             if do_clear {
                 self.clear_queue_all();
+            }
+        }
+
+        // ── 「只能跑在 CPU 上」确认框（照 app/src/ui.rs:1892-1901）──
+        //
+        // 为什么必须拦一次：速度差 30~100 倍 —— GPU 上 1 小时的视频约 7 分钟，
+        // CPU 可能几小时到十几小时。不明确讲清量级，用户会以为「只是慢一点」
+        // 就直接开跑，然后挂一整天。确认过一次就记住（cpu_ok），不再重复弹。
+        if self.show_cpu_warning {
+            let mut do_go = false;
+            let mut do_cancel = false;
+            egui::Modal::new(egui::Id::new("cpu_modal"))
+                .backdrop_color(Color32::from_rgba_unmultiplied(0x1f, 0x1e, 0x1d, 96))
+                .frame(
+                    Frame::new()
+                        .fill(CARD)
+                        .corner_radius(12.0)
+                        .inner_margin(Margin::same(20))
+                        .stroke(Stroke::new(1.0, CARD_LINE))
+                        .shadow(Shadow {
+                            offset: [0, 10],
+                            blur: 30,
+                            spread: 0,
+                            color: Color32::from_rgba_unmultiplied(0x1f, 0x1e, 0x1d, 40),
+                        }),
+                )
+                .show(&ctx, |ui| {
+                            ui.set_width(430.0);
+                            ui.label(
+                                RichText::new("只能用 CPU 处理")
+                                    .size(18.0)
+                                    .color(WARN)
+                                    .family(FontFamily::Name("bold".into())),
+                            );
+                            ui.add_space(10.0);
+                            ui.label(
+                                RichText::new(
+                                    "没检测到可用的 N 卡（或显存不足 6 GB），也没有 Vulkan 设备。",
+                                )
+                                .size(13.0)
+                                .color(INK2),
+                            );
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new("人声分离和语音识别只能跑在 CPU 上，速度差 30~100 倍：")
+                                    .size(12.5)
+                                    .color(INK2),
+                            );
+                            ui.label(
+                                RichText::new(
+                                    "· 1 小时的视频：GPU 约 7 分钟，CPU 可能要几小时到十几小时",
+                                )
+                                .size(12.5)
+                                .color(INK3),
+                            );
+                            ui.add_space(16.0);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                if pill(
+                                    ui,
+                                    "仍然继续",
+                                    ACCENT_DEEP,
+                                    ACCENT_DEEP,
+                                    Color32::WHITE,
+                                    true,
+                                )
+                                .clicked()
+                                {
+                                    do_go = true;
+                                }
+                                if pill(ui, "取消", CARD, CARD_LINE, INK2, true).clicked() {
+                                    do_cancel = true;
+                                }
+                            });
+                });
+            if do_go {
+                self.cpu_ok = true;
+                self.show_cpu_warning = false;
+                self.pending_start = true; // 下一帧开头再开跑（不在这里递归进 start）
+            }
+            if do_cancel {
+                self.show_cpu_warning = false;
             }
         }
     }

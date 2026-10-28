@@ -860,7 +860,19 @@ pub fn python_exe() -> String {
 ///     12 GB 卡上选精简等于没选）。
 ///   · 进度与剩余时间沿用 WinUI 的估算口径（四步加权 + 当前文件单独估算）。
 ///   · 流水线（app\ 下的 Python 脚本与 Rust 后端）与 1.24.4 完全一致。
-pub const APP_VERSION: &str = "1.25";
+/// 1.25.1：修两处「跑了一小时却拿不到字幕」的问题。
+///   · 第 4 步（语音识别）的 Python 进程会在退出时崩掉：字幕已经写完、
+///     「所有 ASR 任务处理完毕！」也打印了，接着 ctranslate2 销毁 CUDA
+///     context / cuBLAS handle 失败，退出码 -1073740791（0xC0000409）。
+///     上游只按退出码判成败，于是「整理字幕」和「把字幕搬到视频旁边」
+///     这两步被整段跳过 —— 用户白等十几分钟，字幕躺在 3asr 里，界面显示
+///     「失败」。
+///   · 两层都修：脚本末尾 os._exit(0) 跳过 CUDA 析构（治本）；Rust 侧再加
+///     一道产物兜底 —— 退出码非 0 时若 3asr 里已有【本次运行新产出】的字幕
+///     （按 mtime 判定，避免上一轮残留被误判成成功），照常整理归位。
+///   · 顺带修掉「进度条停在 98% 直到结束」：那 2% 就是第 4 步没走到正常
+///     收尾、进度推不上去导致的。
+pub const APP_VERSION: &str = "1.25.1";
 
 /// 窗口标题
 pub fn app_title() -> String {
@@ -888,8 +900,18 @@ pub fn icon_path() -> Option<String> {
 }
 
 
-/// 支持的音视频扩展名（和 Python 版的 VIDEO_AUDIO_EXTS 保持一致）
-pub const VIDEO_AUDIO_EXTS: [&str; 5] = [".mp4", ".mkv", ".flac", ".wav", ".mp3"];
+/// 支持的音视频扩展名。
+///
+/// 必须和 Python 侧 `a_提取音频.py` 的 `VIDEO_EXTS + AUDIO_EXTS` **完全一致**。
+/// 那边认、这边不认的格式，用户拖进来就会「毫无反应」——
+/// v1.25 之前这份白名单只有 5 项（mp4/mkv/flac/wav/mp3），
+/// `.wmv`、`.avi`、`.mov`、`.m4a` 全被挡在门外，而 ffmpeg 其实都能处理。
+pub const VIDEO_AUDIO_EXTS: [&str; 19] = [
+    // 视频
+    ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".ts", ".mpg", ".mpeg",
+    // 音频
+    ".flac", ".wav", ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wma",
+];
 
 /// 判断一个路径是不是我们支持的音视频
 pub fn is_video_audio(path: &str) -> bool {

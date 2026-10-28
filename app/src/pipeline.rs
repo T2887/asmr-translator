@@ -324,7 +324,9 @@ except Exception:
             // 阈值和 settings.py 的 _NEED_F16_MIB（8289 MiB）保持一致：
             // float16 峰值 4265 + 基线 3000 + 预留 1024 = 8289 MiB ≈ 8.1 GB
             let lite = vram > 0.0 && vram < 8.1;
-            let text = if vram > 0.0 && vram < 6.0 {
+            // 标称 6 GB 卡的 CUDA 可管理容量可能略低于整 6 GiB；与 egui /
+            // settings.py 一致，按 5.75 GiB（5888 MiB）作为精简模式最低资格。
+            let text = if vram > 0.0 && vram * 1024.0 < 5888.0 {
                 "兼容模式".to_string()
             } else if name.is_empty() {
                 "GPU（已启用 CUDA）".to_string()
@@ -415,6 +417,78 @@ pub fn tidy_subtitles() -> Vec<String> {
 ///
 /// `dest_dir` 是【不勾选「放视频旁边」时】字幕的归宿。它来自界面上那个
 /// 输出目录，用户可以改（比如改到别的盘）。留空则用默认的 3asr\。
+/// 3asr 里是否已有【本次运行新产出】的字幕（任意语言后缀都算）。
+///
+/// 用途：给 worker 做「产物兜底」。
+///
+/// 实测（v1.25，1 小时视频，RTX 3060 Laptop）：第 4 步 whisper 已经正常
+/// 写完字幕并打印「处理完成，保存至 ...」，然后 Python 在退出清理阶段崩在
+/// C++ 析构里，退出码 0xC0000409（-1073740791）。按退出码一刀切判失败的话，
+/// 用户白等 17 分钟、字幕明明躺在 3asr 里，却被告知「失败」而且不会被搬到
+/// 视频旁边 —— 这一小时就白等了。
+///
+/// `since` 是这个文件的处理开始时刻：只有【修改时间晚于它】的字幕才算数，
+/// 否则上一轮留下的同名旧字幕会让真失败被误判成成功（千问评审第 1、2 条）。
+///
+/// 匹配故意宽松但有边界：
+///   - 前缀匹配 stem（分离后的人声名是 `<stem>_(Vocals)`，不是精确相等）
+///   - 但 stem 后面必须紧跟 `_` / `.` / 字符串结尾，否则 `abc` 会误吃 `abc2.chs.srt`
+///   - 文件要大于 32 字节，排除 0 字节残废文件
+pub fn has_any_subtitle_for(file: &str, since: std::time::SystemTime) -> bool {
+    has_any_subtitle_for_in(&crate::config::dir_asr(), file, since)
+}
+
+/// 同 [`has_any_subtitle_for`]，但目录由调用方给。
+///
+/// 拆出这一层纯粹是为了可测：生产路径的目录来自 `config::dir_asr()`，
+/// 而那个函数背后是 `OnceLock`（第一次取到就固定），单元测试里改
+/// `ASMR_DATA_DIR` 根本影响不到它 —— 只能把目录当参数传进来。
+pub fn has_any_subtitle_for_in(dir: &str, file: &str, since: std::time::SystemTime) -> bool {
+    let stem = std::path::Path::new(file)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if stem.is_empty() {
+        return false;
+    }
+    let lower = stem.to_lowercase();
+    let entries = match std::fs::read_dir(std::path::Path::new(dir)) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        let name = match p.file_name() {
+            Some(n) => n.to_string_lossy().to_lowercase(),
+            None => continue,
+        };
+        if !name.ends_with(".srt") || !name.starts_with(&lower) {
+            continue;
+        }
+        // `abc` 不能吃掉 `abc2.chs.srt`
+        let rest = &name[lower.len()..];
+        if !rest.is_empty() && !rest.starts_with('_') && !rest.starts_with('.') {
+            continue;
+        }
+        let m = match p.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if m.len() <= 32 {
+            continue;
+        }
+        // 必须比本次处理的开始时刻新 —— 这是「不是上一轮残留」的唯一证据
+        match m.modified() {
+            Ok(mt) if mt >= since => return true,
+            _ => continue,
+        }
+    }
+    false
+}
+
 pub fn finalize_subtitles(
     files: &[String],
     copy_to_video: bool,
@@ -1167,6 +1241,71 @@ mod tests {
             true,
         );
         assert!(logs[0].contains("找不到目录"), "应给出提示: {logs:?}");
+    }
+
+    // ── 【产物兜底】的判据 ──────────────────────────────────────────
+    //
+    // 第 4 步跑完、字幕已经写完，进程却在退出时崩掉（实测 0xC0000409）。
+    // 这时按失败处理会让用户白等十几分钟，还拿不到已经做好的字幕，
+    // 所以 worker.rs 会先看 3asr\ 里有没有【本次新产出】的字幕。
+    // 判据只有一条：mtime >= 本文件开始处理的时刻。
+    //
+    // 这条判据最容易错的地方，是把上一轮的残留当成新产物 ——
+    // 那样真正的失败会被判成成功，用户拿到旧字幕却毫不知情。
+
+    #[test]
+    fn new_subtitle_after_start_is_detected() {
+        let (root, srt, vid) = make_scene("fallback_new");
+        std::fs::write(
+            srt.join("第五集.chs.srt"),
+            "这是本次刚写出来的字幕，长度远超三十二字节的阈值。",
+        )
+        .unwrap();
+        let since = std::time::SystemTime::now() - std::time::Duration::from_secs(5);
+        let file = vid.join("第五集.mp4").to_string_lossy().to_string();
+        assert!(
+            has_any_subtitle_for_in(&srt.to_string_lossy(), &file, since),
+            "本次新产出的字幕应被认出来"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stale_subtitle_from_previous_run_is_ignored() {
+        let (root, srt, vid) = make_scene("fallback_old");
+        std::fs::write(
+            srt.join("第六集.chs.srt"),
+            "这是上一轮残留的字幕，长度同样远超三十二字节。",
+        )
+        .unwrap();
+        // since 放到未来 → 文件必然更旧，必须判成「不是本次产物」
+        let since = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let file = vid.join("第六集.mp4").to_string_lossy().to_string();
+        assert!(
+            !has_any_subtitle_for_in(&srt.to_string_lossy(), &file, since),
+            "上一轮残留不能当成本次产物，否则真失败会被误判成成功"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn empty_and_prefix_sibling_srt_are_ignored() {
+        let (root, srt, vid) = make_scene("fallback_edge");
+        // 空壳文件：写到一半就崩，内容不足 32 字节 → 不认
+        std::fs::write(srt.join("第七集.chs.srt"), "短").unwrap();
+        // 前缀相同但其实是另一个视频的字幕 → 不认
+        std::fs::write(
+            srt.join("第七集2.chs.srt"),
+            "这是另一个视频的字幕，前缀相同但不是同一个文件。",
+        )
+        .unwrap();
+        let since = std::time::SystemTime::now() - std::time::Duration::from_secs(5);
+        let file = vid.join("第七集.mp4").to_string_lossy().to_string();
+        assert!(
+            !has_any_subtitle_for_in(&srt.to_string_lossy(), &file, since),
+            "空壳文件和前缀相同的兄弟文件都不能误判"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

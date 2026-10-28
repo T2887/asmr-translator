@@ -370,3 +370,19 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
 
 emit("stage", "done", 4)
 print("\n所有 ASR 任务处理完毕！")
+
+# ★ v1.25.1：主动跳过 CUDA 析构，别让进程以 0xC0000409 退出。
+#
+#   实测（RTX 3060 Laptop 6GB，1 小时音频 / 410 段字幕）：字幕已经全部写完、
+#   "处理完成，保存至 ..." 和 "所有 ASR 任务处理完毕！" 都打印了，然后
+#   ctranslate2 在进程退出时销毁 CUDA context / cuBLAS handle 崩掉，退出码
+#   -1073740791（0xC0000409 = STATUS_STACK_BUFFER_OVERRUN）。
+#   业务早就做完了，崩的只是清理阶段 —— 但上游只按退出码判成败，会把这轮
+#   判成失败，后面的字幕整理和"搬到视频旁边"整段跳过。
+#
+#   os._exit 不跑 atexit / finally、不析构 C++ 对象。对马上要结束的进程没有
+#   代价（显存和句柄由内核回收）。必须先手动 flush：os._exit 不会替你刷缓冲，
+#   否则最后几行日志会丢。
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(0)

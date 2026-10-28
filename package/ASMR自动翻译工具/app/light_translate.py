@@ -305,10 +305,18 @@ def fmt_time(t):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+# 双重兜底：旧版 light_asr 生成的 JSON 里可能已有 SenseVoice 事件/情绪
+# emoji；模型也可能原样照抄。最终 `.chs.srt` / `.jpn.srt` 一律不保留。
+_SENSEVOICE_MARKS = str.maketrans("", "", "🎼👏😀😭🤧😷😊😔😡😰🤢😮❓")
+
+
 def _one_line(s):
-    """压成单行：SRT 一条字幕里除了我们故意加的那一个换行，不能再有换行，
-    否则字幕块会被切断（模型偶尔会吐多行、日文里也可能带换行）。"""
-    return " ".join(str(s).split())
+    """清掉非台词标记并压成单行。
+
+    SRT 一条字幕里除了我们故意加的那一个换行，不能再有换行，否则字幕块
+    会被切断（模型偶尔会吐多行、日文里也可能带换行）。
+    """
+    return " ".join(str(s).translate(_SENSEVOICE_MARKS).split())
 
 
 def tidy_rows(rows):

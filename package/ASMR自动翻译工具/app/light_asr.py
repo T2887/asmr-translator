@@ -40,6 +40,19 @@ except Exception:
 import soundfile as sf
 from funasr import AutoModel
 from funasr.utils.postprocess_utils import rich_transcription_postprocess
+
+# SenseVoice 的 rich transcription 会把事件/情绪标签转换成 emoji：
+# <|BGM|> → 🎼、<|ANGRY|> → 😡 等。它们不是台词，送给翻译模型既无助于
+# 翻译，还会原样混进最终 SRT；兼容模式只保留真正的语音正文。
+_SENSEVOICE_MARKS = str.maketrans("", "", "🎼👏😀😭🤧😷😊😔😡😰🤢😮❓")
+
+
+def clean_sensevoice_marks(text):
+    # 当前 funasr 的 rich_transcription_postprocess 返回 str；保守兼容未来可能
+    # 返回 list/tuple 的版本，避免 `str(list)` 把 []、引号和逗号写进字幕。
+    if isinstance(text, (list, tuple)):
+        text = " ".join(map(str, text))
+    return " ".join(str(text).translate(_SENSEVOICE_MARKS).split())
 from silero_vad import get_speech_timestamps, load_silero_vad, read_audio
 
 # ── 数据目录前缀 ──
@@ -78,11 +91,21 @@ total = len(files)
 t_start = time.time()
 
 
-def merge_segments(segs, gap_sec=0.6):
-    """合并间隔很近的段：Silero 对短促语音切得太碎，语义会被切散。"""
+def merge_segments(segs, gap_sec=0.6, max_sec=10.0):
+    """合并短停顿，但绝不把连续对话粘成一整屏字幕。
+
+    Silero 已用 ``max_speech_duration_s=10`` 限制单个原始段；旧代码随后又把
+    间隔小于 0.6 秒的段无限合并，连续对话可能从 1:20 一路粘到 2:23，最终
+    63 秒、十几句话同时显示。合并后的跨度达到 ``max_sec`` 就另起一段。
+    """
     merged = []
     for s in segs:
-        if merged and (s["start"] - merged[-1]["end"]) / 16000.0 < gap_sec:
+        can_join = False
+        if merged:
+            gap = (s["start"] - merged[-1]["end"]) / 16000.0
+            joined_span = (s["end"] - merged[-1]["start"]) / 16000.0
+            can_join = gap < gap_sec and joined_span <= max_sec
+        if can_join:
             merged[-1]["end"] = s["end"]
         else:
             merged.append({"start": s["start"], "end": s["end"]})
@@ -119,9 +142,11 @@ for idx, fp in enumerate(files, 1):
             try:
                 sf.write(tmp, data[a:b], sr)
                 r = asr.generate(input=tmp, language="ja", use_itn=True)
-                text = rich_transcription_postprocess(
-                    r[0].get("text", "") if r else ""
-                ).strip()
+                text = clean_sensevoice_marks(
+                    rich_transcription_postprocess(
+                        r[0].get("text", "") if r else ""
+                    )
+                )
             finally:
                 try:
                     os.remove(tmp)

@@ -85,17 +85,22 @@ if config["device"] == "cuda":
     #   6 GB 卡   → int8（峰值约 1960 + 3000 = 4960，余 1184 MiB ✓）
     #   8 GB 卡   → int8（8192 < 8289，余量不够 ✓ 走保守路线）
     #   12 GB 卡  → float16（7265，余 4962 MiB ✓）
-    _NEED_F16_MIB = 4265 + 3000 + 1024   # 8289
-    # 显存低于 6 GB 时连 int8 也放不下分离模型（分离峰值 +2585 MiB，
-    # 加上桌面基线就超过 4 GB 了）。这种情况退回 CPU。
-    _MIN_GPU_MIB = 6 * 1024              # 6144
+    # 标称 8 GB 卡也可能因驱动/固件预留略低于 8192 MiB。总容量资格给约
+    # 4% 容差（7.7 GiB）；界面在启动前仍要求至少 5.0 GB 当前空余显存。
+    # 因此容差只修正「标称容量误判」，不会放行已经被占满的显卡。
+    _NEED_F16_MIB = 7885                  # 约 7.70 GiB
+    # 标称 6 GB 的显卡，CUDA 可管理容量可能因驱动/固件预留略低于 6144 MiB；
+    # 若硬卡 6144，界面显示 6.0 GB 的 RTX 3060 Laptop 仍可能被误判成 CPU。
+    # 5.75 GiB（5888 MiB）只给标称 6 GB 档约 4.2% 容差；启动前界面仍会
+    # 实时要求至少 3.0 GB 空余显存，所以不会因为这个容差放行已占满的卡。
+    _MIN_GPU_MIB = 5888
 
     if 0 < _total_mib < _MIN_GPU_MIB:
         config["device"] = "cpu"
         config["compute_type"] = "int8"
         config["lite_mode"] = False
         print(f"[CPU 模式] 检测到显存只有 {_total_mib/1024:.1f} GB，"
-              f"低于 6 GB 的最低要求")
+              f"低于精简模式约 5.75 GB 的最低要求")
         print(f"           人声分离需要约 2.5 GB 显存，装不下，已退回 CPU")
         print(f"           速度会慢很多（约为 GPU 的 1/50）")
     elif os.environ.get("ASMR_LITE") == "1":

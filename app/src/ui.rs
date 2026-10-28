@@ -1893,7 +1893,7 @@ impl Component for AppUi {
                 // 的确认框。有 Vulkan（AMD/Intel 核显或独显）时走兼容模式，
                 // 不需要吓唬用户。
                 let no_cuda = !self.has_gpu
-                    || (self.vram_gb > 0.0 && self.vram_gb < 6.0);
+                    || (self.vram_gb > 0.0 && self.vram_gb * 1024.0 < 5888.0);
                 let no_vulkan = !self.has_vulkan;
                 if no_cuda && no_vulkan && !self.cpu_ok {
                     self.show_cpu_warning = true;
@@ -2333,8 +2333,10 @@ impl Component for AppUi {
                 // vram_gb == 0.0 表示「有 GPU 但显存读不出来」，按未知处理，
                 // 不阻止用户选择（否则会被强制塞进兼容模式）。
                 let vram_unknown = vram_gb <= 0.0;
-                self.mode_full_ok = is_gpu && (vram_unknown || vram_gb >= 8.0);
-                self.mode_lite_ok = is_gpu && (vram_unknown || vram_gb >= 6.0);
+                // 标称 6/8 GB 卡的 CUDA 可管理容量可能因预留略小于整档；
+                // 总容量各给约 4% 容差，实际启动仍由空余显存门槛兜底。
+                self.mode_full_ok = is_gpu && (vram_unknown || vram_gb * 1024.0 >= 7885.0);
+                self.mode_lite_ok = is_gpu && (vram_unknown || vram_gb * 1024.0 >= 5888.0);
                 self.mode = if self.mode_full_ok {
                     pipeline::RunMode::Full
                 } else if self.mode_lite_ok {
