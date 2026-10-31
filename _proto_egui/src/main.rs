@@ -20,6 +20,7 @@ mod pipeline;
 #[path = "../../app/src/srt.rs"]
 mod srt;
 mod cancel;
+mod subscan;
 mod worker;
 
 use eframe::egui;
@@ -61,6 +62,9 @@ struct FileRow {
     path: String,
     name: String,
     state: String,
+    /// 被跳过的原因（`内封字幕 subrip（chi）` / `画面里压了硬字幕` / `已有外挂字幕`）。
+    /// 只有 `state == "已有字幕"` 时才有值，界面上鼠标悬停能看到。
+    note: Option<String>,
 }
 
 struct App {
@@ -68,6 +72,19 @@ struct App {
     mode: RunMode,
     to_video: bool,
     force_redo: bool,
+    /// 收尾时产出哪种字幕文件：仅 SRT / 仅 ASS / 两个都要。
+    /// 默认「仅 SRT」—— 老用户升级后产物不变，不会突然多出一堆 .ass。
+    sub_fmt: srt::SubFmt,
+    /// 点「开始处理」后正在后台扫「这个片子是不是已经自带字幕」。
+    /// 扫描期间按钮显示「检查字幕…」且不可点。
+    prechecking: bool,
+    /// 后台扫描的结果通道。Some = 还在扫，None = 没在扫。
+    precheck_rx: Option<std::sync::mpsc::Receiver<Vec<(String, String)>>>,
+    /// 这一批文件已经扫过了。收到结果就置 true ——
+    /// 否则 start() 每次重入都会再扫一遍（队列一变就重置成 false）。
+    prechecked: bool,
+    /// 路径 → 跳过原因（`内封字幕 subrip（chi）` 这类）。命中的不进流水线。
+    skip_note: std::collections::HashMap<String, String>,
     /// 额外生成一份日文字幕（`<视频名>.jpn.srt`）。只有兼容模式能开 ——
     /// 全量/精简模式走 Whisper 的 translate 任务，日文在模型内部就没了。
     jpn_sub: bool,
@@ -91,7 +108,7 @@ struct App {
     // ── 真实后端接线 ──
     worker: Option<worker::Worker>,
     #[allow(clippy::type_complexity)]
-    device_rx: Option<std::sync::mpsc::Receiver<(String, bool, f64, f64, bool, String, String)>>,
+    device_rx: Option<std::sync::mpsc::Receiver<(String, bool, f64, f64, bool, String, String, f64)>>,
     device_text: String,
     full_ok: bool,
     lite_ok: bool,
@@ -111,6 +128,10 @@ struct App {
     has_gpu: bool,
     /// 显卡总显存（GB）。0.0 = 没有 GPU 或读不出来
     vram_gb: f64,
+    /// 显卡计算能力（SM），如 6.1 / 7.5 / 12.0；0.0 = 未知。
+    /// 低于 7.5 的老卡（Pascal / Maxwell / Volta）用自带的 torch 上 GPU
+    /// 会抛 cuDNN 9.19 的 SM 不兼容错误，只能走兼容模式。
+    gpu_cap: f64,
     /// 是否正在显示「只能跑在 CPU 上」的确认框
     show_cpu_warning: bool,
     /// 用户已经确认过「就用 CPU 跑」—— 确认一次后不再弹
@@ -177,6 +198,11 @@ impl Default for App {
             mode: RunMode::Full,
             to_video: true,
             force_redo: false,
+            sub_fmt: srt::SubFmt::Srt,
+            prechecking: false,
+            precheck_rx: None,
+            prechecked: false,
+            skip_note: std::collections::HashMap::new(),
             jpn_sub: false,
             jpn_separate: false,
             sized_to_screen: false,
@@ -198,6 +224,7 @@ impl Default for App {
             vulkan_name: String::new(),
             has_vulkan: false,
             vram_free_gb: 0.0,
+            gpu_cap: 0.0,
             vram_refresh_rx: None,
             pending_start_after_vram: false,
             has_gpu: false,
@@ -291,6 +318,7 @@ impl App {
                     path: f,
                     name,
                     state: "排队中".into(),
+                    note: None,
                 });
             }
         }
@@ -307,6 +335,9 @@ impl App {
             ));
         }
         if n > 0 {
+            // 队列变了 → 预检结论作废，下次点开始重新扫
+            self.prechecked = false;
+            self.skip_note.clear();
             self.save_queue();
         }
     }
@@ -408,6 +439,7 @@ impl App {
                 path: p,
                 name,
                 state: state.to_string(),
+                note: None,
             });
         }
         self.cur_idx = idx;
@@ -441,9 +473,10 @@ impl App {
 
     /// 这个文件算不算已经做完了。
     ///
-    /// 中文那份（`<名字>.chs.srt`）必须在；另外如果这次勾了「日文单独成文件」，
-    /// 日文那份也得在 —— 不然用户只改了这一个选项、又没勾「强制重新处理」时，
-    /// 会被当成做完了直接跳过，白等一场。
+    /// 按**当前选的字幕格式**判断：选了「仅 ASS」而磁盘上只有 .srt 时，
+    /// 这个文件其实还没做（用户要的 .ass 不存在），不能算完成 ——
+    /// 否则他改完格式再点开始会被整批跳过，还以为程序坏了。
+    /// 另外如果这次勾了「日文单独成文件」，日文那份也得在。
     fn has_subtitle(&self, path: &str) -> bool {
         let p = std::path::Path::new(path);
         let stem = p
@@ -451,7 +484,10 @@ impl App {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
         let dir = p.parent().unwrap_or(std::path::Path::new("."));
-        if !dir.join(format!("{stem}.chs.srt")).is_file() {
+        if self.sub_fmt.want_srt() && !dir.join(format!("{stem}.chs.srt")).is_file() {
+            return false;
+        }
+        if self.sub_fmt.want_ass() && !dir.join(format!("{stem}.chs.ass")).is_file() {
             return false;
         }
         let want_jpn = self.jpn_sub && self.jpn_separate && matches!(self.mode, RunMode::Compat);
@@ -462,6 +498,51 @@ impl App {
     }
 
     // ── 运行控制 ──
+
+    /// 「强制重新处理」时，先把本工具以前生成的字幕删掉。返回 `(删掉几个, 失败几个)`。
+    ///
+    /// 只删**自己产物**：视频旁 `<名字>.chs.srt/.ass`、`<名字>.jpn.srt/.ass`，
+    /// 以及 3asr 下同名的中间件。用户自己放的别的字幕（比如不带语言后缀的
+    /// `xxx.ass`）一根手指都不碰 —— 那是他的文件，不是我们生成的。
+    ///
+    /// 删不掉（被播放器占用 / 只读）时只记数不中断：继续跑下去，第 4 步脚本
+    /// 会看到目标还在而跳过，用户至少能拿到「字幕还是旧的」这个结果，
+    /// 比整个任务不开始要好。
+    fn purge_old_subs(&self) -> (usize, usize) {
+        let asr = std::path::PathBuf::from(config::dir_asr());
+        let mut n = 0usize;
+        let mut bad = 0usize;
+        for f in &self.files {
+            let p = std::path::PathBuf::from(&f.path);
+            let stem = p
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if stem.is_empty() {
+                continue;
+            }
+            let dir = p
+                .parent()
+                .map(|d| d.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let mut targets: Vec<std::path::PathBuf> = Vec::new();
+            for ext in ["srt", "ass"] {
+                targets.push(dir.join(format!("{stem}.chs.{ext}")));
+                targets.push(dir.join(format!("{stem}.jpn.{ext}")));
+                targets.push(asr.join(format!("{stem}.{ext}")));
+            }
+            for t in targets {
+                if !t.is_file() {
+                    continue;
+                }
+                match std::fs::remove_file(&t) {
+                    Ok(_) => n += 1,
+                    Err(_) => bad += 1,
+                }
+            }
+        }
+        (n, bad)
+    }
 
     fn n_stages(&self) -> usize {
         pipeline::stages(self.mode).len()
@@ -577,6 +658,61 @@ impl App {
             self.show_cpu_warning = true;
             return;
         }
+        // ── 开跑前先看这些片子是不是已经自带字幕 ──
+        //
+        //   分两层：内封的**软字幕**（ffprobe，毫秒级）+ 画面里烧死的**硬字幕**
+        //   （抽几帧看白字黑描边）。命中就标「已有字幕」跳过 —— 用户手上有一堆
+        //   已经压好中文字幕的片子，再跑一遍人声分离 + 识别 + 翻译纯属白烧
+        //   几十分钟（一部 80 分钟的片要跑小半小时）。
+        //
+        //   只扫一次：扫完之后 `prechecked` 才置位（表示「结果已就绪」），
+        //   千万不能在发起线程时就置位 —— 那样 `try_recv` 万一没被轮询到，
+        //   下次点开始就会直接跳过检测。
+        //   队列一变（增删文件）就把 `prechecked` 清掉重来。
+        //
+        //   ⚠️ 勾了「强制重新处理」就不扫 —— 用户的规则是「强制处理 = 我就要重做，
+        //      别拦我」。
+        if !self.force_redo && !self.files.is_empty() {
+            // 还在扫：等它，别抢先开跑（否则等于没检测）
+            if self.precheck_rx.is_some() {
+                self.push_log("[预检] 还在检查字幕，请稍候…");
+                return;
+            }
+            if !self.prechecked {
+                if subscan::tools().is_some() {
+                    let paths: Vec<String> = self.files.iter().map(|f| f.path.clone()).collect();
+                    let n = paths.len();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(subscan::precheck(&paths));
+                    });
+                    self.precheck_rx = Some(rx);
+                    self.prechecking = true;
+                    self.push_log(format!(
+                        "[预检] 检查 {n} 个文件是否自带字幕（内封 / 画面内嵌）…"
+                    ));
+                    return;
+                }
+                self.push_log("[预检] 没找到 ffmpeg / ffprobe，跳过自带字幕检测");
+                self.prechecked = true;
+            }
+        }
+        // 勾了「强制重新处理」：先把本工具以前生成的字幕删掉。
+        //
+        // 不删的话，第 4 步脚本会看到目标已存在而跳过，用户勾了重做却发现
+        // 字幕还是老的。只删本工具自己的产物（`.chs.*` / `.jpn.*` 和 3asr 下的中间件），
+        // 不碰用户自己放的其他文件。
+        if self.force_redo {
+            let (n, bad) = self.purge_old_subs();
+            if n > 0 {
+                self.push_log(format!("[强制] 已删除 {n} 个旧字幕文件"));
+            }
+            if bad > 0 {
+                self.push_log(format!(
+                    "[强制] 有 {bad} 个旧字幕删不掉（可能被播放器占用），这次可能沿用旧字幕"
+                ));
+            }
+        }
         // 先在不可变借用里把「谁已经有字幕」算出来，再进 iter_mut 循环 ——
         // 否则循环里调 self.has_subtitle() 会和 iter_mut 的可变借用打架（E0502）。
         let force = self.force_redo;
@@ -585,14 +721,38 @@ impl App {
             .iter()
             .map(|f| self.has_subtitle(&f.path))
             .collect();
+        // skip_note 克隆一份：循环里 self.files 已被可变借用，不能再用 self.skip_note
+        let skip_note = self.skip_note.clone();
         let mut jobs: Vec<(usize, String)> = Vec::new();
+        let mut newly_skipped: Vec<String> = Vec::new();
         for (i, f) in self.files.iter_mut().enumerate() {
             if !force && already[i] {
                 f.state = "完成".into();
+                f.note = None;
+            } else if !force && skip_note.contains_key(&f.path) {
+                let reason = skip_note[&f.path].clone();
+                f.state = "已有字幕".into();
+                f.note = Some(reason.clone());
+                newly_skipped.push(format!("        · {} —— {reason}", f.name));
             } else {
                 f.state = "排队中".into();
+                f.note = None;
                 jobs.push((i, f.path.clone()));
             }
+        }
+        if !newly_skipped.is_empty() {
+            let total = self.files.len();
+            self.push_log(format!(
+                "[跳过] {} 个文件已经自带字幕，不再重复处理",
+                newly_skipped.len()
+            ));
+            for line in newly_skipped {
+                self.push_log(line);
+            }
+            self.push_log(format!(
+                "[队列] {} 个待处理 / 共 {total} 个",
+                jobs.len()
+            ));
         }
         if jobs.is_empty() {
             self.push_log("[列表] 所有文件都已有字幕（勾上「强制重新处理」可重做）");
@@ -631,7 +791,13 @@ impl App {
                 && self.jpn_separate
                 && matches!(self.mode, RunMode::Compat),
         );
-        self.worker = Some(worker::spawn(jobs, self.mode, self.to_video, out));
+        self.worker = Some(worker::spawn(
+            jobs,
+            self.mode,
+            self.to_video,
+            out,
+            self.sub_fmt,
+        ));
     }
 
     fn stop(&mut self) {
@@ -665,6 +831,18 @@ impl App {
     ///   兼容但没 Vulkan 设备 → 显存够就写 `CPU：未找到可用的 Vulkan 设备`，
     ///                           显存不够（<4 GB）说明多半是显存被别的程序占了
     fn device_line(&self) -> String {
+        // 老卡（计算能力 < 7.5）优先说清楚原因 —— 否则会退到下面「兼容但没
+        // Vulkan」那句，写成「CPU：未找到可用的 Vulkan 设备」，把「显卡太老」
+        // 这个真正的原因藏掉了。
+        let arch_old = self.gpu_cap > 0.0 && self.gpu_cap < 7.5;
+        if arch_old {
+            let who = plain_device_name(&self.cuda_name);
+            return if who.is_empty() {
+                "显卡太老（计算能力低于 7.5），请用兼容模式".to_string()
+            } else {
+                format!("显卡太老（{who}），请用兼容模式")
+            };
+        }
         let (name, accel) = self.accel();
         if !name.is_empty() && !accel.is_empty() {
             return format!("GPU：{}（已启用 {accel}）", plain_device_name(name));
@@ -937,7 +1115,11 @@ impl App {
     }
 
     fn push_log(&mut self, s: impl Into<String>) {
-        self.logs.push(s.into());
+        let s = s.into();
+        // 实时落盘：崩溃/被结束时，界面上那些行会一起消失，
+        // 只有文件里还能看到「最后走到哪一步」。
+        append_run_log(&self.data_dir, &s);
+        self.logs.push(s);
         if self.logs.len() > 5000 {
             self.logs.drain(0..1500);
         }
@@ -987,7 +1169,7 @@ impl App {
                     self.device_text = "设备检测失败（可直接用兼容模式）".into();
                     self.push_log("[设备] 检测线程结束但没有回值");
                 }
-                Some(Ok((text, is_gpu, vram, free, vulkan, cuda_name, vk_name))) => {
+                Some(Ok((text, is_gpu, vram, free, vulkan, cuda_name, vk_name, cap))) => {
                 self.device_rx = None;
                 self.device_text = text.clone();
                 // 阈值与 Python settings.py 共用同一口径：标称 6/8 GB 卡各给约 4%
@@ -995,12 +1177,35 @@ impl App {
                 // 显存仍单独要求精简 3 GB、全量 5 GB，负责真正的 OOM 安全兜底。
                 let vram_mib = vram * 1024.0;
                 let free_unknown = free <= 0.0;
+                // 计算能力 < 7.5 的老卡（Pascal 6.x / Maxwell 5.x / Volta 7.0）：
+                // 自带 torch 2.11+cu128 的 cuDNN 9.19 不再为这些架构提供 kernel，
+                // 一上 GPU 加载模型就抛
+                //   RuntimeError: cuDNN version 91900 is not compatible with
+                //                 devices with SM < 7.5.
+                // 界面上表现为「第2步退出码 1」，用户看不出是显卡太老。所以这里
+                // 直接把全量/精简判为不可用，并把模式锁到兼容模式（纯 CPU 设计，
+                // 速度比「全量 + CPU」快得多）。
+                let arch_old = cap > 0.0 && cap < 7.5;
+                self.gpu_cap = cap;
+                if arch_old {
+                    self.push_log(format!(
+                        "[显卡] 检测到 {cuda_name}（计算能力 {cap:.1}），低于 7.5"
+                    ));
+                    self.push_log(
+                        "[显卡] 新版 PyTorch 的 cuDNN 已不再支持这么老的显卡，全量/精简模式在 GPU 上会直接报错",
+                    );
+                    self.push_log(
+                        "[显卡] 已锁定为兼容模式：它同样是纯 CPU 运行，但速度快得多，也没有显存要求",
+                    );
+                }
                 // 总显存判断硬件资格；当前空余显存判断此刻是否安全启动。
                 // 全量约 4 GB 峰值 + 1 GB 余量，精简约 2 GB + 1 GB 余量。
-                self.full_ok = is_gpu
+                self.full_ok = !arch_old
+                    && is_gpu
                     && (vram <= 0.0 || vram_mib >= FULL_TOTAL_MIN_MIB)
                     && (free_unknown || free >= 5.0);
-                self.lite_ok = is_gpu
+                self.lite_ok = !arch_old
+                    && is_gpu
                     && (vram <= 0.0 || vram_mib >= LITE_TOTAL_MIN_MIB)
                     && (free_unknown || free >= 3.0);
                 self.cuda_name = cuda_name.clone();
@@ -1023,7 +1228,11 @@ impl App {
                     self.push_log("[精简模式] 代价：识别速度慢约 20%，个别词可能不够准确。");
                 }
                 // 当前模式不安全：优先降到仍可运行的精简模式，否则兼容模式。
-                if self.mode == RunMode::Full && !self.full_ok {
+                // 老卡（arch_old）全量/精简都不可用，直接锁兼容模式，且不再拿
+                // 「空余显存」解释原因（那样会误导用户去关程序腾显存）。
+                if arch_old {
+                    self.mode = RunMode::Compat;
+                } else if self.mode == RunMode::Full && !self.full_ok {
                     if self.lite_ok {
                         self.mode = RunMode::Lite;
                         self.push_log(format!(
@@ -1881,6 +2090,52 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.pump(&ctx);
 
+        // 后台「自带字幕」扫描有结果了吗
+        //
+        //  先 take 出结果再改 self（`if let Some(rx) = &self.precheck_rx` 会和
+        //  后面 self.skip_note.insert 的可变借用打架 —— 和 vram_refresh_rx 同一个坑）。
+        if self.precheck_rx.is_some() {
+            let got = self.precheck_rx.as_ref().map(|rx| rx.try_recv());
+            match got {
+                Some(Ok(hits)) => {
+                    self.precheck_rx = None;
+                    self.prechecking = false;
+                    self.prechecked = true;
+                    self.skip_note.clear();
+                    if hits.is_empty() {
+                        self.push_log("[预检] 没有发现自带字幕的文件");
+                    } else {
+                        let n = hits.len();
+                        for (p, reason) in hits {
+                            self.skip_note.insert(p, reason);
+                        }
+                        self.push_log(format!(
+                            "[预检] {n} 个文件自带字幕，下面开始跳过的部分是它们"
+                        ));
+                    }
+                    // 结果已就绪、start() 里也不会阻塞 → 直接开跑。
+                    //
+                    // 原来这里是置 `pending_start` 等下一帧，但那样中间隔了一帧，
+                    // 用户这一帧里改了队列 / 点了停止的话，start() 会拿着旧的
+                    // `skip_note` 和 `already[]` 去分派 —— 索引和路径都可能对不上。
+                    ctx.request_repaint();
+                    self.start();
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                    self.precheck_rx = None;
+                    self.prechecking = false;
+                    // 线程崩了：置位以免每次点开始都重试同一个会崩的扫描
+                    self.prechecked = true;
+                    self.push_log("[预检] 扫描线程意外结束，跳过检测直接开跑");
+                    self.start();
+                }
+                _ => {
+                    // 还在扫：保证界面继续重绘，结果一到就能被取走
+                    ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                }
+            }
+        }
+
         // 「只能用 CPU」弹窗确认过了 → 现在才真正开跑
         // （推迟到帧开头，避免在绘制途中改一大批状态并启动后台线程）
         if self.pending_start {
@@ -2081,7 +2336,11 @@ impl eframe::App for App {
             )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    if self.running {
+                    if self.prechecking {
+                        // 正在扫自带字幕：按钮变成只读的进度提示，
+                        // 免得用户连点几次、每次都排一个扫描线程
+                        pill(ui, "检查字幕…", ACCENT_SOFT, CARD_LINE, INK3, false);
+                    } else if self.running {
                         pill(ui, "处理中…", ACCENT_SOFT, CARD_LINE, INK3, false);
                     } else if pill(ui, "开始处理 →", ACCENT_SOFT, ACCENT, ACCENT_INK, true).clicked() {
                         self.start();
@@ -2198,6 +2457,36 @@ impl eframe::App for App {
                                     {
                                         self.force_redo = !self.force_redo;
                                     }
+                                    // 输出字幕格式：ASS 是收尾时由 Rust 从 SRT 转的，
+                                    // 样式写死（黑体 / 白字 / 黑描边 / 底部居中 / 字号 52）——
+                                    // 要做可调样式就得配一整套实时预览，收益不值。
+                                    ui.add_space(4.0);
+                                    ui.label(RichText::new("输出字幕格式").size(11.0).color(INK2));
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 8.0;
+                                        for (f, txt) in [
+                                            (srt::SubFmt::Srt, "仅 SRT"),
+                                            (srt::SubFmt::Ass, "仅 ASS"),
+                                            (srt::SubFmt::Both, "两个都要"),
+                                        ] {
+                                            if chip(ui, txt, self.sub_fmt == f, true).clicked()
+                                                && self.sub_fmt != f
+                                            {
+                                                self.sub_fmt = f;
+                                                self.push_log(format!(
+                                                    "[设置] 输出字幕格式：{}",
+                                                    f.label()
+                                                ));
+                                            }
+                                        }
+                                    });
+                                    ui.label(
+                                        RichText::new(
+                                            "ASS：黑体白字黑描边、底部居中；选「两个都要」会同时出 .srt 和 .ass",
+                                        )
+                                        .size(11.0)
+                                        .color(INK3),
+                                    );
                                     // 日文字幕只有兼容模式有原文可用：
                                     //   全量/精简走 Whisper 的 translate 任务（日语直接进、中文直接出），
                                     //   日文在模型内部就丢掉了 —— 想拿日文得再跑一次识别，
@@ -2358,10 +2647,14 @@ impl eframe::App for App {
                                                         "完成" => OK_GREEN,
                                                         "处理中" => ACCENT,
                                                         "失败" => WARN,
+                                                        // 自带字幕被跳过：用最淡的一档，
+                                                        // 一眼能看出「这行不用管」
+                                                        "已有字幕" => INK3,
                                                         _ => INK3,
                                                     };
                                                     let name_color = match f.state.as_str() {
                                                         "完成" => DONE_INK,
+                                                        "已有字幕" => DONE_INK,
                                                         "处理中" => INK,
                                                         "失败" => INK,
                                                         _ => INK2,
@@ -2415,7 +2708,7 @@ impl eframe::App for App {
                                                                 } else {
                                                                     f.name.clone()
                                                                 };
-                                                                ui.add(
+                                                                let name_lab = ui.add(
                                                                     Label::new(
                                                                         RichText::new(short)
                                                                             .size(13.0)
@@ -2423,6 +2716,11 @@ impl eframe::App for App {
                                                                     )
                                                                     .truncate(),
                                                                 );
+                                                                // 被跳过的行：鼠标停在文件名上看具体原因
+                                                                // （内封字幕什么格式 / 画面里烧死的）
+                                                                if let Some(note) = &f.note {
+                                                                    name_lab.on_hover_text(note);
+                                                                }
                                                                 ui.with_layout(
                                                                     Layout::right_to_left(Align::Center),
                                                                     |ui| {
@@ -2530,6 +2828,9 @@ impl eframe::App for App {
                                             self.files = kept;
                                             self.selected.clear();
                                             self.preview.clear();
+                                            // 队列变了 → 预检结论作废
+                                            self.prechecked = false;
+                                            self.skip_note.clear();
                                             self.save_queue();
                                             self.push_log(format!("[列表] 已移除 {n} 个选中文件"));
                                         }
@@ -2538,6 +2839,8 @@ impl eframe::App for App {
                                         self.files.clear();
                                         self.selected.clear();
                                         self.preview.clear();
+                                        self.prechecked = false;
+                                        self.skip_note.clear();
                                         // 下标一起归零：否则 save_queue 会把旧下标写进
                                         // 队列文件，下次启动 load_queue 直接判「跑完了」。
                                         self.cur_idx = 0;
@@ -2884,7 +3187,61 @@ impl eframe::App for App {
     }
 }
 
+/// 把一行日志追加到工作目录的 `_运行日志.txt`。
+///
+/// 失败就静默跳过 —— 日志写不进去（目录只读、文件被占用）绝不能影响主流程。
+fn append_run_log(data_dir: &str, line: &str) {
+    if data_dir.is_empty() {
+        return;
+    }
+    let p = std::path::Path::new(data_dir).join("_运行日志.txt");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+        use std::io::Write;
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 fn main() -> eframe::Result<()> {
+    // ── 崩溃现场 ──
+    // GUI 进程没有控制台，Rust panic 默认只往 stderr 写一行然后退出 ——
+    // 用户看到的就是「窗口突然不见了」，事后什么都查不到。
+    // 这里把 payload 和「文件:行:列」落到 exe 旁边的 _崩溃日志.txt。
+    {
+        let crash = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("_崩溃日志.txt");
+        std::panic::set_hook(Box::new(move |info| {
+            use std::io::Write;
+            let payload = info.payload();
+            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "(非字符串 panic)".to_string()
+            };
+            let loc = info
+                .location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                .unwrap_or_else(|| "未知位置".to_string());
+            let thread = std::thread::current()
+                .name()
+                .unwrap_or("未命名")
+                .to_string();
+            let body = format!("panic[{thread}]: {msg}\n  位置: {loc}\n");
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&crash)
+            {
+                let _ = f.write_all(body.as_bytes());
+            }
+            eprintln!("{body}");
+        }));
+    }
+
     // 原型从 target\release 跑，工作目录不在发布目录 —— 显式指过去，
     // 否则 config::work_dir() 会解析成 exe 所在目录（找不到 env\python.exe）。
     if std::env::var_os("ASMR_WORK_DIR").is_none() {

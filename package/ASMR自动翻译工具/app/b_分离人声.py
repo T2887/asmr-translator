@@ -104,6 +104,58 @@ except Exception as _e:
 # ══════════════════════════════════════════════════════════
 # 工具函数
 # ══════════════════════════════════════════════════════════
+def _memory_status():
+    """读 Win32 GlobalMemoryStatusEx，返回 (可用物理, 还可提交) 字节数。
+
+    读不到返回 (0, 0)。不依赖 psutil（env 里没装 psutil）。
+
+    ★ 为什么必须看「还可提交」而不是「可用物理」：
+      2026-10-31 实测（26:55 素材、RTX 5070）分离阶段
+        WorkingSet 峰值 3.09 GB
+        Commit     峰值 7.06 GB   ← 是工作集的 2.3 倍
+      PyTorch/CUDA 进程会大量 reserve（CUDA 上下文、权重缓冲、
+      中间 tensor），这些**不驻留物理内存但占提交额度**。
+      判定能不能跑必须用提交额度：Windows 上 malloc 失败
+      （DefaultCPUAllocator: not enough memory）几乎都是
+      提交量到达 物理内存 + 页文件 的上限，而不是物理内存不够。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", wintypes.DWORD),
+                ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        st = MEMORYSTATUSEX()
+        st.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            # ullAvailPageFile 就是「还能再提交多少」，这是硬上限
+            return int(st.ullAvailPhys), int(st.ullAvailPageFile)
+    except Exception:
+        pass
+    return 0, 0
+
+
+def available_ram_bytes():
+    """返回系统当前可用物理内存（字节），读不到返回 0。"""
+    return _memory_status()[0]
+
+
+def available_commit_bytes():
+    """返回系统当前还能提交的内存（字节），读不到返回 0。"""
+    return _memory_status()[1]
+
+
 def load_vad_segments(flac_path):
     """读同名的 .vad.json。
 
@@ -284,6 +336,14 @@ for _idx, flac in enumerate(audio_files, 1):
         print(f"  VAD: {len(segs)} 段 / {total_sec:.1f}s（占 {total_sec / dur * 100:.1f}%）")
 
         merged, lens = concat_by_segments(data, sr, segs)
+        # ★ v1.27.2：整段音频（data）除了「总长度 / 声道数」之外就没用了。
+        #   先把这两个值记下来再释放 —— 80 分钟的 44.1k 立体声 float32
+        #   是 1.7 GB，不释放它会一直挂到函数结束，和下面 expand_with_sr
+        #   里再分配的同样大的数组叠在一起。注意：释放之后不能再碰 data，
+        #   下面一律用 total_len / n_ch（第一版忘了这一点，直接 NameError）。
+        total_len = len(data)
+        n_ch = data.shape[1]
+        del data
         if merged is None or len(merged) == 0:
             print("  [跳过] 没有可拼接的语音段")
             _fail.append((base, "VAD 段全为空"))
@@ -295,14 +355,59 @@ for _idx, flac in enumerate(audio_files, 1):
         _tmp_files.append(tmp)
         print(f"  拼接: {len(merged) / sr:.1f}s → {os.path.basename(tmp)}")
 
+        # ── v1.27.2：分离前先查可用内存 ────────────────────────
+        # 实测（RTX 5070 / GPU 加速 / 语音占比 30%）：
+        #   10 分钟音频 → 峰值 7.40 GB
+        #   40 分钟音频 → 峰值 13.86 GB
+        # 拟合：固定基线约 5.3 GB（模型 + PyTorch + 中间张量），
+        # 再按「每小时视频约 13 GB」线性增长。大头是整段音频读进内存
+        # （1 小时 44.1k 立体声 float32 就是 1.27 GB）加上分离后
+        # 填回原长度再分配一份同样大的数组。
+        # 不够就直接报错，别让它跑到一半 OOM（audio-separator 内部 OOM
+        # 时只打一行 ERROR 日志然后返回空列表，不抛异常）。
+        # ★ v1.27.4：按「提交内存」判定，不再按物理内存。
+        #   实测（RTX 5070，44.1k/48k 立体声，语音密度约 30%）：
+        #     300 秒  → WS 1.91 GB / Commit 5.74 GB
+        #     900 秒  → WS 2.74 GB / Commit 6.66 GB
+        #    1800 秒  → WS 3.43 GB / Commit 7.45 GB
+        #    1615 秒  → WS 3.09 GB / Commit 7.06 GB
+        #   Commit 是 WS 的 2~3 倍 —— PyTorch/CUDA 大量 reserve 但不驻留，
+        #   判定能不能跑必须看 commit：Windows 上 malloc 失败
+        #   （DefaultCPUAllocator: not enough memory）几乎都是提交额度到顶，
+        #   物理内存不够只会换页变慢，不会分配失败。
+        #   拟合：5.5 GB 固定（模型 + CUDA 上下文）+ 每秒 1.2 MB
+        #   验算：300→5.85(实测5.74) 900→6.58(6.66) 1800→7.66(7.45) 均偏保守 5% 内
+        _phys, _commit = _memory_status()
+        # 只看提交额度。物理不足 → 系统换页（只是慢）；提交不足 → 直接 malloc 失败。
+        _avail = _commit or _phys
+        if _avail:
+            _need = int(5.5 * 1024 ** 3 + dur * 1.2 * 1024 ** 2)
+            if _avail < _need:
+                print(f"  [失败] 内存不足：需要约 {_need / 1024 ** 3:.1f} GB 提交额度，"
+                      f"当前只能再拿到 {_avail / 1024 ** 3:.1f} GB")
+                print(f"        （{dur / 60:.0f} 分钟音频：分离固定要 5.5 GB，"
+                      f"再按每秒 1.2 MB 递增）")
+                if _commit and _commit < _need:
+                    print("        拦你的是「提交内存」而不是物理内存 ——")
+                    print("        多半是虚拟内存（页文件）设得太小或被关闭了。")
+                    print("        修法：此电脑→属性→高级系统设置→性能设置→高级→"
+                          "虚拟内存→改成「系统管理的大小」或手工 32768 MB，重启后再试。")
+                print("        也可以改用兼容模式（不需要人声分离，内存需求约 1~2 GB）")
+                _fail.append((base, f"内存不足（需 {_need / 1024 ** 3:.1f} GB，"
+                                    f"有 {_avail / 1024 ** 3:.1f} GB）"))
+                continue
+
         with Heartbeat(f"人声分离 {base}"):
             voc_files = separator.separate(tmp)
 
         voc = [f for f in voc_files if "Vocals" in f]
         if not voc:
-            # 分离没产出人声（短音频/模型限制）→ 跳过这个文件，别中止整批
-            print("  [跳过] 分离没有产出人声（短音频/模型限制），继续下一个")
-            _skip.append(base)
+            # ★ v1.27.2：走到这里不是「短音频」—— 真正短的在上游
+            #   total_sec < MIN_SPEECH_SEC 就被拦掉了。返回空列表只可能是
+            #   模型内部失败，最常见的是内存不足。必须记为失败，否则
+            #   _fail 为空 → 退出码 0 → 界面显示「完成」但没有任何字幕。
+            print("  [失败] 分离没有产出人声（常见原因：内存不足或模型加载失败）")
+            _fail.append((base, "分离未产出人声（可能内存不足）"))
             continue
         # 分离结果现在落在临时目录
         vt = voc[0]
@@ -323,7 +428,7 @@ for _idx, flac in enumerate(audio_files, 1):
             vd = vd[idx.astype(int)]
         print(f"  人声: {len(vd) / sr:.1f}s")
 
-        full = expand_with_sr(vd, segs, lens, sr, len(data), data.shape[1])
+        full = expand_with_sr(vd, segs, lens, sr, total_len, n_ch)
 
         # 命名保持和原来一致（下游靠文件名找）
         stem = os.path.splitext(os.path.basename(flac))[0]

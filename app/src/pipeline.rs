@@ -258,7 +258,7 @@ pub fn detect_vulkan_devices() -> Vec<String> {
 ///   · CUDA 但显存 < 6 GB        → 兼容模式
 ///   · 没有 CUDA 但有 Vulkan     → 兼容模式（走 llama.cpp）
 ///   · 什么都没有                → 兼容模式（纯 CPU）
-pub fn detect_device() -> (String, bool, f64, f64, bool, String, String) {
+pub fn detect_device() -> (String, bool, f64, f64, bool, String, String, f64) {
     // 这段 Python 的缩进是语法的一部分，改的时候注意别动前面的空格。
     // 最外层不能有缩进。
     let code = r#"
@@ -292,7 +292,19 @@ try:
                 free_gb = _fb / (1024 ** 3)
             except Exception:
                 free_gb = 0.0
-        print('GPU:' + name + '|' + ('%.1f' % gb) + '|' + ('%.1f' % free_gb))
+        # 计算能力（SM）：NVIDIA 从 cuDNN 9.10 起不再为 SM < 7.5 的架构提供
+        # kernel，本程序自带的 torch 2.11+cu128 只编译了 sm_75/80/86/90/100/120。
+        # GTX 10 系（6.1）、Maxwell（5.x）、Volta（7.0）的用户一上 GPU 就抛
+        #   RuntimeError: cuDNN version 91900 is not compatible with
+        #                 devices with SM < 7.5.
+        # 这里把 SM 一起报给界面，界面据此把模式锁到兼容模式并说明原因。
+        try:
+            _cc = torch.cuda.get_device_capability(0)
+            cap = _cc[0] + _cc[1] / 10.0
+        except Exception:
+            cap = 0.0
+        print('GPU:' + name + '|' + ('%.1f' % gb) + '|' + ('%.1f' % free_gb)
+              + '|' + ('%.1f' % cap))
     else:
         print('CPU')
 except Exception:
@@ -305,28 +317,33 @@ except Exception:
 
     match backend::run_python_inline(&config::python_exe(), code) {
         Ok(s) if s.starts_with("GPU:") => {
-            // 格式：GPU:<名字>|<显存GB>
+            // 格式：<名字>|<总显存GB>|<剩余显存GB>|<计算能力 SM>
+            // 老版本只报前三段，SM 缺失时按 0.0（未知）处理，等价于「不判老卡」。
             let rest = s[4..].trim();
-            // 格式：<名字>|<总显存GB>|<剩余显存GB>
-            let (name, vram, free_gb) = match rest.split_once('|') {
-                Some((n, v)) => {
-                    let (tot, free) = match v.split_once('|') {
-                        Some((a, b)) => (
-                            a.trim().parse::<f64>().unwrap_or(0.0),
-                            b.trim().parse::<f64>().unwrap_or(0.0),
-                        ),
-                        None => (v.trim().parse::<f64>().unwrap_or(0.0), 0.0),
-                    };
-                    (n.trim(), tot, free)
-                }
-                None => (rest, 0.0, 0.0),
+            let parts: Vec<&str> = rest.split('|').collect();
+            let name = parts.first().map(|v| v.trim()).unwrap_or("");
+            let num = |i: usize| -> f64 {
+                parts
+                    .get(i)
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+                    .unwrap_or(0.0)
             };
+            let vram = num(1);
+            let free_gb = num(2);
+            // 计算能力：7.5 = Turing。低于它是 Pascal / Maxwell / Volta，
+            // 自带 torch（cu128 + cuDNN 9.19）在这些卡上会直接抛异常。
+            let cap = num(3);
+            let arch_old = cap > 0.0 && cap < 7.5;
             // 阈值和 settings.py 的 _NEED_F16_MIB（8289 MiB）保持一致：
             // float16 峰值 4265 + 基线 3000 + 预留 1024 = 8289 MiB ≈ 8.1 GB
             let lite = vram > 0.0 && vram < 8.1;
             // 标称 6 GB 卡的 CUDA 可管理容量可能略低于整 6 GiB；与 egui /
             // settings.py 一致，按 5.75 GiB（5888 MiB）作为精简模式最低资格。
-            let text = if vram > 0.0 && vram * 1024.0 < 5888.0 {
+            let text = if arch_old {
+                // 老卡能跑，但只能在 CPU 上跑；兼容模式就是纯 CPU 设计，
+                // 比「全量模式 + CPU」快得多，所以直接引导过去。
+                format!("显卡太老（{name}），请用兼容模式")
+            } else if vram > 0.0 && vram * 1024.0 < 5888.0 {
                 "兼容模式".to_string()
             } else if name.is_empty() {
                 "GPU（已启用 CUDA）".to_string()
@@ -336,7 +353,16 @@ except Exception:
                 format!("GPU：{name}（已启用 CUDA）")
             };
             let vulkan_name = vulkan.join(" / ");
-            (text, true, vram, free_gb, has_vulkan, name.to_string(), vulkan_name)
+            (
+                text,
+                true,
+                vram,
+                free_gb,
+                has_vulkan,
+                name.to_string(),
+                vulkan_name,
+                cap,
+            )
         }
         // 没有 CUDA：不再说「CPU 慢 50 倍」，而是走兼容模式。
         Ok(s) if s == "CPU" => {
@@ -348,7 +374,7 @@ except Exception:
             // 兼容模式副标题要写「<显卡/核显型号> Vulkan 加速中」，
             // 型号从显示适配器枚举里拿；纯 CPU 就留空，副标题不显示这段。
             let vulkan_name = vulkan.join(" / ");
-            (text, false, 0.0, 0.0, has_vulkan, String::new(), vulkan_name)
+            (text, false, 0.0, 0.0, has_vulkan, String::new(), vulkan_name, 0.0)
         }
         Ok(other) => (
             format!("未知（检测失败：{other}）"),
@@ -358,6 +384,7 @@ except Exception:
             has_vulkan,
             String::new(),
             vulkan.join(" / "),
+            0.0,
         ),
         Err(e) => {
             // 常见情况：解释器路径不对、torch 没装。
@@ -374,6 +401,7 @@ except Exception:
                 has_vulkan,
                 String::new(),
                 vulkan.join(" / "),
+                0.0,
             )
         }
     }
@@ -465,7 +493,10 @@ pub fn has_any_subtitle_for_in(dir: &str, file: &str, since: std::time::SystemTi
             Some(n) => n.to_string_lossy().to_lowercase(),
             None => continue,
         };
-        if !name.ends_with(".srt") || !name.starts_with(&lower) {
+        // 产物可能是 .srt 也可能是 .ass（用户在「输出字幕格式」里选的那个）。
+        // 只认 .srt 的话，选「仅 ASS」时这一层兜底永远判「没有产物」，
+        // 于是脚本明明成功、界面却报失败并把文件重跑一遍。
+        if !(name.ends_with(".srt") || name.ends_with(".ass")) || !name.starts_with(&lower) {
             continue;
         }
         // `abc` 不能吃掉 `abc2.chs.srt`
@@ -489,10 +520,26 @@ pub fn has_any_subtitle_for_in(dir: &str, file: &str, since: std::time::SystemTi
     false
 }
 
-pub fn finalize_subtitles(
+/// 老签名（只出 SRT）—— app/src/ui.rs 那个 WinUI 界面还在调它。
+///
+/// 那个界面从 v1.25 起就废弃了（真程序是 `_proto_egui`），但它是
+/// srt / pipeline 单测唯一能跑的地方（`cargo test` 在 app/ 里），
+/// 所以这里留一个默认 SRT 的转发，把两边的签名都保住。
+pub fn finalize_subtitles(files: &[String], copy_to_video: bool, dest_dir: &str) -> Vec<String> {
+    finalize_subtitles_with(
+        files,
+        copy_to_video,
+        dest_dir,
+        crate::srt::SubFmt::Srt,
+    )
+}
+
+/// 收尾并归位，按 `fmt` 决定产出 SRT / ASS / 两个都要。
+pub fn finalize_subtitles_with(
     files: &[String],
     copy_to_video: bool,
     dest_dir: &str,
+    fmt: crate::srt::SubFmt,
 ) -> Vec<String> {
     // 源目录永远是 3asr\（四个脚本把字幕生成在那儿，改不了）；
     // 目标目录才是用户可以改的那个。
@@ -502,7 +549,18 @@ pub fn finalize_subtitles(
     } else {
         dest_dir.trim().to_string()
     };
-    finalize_subtitles_in(&src, &dst, files, copy_to_video)
+    finalize_subtitles_fmt(&src, &dst, files, copy_to_video, fmt)
+}
+
+/// 旧签名（只出 SRT）—— 单元测试走这条，语义就是「和加 ASS 之前完全一样」。
+#[cfg(test)]
+fn finalize_subtitles_in(
+    srt_dir: &str,
+    dest_dir: &str,
+    files: &[String],
+    copy_to_video: bool,
+) -> Vec<String> {
+    finalize_subtitles_fmt(srt_dir, dest_dir, files, copy_to_video, crate::srt::SubFmt::Srt)
 }
 
 /// 实际的收尾逻辑。
@@ -512,13 +570,17 @@ pub fn finalize_subtitles(
 ///
 /// 两个都作为参数传进来是为了能写单元测试 —— 测的时候给临时目录，
 /// 不会碰到真实的 3asr\。
-fn finalize_subtitles_in(
+fn finalize_subtitles_fmt(
     srt_dir: &str,
     dest_dir: &str,
     files: &[String],
     copy_to_video: bool,
+    fmt: crate::srt::SubFmt,
 ) -> Vec<String> {
     let mut logs = Vec::new();
+    // ASS 单独计数：「SRT 搬成功了、ASS 没写出来」不属于整个文件失败，
+    // 混进 failed 里会让总结说假话。
+    let (mut ass_ok, mut ass_bad) = (0usize, 0usize);
 
     if !std::path::Path::new(srt_dir).is_dir() {
         logs.push(format!("[字幕] 找不到目录 {srt_dir}"));
@@ -633,24 +695,108 @@ fn finalize_subtitles_in(
             None => (dest_dir.to_string(), false),
         };
 
-        let dst = format!(r"{dst_dir}\{stem}.{lang}.srt");
+        let dst_srt = format!(r"{dst_dir}\{stem}.{lang}.srt");
+        let dst_ass = format!(r"{dst_dir}\{stem}.{lang}.ass");
+        let path_str = path.to_string_lossy().to_string();
+        let src_is_dst_srt = dst_srt == path_str;
+
+        // ── ① 要 ASS 的话，趁 SRT 还在，先把它转出来 ──
+        //
+        //   ASS 的内容完全来自这份 SRT（同一批 Cue + 一套固定样式），
+        //   所以必须在「搬走 / 删掉 SRT」之前做。
+        let mut ass_written = false;
+        if fmt.want_ass() {
+            match crate::srt::read_srt(&path) {
+                Ok(cues) if !cues.is_empty() => {
+                    if dst_ass != path_str && std::path::Path::new(&dst_ass).exists() {
+                        let _ = std::fs::remove_file(&dst_ass);
+                    }
+                    match crate::srt::write_ass(std::path::Path::new(&dst_ass), &cues) {
+                        Ok(_) => {
+                            ass_written = true;
+                            ass_ok += 1;
+                            logs.push(format!(
+                                "[字幕] {fname} → {stem}.{lang}.ass（黑体白字黑描边，底部居中）"
+                            ));
+                        }
+                        Err(e) => {
+                            ass_bad += 1;
+                            logs.push(format!("[字幕] {fname} 生成 ASS 失败: {e}"));
+                        }
+                    }
+                }
+                Ok(_) => {
+                    ass_bad += 1;
+                    logs.push(format!("[字幕] {fname} 解析出 0 条字幕，跳过 ASS"));
+                }
+                Err(e) => {
+                    ass_bad += 1;
+                    logs.push(format!("[字幕] {fname} 读不出内容: {e}"));
+                }
+            }
+        }
+
+        // ── ② 清掉「另一种格式」的旧产物 ──
+        //
+        //   用户从「SRT + ASS」改回「仅 SRT」时，上一次写的 .ass 还躺在
+        //   视频旁边 —— 播放器优先加载 ASS，界面上看就是「我改了选项，
+        //   字幕却一点没变」。反方向同理，所以两个方向都清。
+        let mut stale: Vec<String> = Vec::new();
+        if !fmt.want_ass() {
+            stale.push(dst_ass.clone());
+            let in_src = format!(r"{srt_dir}\{stem}.{lang}.ass");
+            if in_src != dst_ass {
+                stale.push(in_src);
+            }
+        }
+        //   ⚠️ `&& ass_written` 这一条是安全底线（千问评审指出的真 bug）：
+        //      只出 ASS 时，如果 ASS 因为读不出 SRT / 写盘失败而没生成成功，
+        //      这里再把视频旁那份旧 .srt 删掉，用户就一个字幕都没有了 ——
+        //      而 3asr 里的源 SRT 紧接着还会被 purge 清掉，彻底没救。
+        if !fmt.want_srt() && !src_is_dst_srt && ass_written {
+            stale.push(dst_srt.clone());
+        }
+        for sp in stale {
+            if sp == path_str {
+                continue; // 别把当前这份唯一的字幕删了
+            }
+            if std::path::Path::new(&sp).is_file() {
+                let _ = std::fs::remove_file(&sp);
+            }
+        }
+
+        // ── ③ 只出 ASS：SRT 使命完成，删掉它 ──
+        //
+        //   留着的话 3asr 里会同时有 .srt 和 .ass，下一轮收尾又把那份 srt
+        //   当输入重转一遍 —— 幂等但白费事，用户也只该看到一份产物。
+        //   ASS 没写成时绝不能删，否则这个文件就彻底没有字幕了。
+        if !fmt.want_srt() {
+            if ass_written {
+                let _ = std::fs::remove_file(&path);
+                moved += 1;
+            } else {
+                kept += 1;
+                logs.push(format!("[字幕] {fname} 只保留了 SRT（ASS 没生成成功）"));
+            }
+            continue;
+        }
 
         // 目标已存在就先删掉 —— rename 在 Windows 上不会覆盖
-        if dst != path.to_string_lossy() && std::path::Path::new(&dst).exists() {
-            let _ = std::fs::remove_file(&dst);
+        if !src_is_dst_srt && std::path::Path::new(&dst_srt).exists() {
+            let _ = std::fs::remove_file(&dst_srt);
         }
-        if dst == path.to_string_lossy() {
+        if src_is_dst_srt {
             continue; // 已经是目标名了
         }
 
-        match std::fs::rename(&path, &dst) {
+        match std::fs::rename(&path, &dst_srt) {
             Ok(_) => {
                 if matched {
                     moved += 1;
                     logs.push(format!(
                         "[字幕] {fname} → {}{}",
                         if copy_to_video { "视频目录\\" } else { "3asr\\" },
-                        std::path::Path::new(&dst)
+                        std::path::Path::new(&dst_srt)
                             .file_name()
                             .map(|s| s.to_string_lossy().to_string())
                             .unwrap_or_default()
@@ -662,7 +808,7 @@ fn finalize_subtitles_in(
             }
             Err(e) => {
                 // rename 跨卷会失败，退回复制 + 删除
-                match std::fs::copy(&path, &dst) {
+                match std::fs::copy(&path, &dst_srt) {
                     Ok(_) => {
                         let _ = std::fs::remove_file(&path);
                         moved += 1;
@@ -677,9 +823,13 @@ fn finalize_subtitles_in(
         }
     }
 
-    logs.push(format!(
+    let mut summary = format!(
         "[字幕] 完成：移到视频旁 {moved} 个，放进输出目录 {kept} 个，失败 {failed} 个"
-    ));
+    );
+    if fmt.want_ass() {
+        summary.push_str(&format!("；ASS 生成 {ass_ok} 个、失败 {ass_bad} 个"));
+    }
+    logs.push(summary);
     logs
 }
 
@@ -1305,6 +1455,64 @@ mod tests {
             !has_any_subtitle_for_in(&srt.to_string_lossy(), &file, since),
             "空壳文件和前缀相同的兄弟文件都不能误判"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // 「仅 ASS」：产物只有 .ass，且 3asr 里那份 srt 要被清掉 ——
+    // 留着它下一轮收尾又会把它当输入重转一遍，用户也会看到两份文件。
+    #[test]
+    fn ass_only_outputs_ass_and_drops_srt() {
+        let (root, srt, vid) = make_scene("ass_only");
+        std::fs::write(
+            srt.join("第八集_中文字幕.srt"),
+            "1\n00:00:01,000 --> 00:00:02,000\nお姉さん\n姐姐\n",
+        )
+        .unwrap();
+        let files = vec![vid.join("第八集.mp4").to_string_lossy().to_string()];
+
+        let logs = finalize_subtitles_fmt(
+            &srt.to_string_lossy(),
+            &srt.to_string_lossy(),
+            &files,
+            true,
+            crate::srt::SubFmt::Ass,
+        );
+
+        let ass = vid.join("第八集.chs.ass");
+        assert!(ass.is_file(), "应生成 .chs.ass；日志: {logs:?}");
+        assert!(!vid.join("第八集.chs.srt").exists(), "仅 ASS 时不该留 srt");
+        assert!(!srt.join("第八集_中文字幕.srt").exists(), "源 srt 应被清掉");
+
+        let t = std::fs::read_to_string(&ass).unwrap();
+        assert!(t.contains("Style: Default,SimHei,52"), "样式没写进 ASS：{t}");
+        assert!(t.contains("\\N姐姐"), "双语两行应转成 \\N：{t}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // 「两个都要」：同名 .chs.srt + .chs.ass 并存
+    // （播放器优先加载 ASS，SRT 留作备份 / 给不认 ASS 的软件）。
+    #[test]
+    fn both_formats_written() {
+        let (root, srt, vid) = make_scene("both_fmt");
+        std::fs::write(
+            srt.join("第九集_中文字幕.srt"),
+            "1\n00:00:01,000 --> 00:00:02,000\nこんばんは\n晚上好\n",
+        )
+        .unwrap();
+        let files = vec![vid.join("第九集.mp4").to_string_lossy().to_string()];
+
+        finalize_subtitles_fmt(
+            &srt.to_string_lossy(),
+            &vid.to_string_lossy(),
+            &files,
+            true,
+            crate::srt::SubFmt::Both,
+        );
+
+        assert!(vid.join("第九集.chs.srt").is_file(), "SRT 也要在");
+        assert!(vid.join("第九集.chs.ass").is_file(), "ASS 也要在");
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }

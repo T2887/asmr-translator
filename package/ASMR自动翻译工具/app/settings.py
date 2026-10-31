@@ -95,7 +95,40 @@ if config["device"] == "cuda":
     # 实时要求至少 3.0 GB 空余显存，所以不会因为这个容差放行已占满的卡。
     _MIN_GPU_MIB = 5888
 
-    if 0 < _total_mib < _MIN_GPU_MIB:
+    # ── 老架构显卡直接退 CPU ─────────────────────────────────────────
+    # 本程序自带 PyTorch 2.11 + cuDNN 9.19，NVIDIA 从 cuDNN 9.10 起就不再
+    # 给 SM < 7.5 的架构出 kernel 了。GTX 10 系（6.1）、Maxwell（5.x）、
+    # Volta（7.0）的用户一跑到第 2/3 步就抛：
+    #   RuntimeError: cuDNN version 91900 is not compatible with
+    #                 devices with SM < 7.5.
+    # 这个异常发生在加载模型时，界面只会看到「第2步退出码 1」，看不出是
+    # 显卡太老。所以这里提前判定，直接退 CPU，并给出人能看懂的说明。
+    #
+    # 注意：不能为了兼容老卡把 torch 降级 —— 50 系（Blackwell，SM 12.0）
+    # 只有 cu128 及以上的构建才有 kernel，降级等于把新卡用户搞挂。
+    # 一套环境无法同时覆盖 SM 5.x 和 SM 12.0，所以老卡走 CPU。
+    _sm = 0.0
+    try:
+        _maj, _min = torch.cuda.get_device_capability(0)
+        _sm = _maj + _min / 10.0
+    except Exception:
+        _sm = 0.0
+    try:
+        _gpu_name = torch.cuda.get_device_name(0)
+    except Exception:
+        _gpu_name = "你的显卡"
+
+    if 0 < _sm < 7.5:
+        config["device"] = "cpu"
+        config["compute_type"] = "int8"
+        config["lite_mode"] = False
+        print(f"[CPU 模式] 检测到 {_gpu_name}（计算能力 {_sm:.1f}），"
+              f"低于 7.5")
+        print(f"           新版 PyTorch 的 cuDNN 已经不再支持这么老的显卡，"
+              f"在 GPU 上跑会直接报错")
+        print(f"           已自动改为 CPU 运行。建议改用【兼容模式】：")
+        print(f"           兼容模式同样是纯 CPU，但速度快得多、显存占用为 0")
+    elif 0 < _total_mib < _MIN_GPU_MIB:
         config["device"] = "cpu"
         config["compute_type"] = "int8"
         config["lite_mode"] = False

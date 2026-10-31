@@ -72,7 +72,7 @@ pub enum Msg {
     /// 用户从资源管理器拖了东西进来
     Dropped(DroppedData),
     /// 设备检测完成，payload 是给界面直接显示的文本
-    DeviceDetected(String, bool, f64, f64, bool, String, String),
+    DeviceDetected(String, bool, f64, f64, bool, String, String, f64),
     /// 切换运行模式
     SetModeFull,
     SetModeLite,
@@ -1753,9 +1753,18 @@ impl Component for AppUi {
         // 后台问一次 CUDA。torch 首次导入要 2~3 秒，不能卡在界面线程里，
         // 所以走 spawn_background，回来时发 Msg::DeviceDetected。
         context.spawn_background(|_token| {
-            let (text, is_gpu, vram, free_gb, has_vulkan, cuda_name, vulkan_name) =
+            let (text, is_gpu, vram, free_gb, has_vulkan, cuda_name, vulkan_name, gpu_cap) =
                 pipeline::detect_device();
-            Msg::DeviceDetected(text, is_gpu, vram, free_gb, has_vulkan, cuda_name, vulkan_name)
+            Msg::DeviceDetected(
+                text,
+                is_gpu,
+                vram,
+                free_gb,
+                has_vulkan,
+                cuda_name,
+                vulkan_name,
+                gpu_cap,
+            )
         });
 
         // 窗口居中的逻辑【不在这里】。
@@ -2320,14 +2329,22 @@ impl Component for AppUi {
                 has_vulkan,
                 cuda_name,
                 vulkan_name,
+                gpu_cap,
             ) => {
                 self.device_status = text;
-                self.cuda_name = cuda_name;
+                self.cuda_name = cuda_name.clone();
                 self.vulkan_name = vulkan_name;
                 self.has_gpu = is_gpu;
                 self.vram_gb = vram_gb;
                 self.vram_free_gb = free_gb;
                 self.has_vulkan = has_vulkan;
+                // 计算能力低于 7.5 的老卡（Pascal 6.x / Maxwell 5.x / Volta 7.0）：
+                // 自带 torch 2.11+cu128 的 cuDNN 9.19 已不为这些架构提供 kernel，
+                // 一旦在 GPU 上加载模型就抛
+                //   RuntimeError: cuDNN version 91900 is not compatible with
+                //                 devices with SM < 7.5.
+                // 所以全量/精简都判为不可用，只留兼容模式（纯 CPU 设计）。
+                let arch_old = gpu_cap > 0.0 && gpu_cap < 7.5;
                 // v1.21.1：精简模式的条件放宽为「N 卡显存 ≥ 6 GB」——
                 // 大显存卡也可以主动选精简模式（比如想省显存跑别的程序）。
                 // vram_gb == 0.0 表示「有 GPU 但显存读不出来」，按未知处理，
@@ -2335,8 +2352,21 @@ impl Component for AppUi {
                 let vram_unknown = vram_gb <= 0.0;
                 // 标称 6/8 GB 卡的 CUDA 可管理容量可能因预留略小于整档；
                 // 总容量各给约 4% 容差，实际启动仍由空余显存门槛兜底。
-                self.mode_full_ok = is_gpu && (vram_unknown || vram_gb * 1024.0 >= 7885.0);
-                self.mode_lite_ok = is_gpu && (vram_unknown || vram_gb * 1024.0 >= 5888.0);
+                self.mode_full_ok =
+                    !arch_old && is_gpu && (vram_unknown || vram_gb * 1024.0 >= 7885.0);
+                self.mode_lite_ok =
+                    !arch_old && is_gpu && (vram_unknown || vram_gb * 1024.0 >= 5888.0);
+                if arch_old {
+                    self.push_log(format!(
+                        "[显卡] 检测到 {cuda_name}（计算能力 {gpu_cap:.1}），低于 7.5"
+                    ));
+                    self.push_log(
+                        "[显卡] 新版 PyTorch 的 cuDNN 已不再支持这么老的显卡，全量/精简模式在 GPU 上会直接报错",
+                    );
+                    self.push_log(
+                        "[显卡] 已锁定为兼容模式：它同样是纯 CPU，但速度快得多，也没有显存要求",
+                    );
+                }
                 self.mode = if self.mode_full_ok {
                     pipeline::RunMode::Full
                 } else if self.mode_lite_ok {

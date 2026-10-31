@@ -261,9 +261,13 @@ def pick_device():
     return "none", "CPU"
 
 
-def wait_health(port, timeout=120):
+def wait_health(port, timeout=120, proc=None):
     deadline = time.time() + timeout
     while time.time() < deadline:
+        # llama-server 已经退出（设备不兼容 / 显存不够 / 老驱动的 Vulkan 起不来），
+        # 不必再空等到 timeout：这里直接判失败，交给上层回退 CPU 重试。
+        if proc is not None and proc.poll() is not None:
+            return False
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1) as r:
                 if r.status == 200:
@@ -367,7 +371,7 @@ def main():
     print(f"启动内置 llama.cpp（端口 {port}）...", flush=True)
     proc = start_server(dev)
     try:
-        if not wait_health(port):
+        if not wait_health(port, proc=proc):
             # 选中设备加载失败（显存不够 / OOM / 驱动问题）→ 回退 CPU 重试一次。
             # 千问评审指出：--list-devices 的 free 是瞬时值，不能保证加载时还够。
             print("[回退] 该设备加载失败，改用 CPU 重试", flush=True)
@@ -381,7 +385,7 @@ def main():
                     pass
             dev, dev_name = "none", "CPU"
             proc = start_server("none")
-            if not wait_health(port):
+            if not wait_health(port, proc=proc):
                 print("[失败] llama-server 启动超时")
                 sys.exit(1)
         print("llama-server 就绪", flush=True)

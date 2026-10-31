@@ -272,6 +272,54 @@ def get_custom_vad_patch(audio, vad_parameters=None):
     return []
 
 
+# ★ v1.27.4：加载模型前先确认「提交内存」够。
+#   实测（26:55 素材，RTX 5070，float16）：ASR 阶段
+#     WorkingSet 峰值 3.55 GB，Commit 峰值 5.26 GB
+#   用物理内存判会放行，然后在中途 malloc 失败（DefaultCPUAllocator:
+#   not enough memory），表现为 0xC0000409 或退出码 1 ——
+#   用户看到的是「第4步失败」，但真正原因是页文件/提交额度不够。
+def _memory_status():
+    """返回 (可用物理, 还可提交) 字节数，读不到返回 (0, 0)。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", wintypes.DWORD),
+                ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        st = MEMORYSTATUSEX()
+        st.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            return int(st.ullAvailPhys), int(st.ullAvailPageFile)
+    except Exception:
+        pass
+    return 0, 0
+
+
+_phys0, _commit0 = _memory_status()
+# 实测（26:55 素材、float16）：ASR 阶段 Commit 峰值 5.26 GB / WS 3.55 GB。
+# 取 5.0 GB 作门槛（略低于峰值，留给系统一点余量，不至于误拦能跑的机器）。
+_need0 = int(5.0 * 1024 ** 3)
+if _commit0 and _commit0 < _need0:
+    print(f"[失败] 内存不足：语音识别需要约 {_need0 / 1024 ** 3:.1f} GB 提交额度，"
+          f"当前只能再拿到 {_commit0 / 1024 ** 3:.1f} GB")
+    print("       这是「提交内存」不足 —— 虚拟内存（页文件）设得太小或被关闭了。")
+    print("       修法：此电脑→属性→高级系统设置→性能设置→高级→虚拟内存→"
+          "改成「系统管理的大小」或手工 32768 MB，重启后再试。")
+    print("       也可以改用兼容模式（内存需求约 1~2 GB）。")
+    sys.exit(1)
+
+
 # 3. 初始化 Whisper 模型
 with Heartbeat("加载语音识别模型"):
     model = WhisperModel(

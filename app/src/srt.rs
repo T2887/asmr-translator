@@ -70,6 +70,151 @@ pub fn write_srt(path: &Path, cues: &[Cue]) -> Result<(), String> {
     std::fs::write(path, out).map_err(|e| format!("写不了 {}: {e}", path.display()))
 }
 
+// ─────────────────────── 字幕输出格式（SRT / ASS） ───────────────────────
+
+/// 输出字幕格式。三个选项互斥。
+///
+/// 【为什么 ASS 放在 Rust 侧做，而不是改 Python】
+///   识别/翻译那条链路（`d_语音识别.py`）只产 SRT，动它要重新跑一遍
+///   语音识别才知道有没有坏 —— 风险高、验证慢。
+///   而 ASS 本质上就是「同一批时间轴 + 一套固定样式」，收尾时手里正好
+///   有解析好的 `Cue`，读 SRT → 写 ASS 是纯文本转换，不碰任何模型。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubFmt {
+    /// 只出 .srt（原来唯一的行为，默认值）
+    Srt,
+    /// 只出 .ass
+    Ass,
+    /// 两个都出：播放器优先加载 ASS，SRT 留作备份/给不认 ASS 的软件
+    Both,
+}
+
+impl SubFmt {
+    pub fn want_srt(self) -> bool {
+        matches!(self, SubFmt::Srt | SubFmt::Both)
+    }
+
+    pub fn want_ass(self) -> bool {
+        matches!(self, SubFmt::Ass | SubFmt::Both)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SubFmt::Srt => "仅 SRT",
+            SubFmt::Ass => "仅 ASS",
+            SubFmt::Both => "SRT + ASS",
+        }
+    }
+}
+
+/// ASS 文件头（含样式表）。样式按用户要求固定：
+///   **黑体（SimHei）/ 白字 / 黑描边 / 底部居中 / 字号适中**。
+///
+/// 逐字段对照：
+///   `SimHei`        —— 黑体（Windows 自带，不依赖装字体）
+///   `52`            —— 字号。52 在 1080p 坐标系下约占画面高 4.8%，
+///                      双行字幕也不压画面
+///   `&H00FFFFFF`    —— PrimaryColour 白字。ASS 是 BGR + 前置 alpha：
+///                      00=不透明, FF FF FF = 白
+///   `&H00000000`    —— OutlineColour 黑描边
+///   `Outline 3`     —— 描边 3px。1px 在浅色画面上看不清，5px 会糊住笔画
+///   `Shadow 0`      —— 不要阴影，否则加描边后显得脏
+///   `Alignment 2`   —— 底部居中（ASS 的 2 = bottom center，
+///                      这个编号跟 SSA 的 1/2/3 体系不同，别混）
+///   `MarginV 40`    —— 离底边 40px，避免压到播放器进度条
+///
+/// ⚠️ PlayResX/Y 写死 1920×1080：播放器会按实际画面等比缩放。反过来
+///    「取视频原生分辨率」需要在收尾时多跑一次 ffprobe，还得处理旋转
+///    元数据（手机录的视频 width/height 是反的），为省这点缩放误差不值。
+const ASS_HEADER: &str = "[Script Info]
+; 由 ASMR 自动翻译工具生成
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1080
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,SimHei,52,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,3,0,2,40,40,40,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+";
+
+/// ASS 的时间戳是 `h:mm:ss.cc`（小时**不补零**，秒后是**百分秒**两位），
+/// 和 SRT 的 `HH:MM:SS,mmm` 完全不是一回事 —— 直接拿 fmt_time 的结果
+/// 写进 Dialogue 行，播放器会显示 0 条字幕（解析失败不报错，静默丢弃）。
+pub fn fmt_ass_time(t: f64) -> String {
+    // NaN / ±Inf 在 SRT 解析里本不该出现，但真漏进来时 `as u64` 会给出
+    // 一个天文数字（不是 panic），屏幕上就是一条横跨几小时的字幕。
+    // 统一按 0 处理：至少看得见、能定位。
+    let t = if t.is_finite() { t.max(0.0) } else { 0.0 };
+    let cs = (t * 100.0).round() as u64;
+    // 百分秒先到整数再拆字段，所以 59.995 → cs=6000 → `0:01:00.00`，
+    // 不会出现 `0:00:60.00` 这种非法值（s / m 都带 % 约束在 0-59）。
+    let h = cs / 360_000;
+    let m = (cs % 360_000) / 6_000;
+    let s = (cs % 6_000) / 100;
+    let cs = cs % 100;
+    // 小时按 ASS 惯例不补零（Aegisub 导出就是 `0:00:01.00`）。
+    format!("{h}:{m:02}:{s:02}.{cs:02}")
+}
+
+/// 把一条字幕正文转成 ASS 的 `Text` 字段。
+///
+/// 两处必须处理，否则不是「难看」而是「内容丢失」：
+///   ① 换行 → `\N`（硬换行）。双语字幕是「日文原文 + 中文」两行；
+///      直接把 \n 塞进 Dialogue 行，ASS 会当成一行，两行字挤成一坨。
+///   ② 半角花括号 → 全角。ASS 的 `{...}` 是样式覆盖语法（`{\an8}` `{\fs80}`），
+///      正文里出现半角花括号会被当标签整个吞掉，屏幕上直接少字。
+///
+/// 反斜杠本身不处理：正文里出现 `\N` `\h` 这类字面量在实践中不存在，
+/// 而按逃逸规则重写反而会破坏 ASMR 拟声词里偶尔出现的反斜杠字符。
+fn ass_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        match ch {
+            '\n' => out.push_str("\\N"),
+            '\r' => {}
+            '{' => out.push('｛'),
+            '}' => out.push('｝'),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// 写 ASS（Advanced SubStation Alpha）字幕。
+///
+/// 与 `write_srt` 平行：同一批 `Cue`，两套方言。
+pub fn write_ass(path: &Path, cues: &[Cue]) -> Result<(), String> {
+    let mut out = String::with_capacity(ASS_HEADER.len() + cues.len() * 96);
+    out.push_str(ASS_HEADER);
+    for c in cues {
+        out.push_str(&format!(
+            "Dialogue: 0,{},{},Default,,0,0,0,,{}\n",
+            fmt_ass_time(c.start),
+            fmt_ass_time(c.end),
+            ass_escape(&c.text)
+        ));
+    }
+    // ASS 传统用 CRLF。libass / mpv / ffmpeg 吃 LF 没问题，但个别国产
+    // 播放器（PotPlayer 老版本）对纯 LF 的样式段解析会出岔子 —— 转一下，
+    // 代价是一次字符串拷贝，收益是省掉一整类「某个播放器不显示字幕」的报障。
+    let text = out.replace('\n', "\r\n");
+    // 先写 `.ass.tmp` 再改名（同目录 rename 是原子的）：
+    // 直接写目标文件的话，中途失败（磁盘满、被杀进程）会留下**半截 .ass**，
+    // 播放器照样加载它，用户看到的是「字幕只到第 3 分钟就没了」——
+    // 比没有字幕更像 bug，还很难往源头上想。
+    let tmp = path.with_extension("ass.tmp");
+    std::fs::write(&tmp, text).map_err(|e| format!("写不了 {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("写不了 {}: {e}", path.display())
+    })
+}
+
 /// 读全局词表 + 按作品词表（app\词表.txt 和 app\词表_<stem>.txt）。
 pub fn load_wordlist(app_dir: &Path, stem: Option<&str>) -> Vec<(String, String)> {
     let mut files: Vec<PathBuf> = vec![app_dir.join("词表.txt")];
@@ -461,5 +606,64 @@ mod tests {
         assert_eq!(out2[0].text, "B");
         // 未排序时短词先替换，会产生 "A吗" —— 仅用于确认排序的重要性
         assert_eq!(out[0].text, "A吗");
+    }
+
+    // ASS 的时间戳是 h:mm:ss.cc，不是 SRT 的 HH:MM:SS,mmm。
+    // 这两者混用是「字幕整份不显示」最典型的成因，所以单独立一条。
+    #[test]
+    fn ass_time_format() {
+        assert_eq!(fmt_ass_time(0.0), "0:00:00.00");
+        assert_eq!(fmt_ass_time(1.0), "0:00:01.00");
+        assert_eq!(fmt_ass_time(3723.456), "1:02:03.46");
+        // 负时间（识别出来的时间轴有极小负值）必须夹到 0，不能出现 "-1:00:00.00"
+        assert_eq!(fmt_ass_time(-5.0), "0:00:00.00");
+        // 百分秒进位：59.995s 四舍五入成 6000cs，必须整体进位成 1 分 0 秒，
+        // 而不是输出非法的 "0:00:60.00"（严格解析器会丢整条字幕）。
+        assert_eq!(fmt_ass_time(59.995), "0:01:00.00");
+        assert_eq!(fmt_ass_time(3599.999), "1:00:00.00");
+        // NaN / Inf 兜底成 0，别让一条字幕横跨几小时
+        assert_eq!(fmt_ass_time(f64::NAN), "0:00:00.00");
+        assert_eq!(fmt_ass_time(f64::INFINITY), "0:00:00.00");
+    }
+
+    // 样式是用户点名要的：黑体、白字、黑描边、底部居中、字号适中。
+    // 错一个字段播放器不会报错，只会「看着不对」，所以锁死字符串。
+    #[test]
+    fn ass_style_matches_spec() {
+        let dir = std::env::temp_dir().join("asmr_ass_style_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.ass");
+        write_ass(&p, &[Cue { start: 1.0, end: 2.5, text: "お姉さん\n姐姐".into() }]).unwrap();
+        let t = std::fs::read_to_string(&p).unwrap();
+
+        assert!(t.contains("ScriptType: v4.00+"), "必须是 ASS v4.00+：{t}");
+        assert!(t.contains("PlayResX: 1920") && t.contains("PlayResY: 1080"), "{t}");
+        // Fontname=SimHei 黑体 / Fontsize=52 / 主色白 / 描边色黑
+        assert!(
+            t.contains("Style: Default,SimHei,52,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"),
+            "字体颜色不对：{t}"
+        );
+        // BorderStyle=1 / Outline=3 / Shadow=0 / Alignment=2(底部居中) / MarginV=40
+        assert!(t.contains(",0,0,1,3,0,2,40,40,40,1"), "描边/对齐/MarginV 不对：{t}");
+        // 双语两行必须变成 \N，否则挤成一行
+        assert!(
+            t.contains("Dialogue: 0,0:00:01.00,0:00:02.50,Default,,0,0,0,,お姉さん\\N姐姐"),
+            "Dialogue 行不对：{t}"
+        );
+        // 正文里的花括号会被当样式标签吞掉，应转全角
+        let p2 = dir.join("b.ass");
+        write_ass(&p2, &[Cue { start: 0.0, end: 1.0, text: "{测试}".into() }]).unwrap();
+        assert!(std::fs::read_to_string(&p2).unwrap().contains("｛测试｝"), "花括号未转义");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 三个格式开关的互斥关系（「两个都要」时 srt 和 ass 都是 true）。
+    #[test]
+    fn sub_fmt_switches() {
+        assert!(SubFmt::Srt.want_srt() && !SubFmt::Srt.want_ass());
+        assert!(!SubFmt::Ass.want_srt() && SubFmt::Ass.want_ass());
+        assert!(SubFmt::Both.want_srt() && SubFmt::Both.want_ass());
     }
 }
