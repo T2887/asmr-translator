@@ -893,7 +893,7 @@ pub fn python_exe() -> String {
 ///     120 秒超时才回退 CPU，用户会以为卡死。
 ///   · 现在 `wait_health` 多了 `proc` 参数：进程一退出就立刻判失败并回退，
 ///     实测从 120 秒降到 0 秒；进程活着但没有监听时仍按超时兜底。
-pub const APP_VERSION: &str = "1.27.4";
+pub const APP_VERSION: &str = "1.28";
 
 /// 窗口标题
 pub fn app_title() -> String {

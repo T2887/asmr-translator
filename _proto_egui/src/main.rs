@@ -21,10 +21,13 @@ mod pipeline;
 mod srt;
 mod cancel;
 mod subscan;
+mod updater;
 mod worker;
 
 use eframe::egui;
 use pipeline::RunMode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 // 标称 6/8 GB 的显卡，CUDA 可管理容量可能因驱动和固件预留略低于整档。
 // 各给约 4% 容差；启动前另有 3/5 GB【当前空余】门槛负责安全兜底。
@@ -179,6 +182,26 @@ struct App {
     progress_value: f64,
     /// 当前阶段是什么时候开始的（第 4 步前 5 秒不用 tqdm 的 ETA）
     stage_started_at: Option<std::time::Instant>,
+
+    // ── 更新检查 ───────────────────────────────────────────────
+    /// 后台检查更新的接收端（启动时挂上，拿到结果就置 None）
+    update_rx: Option<std::sync::mpsc::Receiver<Result<Option<updater::UpdateInfo>, String>>>,
+    /// 查到的可用更新（None = 没有新版 / 还没查）
+    update_found: Option<updater::UpdateInfo>,
+    /// 是否正在显示「发现新版本」弹窗
+    show_update_dialog: bool,
+    /// 检查是否已经跑过一次（避免每帧重复发起）
+    update_checked: bool,
+    /// 下载线程的接收端
+    download_rx: Option<std::sync::mpsc::Receiver<Result<std::path::PathBuf, String>>>,
+    /// 下载进度：(已下载字节, 总字节)
+    download_progress: Arc<Mutex<(u64, Option<u64>)>>,
+    /// 点「取消」时置 true，下载线程轮询到就杀掉 curl
+    download_cancel: Arc<AtomicBool>,
+    /// 下好的安装包路径（等用户点「立即安装」）
+    downloaded: Option<std::path::PathBuf>,
+    /// 更新相关的提示文字（检查失败 / 下载失败都写这儿，显示在横幅里）
+    update_msg: Option<String>,
 }
 
 impl Default for App {
@@ -256,6 +279,15 @@ impl Default for App {
             eta_display: None,
             progress_value: 0.0,
             stage_started_at: None,
+            update_rx: None,
+            update_found: None,
+            show_update_dialog: false,
+            update_checked: false,
+            download_rx: None,
+            download_progress: Arc::new(Mutex::new((0, None))),
+            download_cancel: Arc::new(AtomicBool::new(false)),
+            downloaded: None,
+            update_msg: None,
         }
     }
 }
@@ -2085,10 +2117,132 @@ fn logo(ui: &mut Ui) {
     );
 }
 
+
+impl App {
+    // ── 更新检查 ──────────────────────────────────────────────────
+
+    /// 首帧发起后台检查，之后每帧收一次结果。**不阻塞**。
+    fn poll_update(&mut self, ctx: &egui::Context) {
+        // ① 首帧：挂上检查线程
+        if !self.update_checked {
+            self.update_checked = true;
+            self.update_rx = Some(updater::check_async(config::APP_VERSION.to_string()));
+        }
+
+        // ② 收检查结果
+        if self.update_rx.is_some() {
+            let got = self.update_rx.as_ref().map(|rx| rx.try_recv());
+            match got {
+                Some(Ok(Ok(Some(info)))) => {
+                    self.update_rx = None;
+                    self.push_log(format!(
+                        "[更新] 发现新版本 v{}（当前 v{}）",
+                        info.version,
+                        config::APP_VERSION
+                    ));
+                    self.update_found = Some(info);
+                    self.show_update_dialog = true;
+                }
+                Some(Ok(Ok(None))) => {
+                    self.update_rx = None;
+                    self.push_log("[更新] 已是最新版本");
+                }
+                Some(Ok(Err(e))) => {
+                    self.update_rx = None;
+                    // 网络不通是常态（国内连不上），不打进日志免得误导用户以为出错
+                    self.update_msg = Some(format!("检查更新失败：{e}"));
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                    self.update_rx = None;
+                }
+                _ => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(500));
+                }
+            }
+        }
+
+        // ③ 收下载结果
+        if self.download_rx.is_some() {
+            let got = self.download_rx.as_ref().map(|rx| rx.try_recv());
+            match got {
+                Some(Ok(Ok(path))) => {
+                    self.download_rx = None;
+                    *self.download_progress.lock().unwrap() = (0, None);
+                    self.push_log(format!("[更新] 下载完成：{}", path.display()));
+                    self.downloaded = Some(path);
+                    // 下完直接把弹窗拉回前台，让用户点「立即安装」
+                    self.show_update_dialog = true;
+                    ctx.request_repaint();
+                }
+                Some(Ok(Err(e))) => {
+                    self.download_rx = None;
+                    *self.download_progress.lock().unwrap() = (0, None);
+                    self.push_log(format!("[更新] 下载失败：{e}"));
+                    self.update_msg = Some(format!(
+                        "下载失败：{e}\n可以点下面的网盘链接手动下载。"
+                    ));
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                    self.download_rx = None;
+                }
+                _ => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                }
+            }
+        }
+    }
+
+    /// 下载是否正在进行
+    fn downloading(&self) -> bool {
+        self.download_rx.is_some()
+    }
+
+    /// 启动后台下载
+    fn start_download(&mut self) {
+        let Some(info) = self.update_found.clone() else {
+            return;
+        };
+        if self.downloading() {
+            return;
+        }
+        if info.download_url.trim().is_empty() {
+            self.update_msg = Some("这一个版本没有配置直链下载，请用下面的网盘链接。".into());
+            return;
+        }
+        self.update_msg = None;
+        self.downloaded = None;
+        self.download_cancel.store(false, Ordering::SeqCst);
+        *self.download_progress.lock().unwrap() = (0, None);
+
+        let dest = updater::download_dir(&self.data_dir)
+            .join(format!("ASMR-Translator-Setup_v{}.exe", info.version));
+        let prog = self.download_progress.clone();
+        let cancel = self.download_cancel.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.download_rx = Some(rx);
+
+        let url = info.download_url.clone();
+        std::thread::spawn(move || {
+            let p2 = prog.clone();
+            let res = updater::download_blocking(
+                &url,
+                &dest,
+                move |cur, total| {
+                    *p2.lock().unwrap() = (cur, total);
+                },
+                &|| cancel.load(Ordering::SeqCst),
+            );
+            let _ = tx.send(res.map(|_| dest));
+        });
+        self.push_log("[更新] 开始下载安装包…");
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.pump(&ctx);
+        self.poll_update(&ctx);
 
         // 后台「自带字幕」扫描有结果了吗
         //
@@ -2404,6 +2558,47 @@ impl eframe::App for App {
                         });
                     });
                     ui.add_space(12.0);
+
+                    // ── 更新横幅：只在查到新版本时出现 ──
+                    if let Some(info) = self.update_found.clone() {
+                        ui.add_space(2.0);
+                        Frame::new()
+                            .fill(ACCENT_SOFT)
+                            .corner_radius(10.0)
+                            .stroke(Stroke::new(1.0, ACCENT))
+                            .inner_margin(Margin { left: 14, right: 14, top: 10, bottom: 10 })
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!("发现新版本  v{}", info.version))
+                                            .size(13.5)
+                                            .color(ACCENT_INK)
+                                            .family(FontFamily::Name("bold".into())),
+                                    );
+                                    ui.label(
+                                        RichText::new(format!("（当前 v{}）", config::APP_VERSION))
+                                            .size(12.0)
+                                            .color(INK3),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if pill(ui, "忽略", CARD, CARD_LINE, INK3, true)
+                                                .clicked()
+                                            {
+                                                self.update_found = None;
+                                            }
+                                            if pill(ui, "查看更新", ACCENT_DEEP, ACCENT_DEEP, Color32::WHITE, true)
+                                                .clicked()
+                                            {
+                                                self.show_update_dialog = true;
+                                            }
+                                        },
+                                    );
+                                });
+                            });
+                        ui.add_space(8.0);
+                    }
 
                     // ── 卡片 1：环境 ──
                     card(ui, "环境", |ui| {
@@ -3025,6 +3220,183 @@ impl eframe::App for App {
         // 启动时读到队列文件才会出现。两个选择：
         //   恢复 → 填回列表、从上次的位置继续（已经有字幕的不会重跑）
         //   清空 → 丢弃队列，从空列表重新开始
+        // ── 「发现新版本」弹窗 ──
+        //
+        // 方案 C：先试程序内下载（体验最好），失败就退回「打开下载页 / 网盘镜像」。
+        // 国内直连 gitee.io / github.com 的成功率不稳定，所以下载失败不是异常，
+        // 而是预期路径之一 —— 文案里直接把网盘链接摆出来。
+        if self.show_update_dialog {
+            if let Some(info) = self.update_found.clone() {
+                let mut do_download = false;
+                let mut do_cancel_dl = false;
+                let mut do_install = false;
+                let mut do_later = false;
+                let mut open_page = false;
+                let mut open_mirror: Option<String> = None;
+
+                let dl_active = self.downloading();
+                let (done_b, total_b) = *self.download_progress.lock().unwrap();
+
+                egui::Modal::new(egui::Id::new("update_modal"))
+                    .backdrop_color(Color32::from_rgba_unmultiplied(0x1f, 0x1e, 0x1d, 96))
+                    .frame(
+                        Frame::new()
+                            .fill(CARD)
+                            .corner_radius(12.0)
+                            .inner_margin(Margin::same(20))
+                            .stroke(Stroke::new(1.0, CARD_LINE))
+                            .shadow(Shadow {
+                                offset: [0, 10],
+                                blur: 30,
+                                spread: 0,
+                                color: Color32::from_rgba_unmultiplied(0x1f, 0x1e, 0x1d, 40),
+                            }),
+                    )
+                    .show(&ctx, |ui| {
+                        ui.set_width(440.0);
+                        ui.label(
+                            RichText::new(format!("发现新版本 v{}", info.version))
+                                .size(18.0)
+                                .color(INK)
+                                .family(FontFamily::Name("bold".into())),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "当前版本 v{}　→　最新版本 v{}",
+                                config::APP_VERSION, info.version
+                            ))
+                            .size(12.5)
+                            .color(INK3),
+                        );
+                        ui.add_space(10.0);
+
+                        if !info.notes.trim().is_empty() {
+                            egui::ScrollArea::vertical()
+                                .id_salt("upd_notes")
+                                .max_height(140.0)
+                                .show(ui, |ui| {
+                                    ui.label(RichText::new(&info.notes).size(12.5).color(INK2));
+                                });
+                            ui.add_space(10.0);
+                        }
+
+                        // 下载进度
+                        if dl_active {
+                            let pct = match total_b {
+                                Some(t) if t > 0 => (done_b as f32 / t as f32).clamp(0.0, 1.0),
+                                _ => 0.0,
+                            };
+                            let txt = match total_b {
+                                Some(t) if t > 0 => format!(
+                                    "正在下载…  {:.1} / {:.1} MB",
+                                    done_b as f64 / 1048576.0,
+                                    t as f64 / 1048576.0
+                                ),
+                                _ => format!("正在下载…  {:.1} MB", done_b as f64 / 1048576.0),
+                            };
+                            ui.label(RichText::new(txt).size(12.0).color(INK3));
+                            ui.add_space(4.0);
+                            ui.add(
+                                egui::ProgressBar::new(pct)
+                                    .desired_width(400.0)
+                                    .fill(ACCENT),
+                            );
+                            ui.add_space(10.0);
+                        }
+
+                        // 提示（失败原因等）
+                        if let Some(msg) = &self.update_msg {
+                            ui.label(RichText::new(msg).size(12.0).color(WARN));
+                            ui.add_space(8.0);
+                        }
+
+                        // 网盘镜像（按需显示：下载失败或没有直链时才突出）
+                        if !info.mirrors.is_empty() {
+                            ui.label(
+                                RichText::new("国内下载慢的话，可以用网盘：")
+                                    .size(12.0)
+                                    .color(INK3),
+                            );
+                            ui.add_space(4.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                for (name, url) in info.mirrors.clone() {
+                                    if pill(ui, &name, CARD, CARD_LINE, ACCENT_INK, !dl_active)
+                                        .clicked()
+                                    {
+                                        open_mirror = Some(url);
+                                    }
+                                }
+                            });
+                            ui.add_space(10.0);
+                        }
+
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            if self.downloaded.is_some() {
+                                if pill(ui, "立即安装", ACCENT_DEEP, ACCENT_DEEP, Color32::WHITE, true)
+                                    .clicked()
+                                {
+                                    do_install = true;
+                                }
+                            } else if dl_active {
+                                if pill(ui, "取消下载", CARD, CARD_LINE, WARN, true).clicked() {
+                                    do_cancel_dl = true;
+                                }
+                            } else if !info.download_url.trim().is_empty() {
+                                if pill(ui, "立即更新", ACCENT_DEEP, ACCENT_DEEP, Color32::WHITE, true)
+                                    .clicked()
+                                {
+                                    do_download = true;
+                                }
+                            }
+                            if pill(ui, "打开下载页", CARD, CARD_LINE, INK2, !dl_active).clicked() {
+                                open_page = true;
+                            }
+                            if pill(ui, "稍后", CARD, CARD_LINE, INK3, !dl_active).clicked() {
+                                do_later = true;
+                            }
+                        });
+                    });
+
+                if do_cancel_dl {
+                    self.download_cancel.store(true, Ordering::SeqCst);
+                    self.push_log("[更新] 已取消下载");
+                }
+                if do_download {
+                    self.start_download();
+                }
+                if do_install {
+                    if let Some(p) = self.downloaded.clone() {
+                        match updater::run_installer(&p) {
+                            Ok(()) => {
+                                self.push_log("[更新] 安装程序已启动，本程序即将退出");
+                                // 安装包会带 /CLOSEAPPLICATIONS 关掉我们，这里主动退也行
+                                std::process::exit(0);
+                            }
+                            Err(e) => {
+                                self.push_log(format!("[更新] 启动安装程序失败：{e}"));
+                                self.update_msg = Some(format!("{e}，请手动运行：{}", p.display()));
+                            }
+                        }
+                    }
+                }
+                if open_page {
+                    updater::open_url(updater::RELEASES_PAGE);
+                }
+                if let Some(u) = open_mirror {
+                    updater::open_url(&u);
+                }
+                if do_later {
+                    self.show_update_dialog = false;
+                }
+            } else {
+                self.show_update_dialog = false;
+            }
+        }
+
         if self.show_restore_dialog {
             let n = self.pending_queue.len();
             let idx = self.pending_idx.min(n);
