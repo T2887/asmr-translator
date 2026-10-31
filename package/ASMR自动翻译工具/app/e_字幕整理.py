@@ -148,7 +148,7 @@ def _collapse_repeats(text, max_len=4):
 
 # ── 时间轴整理 ──────────────────────────────────────────────
 
-def _speech_tail(start, vad_segs, gap=0.5, max_span=15.0):
+def _speech_tail(start, vad_segs, gap=0.9, max_span=20.0):
     """从 start 所在段起向后连段，返回同一口气说到最后的段末。"""
     idx = None
     for i, seg in enumerate(vad_segs):
@@ -178,16 +178,23 @@ def _cap_end(start, end, text, vad_segs, relax=1.0):
     """
     n = len(text.replace(" ", ""))
     low = 0.30 * n + 0.6
-    high = (0.90 * n + 0.8) * relax
+    # ★ v1.28.3：原来 0.90 秒/字 —— 数的是【中文字数】，而语音长度由日文
+    #   音节决定，中文普遍更短 → 字幕收得太早（「话还没说完就消失」）。
+    high = (1.80 * n + 3.5) * relax
     cap = start + high
 
     # v1.24.2：段末改成「同一口气连起来之后的段末」，并且允许把 whisper
     # 偏早的 end 补到段末（最多 1.2 秒）。与 d_语音识别.py 保持一致。
     seg_end = _speech_tail(start, vad_segs)
     if seg_end is not None:
-        cap = min(cap, max(seg_end, start + low))
-        if end < seg_end and seg_end - end <= 2.0:
-            end = max(end, min(seg_end, end + 1.2))
+        # ★ v1.28.7：与 d_语音识别.py 一致 —— 不再把 VAD 段尾当唯一天花板。
+        #   whisper 的 end 通常比 VAD 更贴近真实收尾；VAD 对耳语 / 气声不敏感，
+        #   段尾常偏早，会让字幕提前消失。取三者最大，再用「按字数算的宽松
+        #   上限」压一道：start + max(6, 0.75n + 6)，防止三个字挂 30 秒。
+        _soft = start + max(6.0, 0.75 * n + 6.0)
+        cap = min(max(seg_end, start + low, min(end, start + 30.0)), _soft)
+        if end < seg_end and seg_end - end <= 3.5:
+            end = max(end, min(seg_end, end + 2.5))
     return min(end, cap)
 
 
@@ -204,10 +211,11 @@ def tidy_rows(rows, vad_segs, relax=1.0, wordlist=None):
         nxt = rows[i + 1][0] if i + 1 < len(rows) else None
         if nxt is not None and nxt > a:
             nb = min(nb, nxt)
-            # 最少显示 0.5 秒，但不超过下一句
-            nb = max(nb, min(a + 0.5, nxt))
+            # ★ v1.28.4：保底显示 1.2 秒（原 0.5）—— 一行中文至少要这么久才读完，
+            #   0.5 秒的残留字幕看起来就像「下一句还没开始就消失了」。
+            nb = max(nb, min(a + 1.2, nxt))
         if nb <= a:
-            nb = a + 0.3
+            nb = a + 0.8
         if nb < b - 0.01:
             shrunk += 1
         before += b - a

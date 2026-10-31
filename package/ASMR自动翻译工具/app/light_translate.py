@@ -279,6 +279,27 @@ def wait_health(port, timeout=120, proc=None):
 
 
 def translate(port, text, glossary):
+    """翻译一句。★ v1.28.5：内部重试 3 次，绝不返回空。
+
+    以前这里只请求一次：超时 / 返回空串就一路抛到上层，上层直接
+    `continue` 丢掉 —— 用户看到的就是「有些话根本没翻译、整条不见了」。
+    现在改成 3 次重试（间隔递增），仍然失败就抛异常，由上层汇总报错，
+    不再悄悄留下一句日文或干脆删掉。
+    """
+    last = "未知错误"
+    for attempt in range(3):
+        try:
+            zh = _translate_once(port, text, glossary, temp=0.1 if attempt == 0 else 0.3)
+            if zh:
+                return zh
+            last = "模型返回空"
+        except Exception as e:
+            last = f"{type(e).__name__}: {e}"
+        time.sleep(0.4 * (attempt + 1))
+    raise RuntimeError(last)
+
+
+def _translate_once(port, text, glossary, temp=0.1):
     system = SYSTEM
     if glossary:
         system += "\n专有名词（必须原样保留，不要意译）：" + "、".join(glossary)
@@ -287,8 +308,9 @@ def translate(port, text, glossary):
             {"role": "system", "content": system},
             {"role": "user", "content": text},
         ],
-        "temperature": 0.1,
-        "max_tokens": 128,
+        "temperature": temp,
+        # ★ v1.28.5：128 对长句会被硬截断（译文半截但不为空，更隐蔽）
+        "max_tokens": 320,
         "stream": False,
     }
     req = urllib.request.Request(
@@ -298,7 +320,7 @@ def translate(port, text, glossary):
     )
     with urllib.request.urlopen(req, timeout=120) as r:
         d = json.load(r)
-    return d["choices"][0]["message"]["content"].strip()
+    return (d["choices"][0]["message"]["content"] or "").strip()
 
 
 def fmt_time(t):
@@ -333,13 +355,19 @@ def tidy_rows(rows):
         n = len(r.get("zh", ""))
         if JPN_INLINE:
             n = max(n, len(r.get("jp", "")))
-        cap = a + max(1.0, 0.9 * n + 0.8)
+        # ★ v1.28.3：原来 0.9n+0.8 —— 数的是【中文字数】，而语音长度由日文
+        #   音节决定，中文普遍更短 → 字幕收得太早（「话还没说完就消失」）。
+        #   放宽到 1.8n+3.5，并且上下文已有「不压到下一句」的兜底。
+        cap = a + max(2.5, 1.8 * n + 3.5)
         b = min(b, cap)
+        # ★ v1.28.4：不再无条件压到下一句开始。只要离得开，就保底显示
+        #   1.2 秒（人眼读完一行中文至少要这么久），不够才压。
         if i + 1 < len(rows):
             nxt = float(rows[i + 1]["start"])
             if nxt > a:
                 b = min(b, nxt)
-        b = max(b, a + 0.4)
+                b = max(b, min(a + 1.2, nxt))
+        b = max(b, a + 1.0)
         out.append({**r, "start": a, "end": b})
     return out
 
@@ -404,6 +432,7 @@ def main():
         os.makedirs(ASR_DIR, exist_ok=True)
         total = len(files)
         ok = 0
+        total_failed = 0
         t_start = time.time()
         for idx, fp in enumerate(files, 1):
             stem = os.path.splitext(os.path.basename(fp))[0]
@@ -412,19 +441,43 @@ def main():
             print(f"\n翻译: {os.path.basename(fp)}（{len(rows)} 段）", flush=True)
 
             done = []
+            failed = []
             for r in rows:
                 text = (r.get("text") or "").strip()
                 if not text:
                     continue
+                # ★ v1.28.5：失败绝不写日文原文，也绝不静默丢条。
+                #   内部已重试 3 次；这一层再收集起来整批复试一次。
+                #   仍然失败的会在末尾明确列出并让本步退出码非 0，
+                #   用户能一眼看出「这次不全」，而不是拿到一份混着日文的字幕。
                 try:
                     zh = translate(port, text, glossary)
                 except Exception as e:
-                    print(f"  [跳过] {type(e).__name__}: {e}", flush=True)
-                    continue
-                if not zh:
+                    failed.append({"start": r["start"], "end": r["end"], "jp": text, "err": str(e)})
+                    print(f"  [失败] {type(e).__name__}: {e}", flush=True)
                     continue
                 done.append({"start": r["start"], "end": r["end"], "zh": zh, "jp": text})
                 print(f"[{float(r['start']):.2f}s -> {float(r['end']):.2f}s]: {zh}", flush=True)
+
+            # 整批复试：刚才多半是 llama-server 瞬时卡住，歇 2 秒再来一轮。
+            if failed:
+                print(f"  [重试] {len(failed)} 句失败，2 秒后整批复试…", flush=True)
+                time.sleep(2.0)
+                still = []
+                for it in failed:
+                    try:
+                        zh = translate(port, it["jp"], glossary)
+                        done.append({"start": it["start"], "end": it["end"], "zh": zh, "jp": it["jp"]})
+                        print(f"[{float(it['start']):.2f}s 重试成功]: {zh}", flush=True)
+                    except Exception as e:
+                        still.append((it, str(e)))
+                failed = still
+                done.sort(key=lambda x: float(x["start"]))
+            total_failed += len(failed)
+            if failed:
+                print(f"  [未翻译] {len(failed)} 句（本文件字幕不完整）：", flush=True)
+                for it, e in failed[:10]:
+                    print(f"    - {it['jp'][:40]}  ({e})", flush=True)
 
             tidy = tidy_rows(done)
             lines = []
@@ -471,6 +524,11 @@ def main():
             print(f"  {pct:3.0f}%|{bar:<20}| {idx}/{total} [{el // 60:02d}:{el % 60:02d}<00:00]", flush=True)
 
         print(f"\n兼容模式翻译完成：成功 {ok} 个")
+        if total_failed:
+            # ★ v1.28.5：有句子没翻译出来就让本步失败 —— 以前一律 exit 0，
+            #   界面显示「完成」，用户却在片子里找不到那几句话。
+            print(f"[失败] 共 {total_failed} 句未能翻译，字幕不完整")
+            sys.exit(1)
         if ok == 0:
             sys.exit(1)
     finally:

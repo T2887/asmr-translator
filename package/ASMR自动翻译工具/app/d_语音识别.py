@@ -183,7 +183,7 @@ import re as _re
 #   · 该字幕 start 所在 VAD 段的结尾 —— 真实语音边界，跨静音就截这里
 # 最后再夹到"下一条字幕 start"之前，保证不重叠。
 # ─────────────────────────────────────────────────────────────
-def _speech_tail(start, vad_subs, gap=0.5, max_span=15.0):
+def _speech_tail(start, vad_subs, gap=0.9, max_span=20.0):
     """返回「从 start 这一口气说到哪」：start 所在段起，向后把间隔
     <= gap 的段连起来，取最后一个段末。
 
@@ -221,17 +221,34 @@ def _cap_row_end(start, end, text, vad_subs):
     """
     n = len(text.replace(" ", ""))
     low = 0.30 * n + 0.6
-    high = 0.90 * n + 0.8
+    # v1.28.2：high 从 0.90n+0.8 放宽到 1.30n+1.8。
+    #   原因：这里数的是【中文字数】，但真实语音时长由日语音节数决定。
+    #   中文译文普遍比日文短（「姐姐你回来啦」6 字对应「お姉さんおかえり」10 音节），
+    #   按中文字数估时长必然偏短 → 用户听到「话还没说完字幕就消失」。
+    high = 1.30 * n + 1.8
     cap = start + high
 
     seg_end = _speech_tail(start, vad_subs)
     if seg_end is not None:
-        # 段尾是真实语音结束；但不早于"正常语速该有的时长"
-        cap = min(cap, max(seg_end, start + low))
-        if end < seg_end and seg_end - end <= 2.0:
-            # 补到段末，单条最多补 1.2 秒（千问评审建议 0.8；取 1.2 是
-            # 为了覆盖诊断里 0.87~1.59 秒那批的主要分布）
-            end = max(end, min(seg_end, end + 1.2))
+        # ★ v1.28.3 关键修正：真实语音边界优先。
+        #   原来是 cap = min(cap, max(seg_end, start + low)) —— 把「按字数
+        #   估出来的 high」当成天花板，即使 VAD 明确说这段语音还在继续，
+        #   超过 high 的部分照样被切掉 → 「话没说完字幕就消失」。
+        # ★ v1.28.7：不再用 VAD 段尾当唯一天花板。
+        #   原来的 cap = min(max(seg_end, ...), start+20) 会出问题：whisper 的
+        #   end 来自解码对齐，通常比 VAD 更贴近真实说话结束；而 VAD 对耳语 /
+        #   气声 / ASMR 背景音不敏感，段尾常早于实际收尾 → 字幕在 whisper
+        #   认为还在说的位置就被切掉，用户听到「话没说完字幕就消失」。
+        #   现在：取 VAD 段尾、字数下限、whisper 自己的 end 三者最大，但整体
+        #   再压一道「按字数算的宽松上限」= start + max(6, 0.75n + 6)：
+        #   3 个字最多 9 秒、23 个字最多 23 秒 —— 既有足够余量，又不会出现
+        #   「很不错」这种三个字挂 30 秒的情况。
+        _soft = start + max(6.0, 0.75 * n + 6.0)
+        cap = min(max(seg_end, start + low, min(end, start + 30.0)), _soft)
+        if end < seg_end:
+            # ★ v1.28.4：补长上限从 2.5 秒放宽到 5.0 秒 —— ASMR 里 whisper
+            #   经常把一句长耳语的 end 判在句中，VAD 才是真实结束点。
+            end = max(end, min(seg_end, end + 5.0))
 
     return min(end, cap)
 
@@ -366,6 +383,9 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
             audio=audio_path,
             language="ja",
             task='translate',
+            # 解码束宽。faster-whisper 默认 5，不传就是 5。
+            # 用环境变量 ASMR_BEAM 临时试更小的值（2 / 1），默认仍是 5。
+            beam_size=int(os.environ.get("ASMR_BEAM", "5")),
             vad_filter=True,  # 必须开启，Patch 才会生效
             # ★ v1.17.1：关闭跨段上下文（原来是 True）。
             #
@@ -399,10 +419,18 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
             if i + 1 < len(raw_rows):
                 nxt = raw_rows[i + 1][0]
                 if nxt > a:
-                    nb = min(nb, nxt)                 # 不压到下一句
-                    nb = max(nb, min(a + 0.5, nxt))   # 最少显示 0.5 秒
+                    # ★ v1.28.3：原来这里无条件 nb = min(nb, nxt) —— 只要
+                    #   whisper 把下一句的 start 判早了，上一句就被硬切到那里，
+                    #   即使 VAD 明确说这句话还在说 → 用户听到「话没说完字幕
+                    #   就消失」。现在改成：只有当 VAD 也认为语音在 nxt 之前
+                    #   就结束时才截断；否则允许本条多挂一会儿（最多盖到真实
+                    #   语音尾），重叠部分由播放器用后一条覆盖，不影响阅读。
+                    _tail = _speech_tail(a, vad_subs)
+                    _limit = nxt if (_tail is None or _tail <= nxt + 0.15) else min(_tail, a + 20.0)
+                    nb = min(nb, _limit)
+                    nb = max(nb, min(a + 1.2, nxt))   # ★ v1.28.4：最少显示 1.2 秒（原 0.5）
             if nb <= a:
-                nb = a + 0.3
+                nb = a + 0.8
             asr_rows.append((a, nb, t))
 
         _shrunk = sum(1 for r0, r1 in zip(raw_rows, asr_rows) if r1[1] < r0[1] - 0.01)

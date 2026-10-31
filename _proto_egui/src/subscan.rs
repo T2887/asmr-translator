@@ -532,6 +532,114 @@ pub fn looks_like_subtitle(gray: &[u8], w: usize, h: usize) -> bool {
             return true;
         }
     }
+
+    // ── 通道 2：无描边白字 ──
+    // 用户实测的片子（ROYD-284-C）字幕是**纯白、没有黑描边**的。
+    // 只认「白字黑边」会整部漏检，所以再补一条判据：
+    //   文字和白色物体的区别在**行内白像素是断续的** ——
+    //   一行 10 个汉字会切成 20~40 段（笔画之间有空隙），
+    //   而白床单、白墙、反光是一整片，run 数只有 1~3。
+    let mut runs = vec![0usize; h];
+    let mut whites = vec![0usize; h];
+    for y in 0..h {
+        let mut in_run = false;
+        for x in 0..w {
+            let white = gray[y * w + x] > WHITE;
+            if white {
+                whites[y] += 1;
+                if !in_run {
+                    runs[y] += 1;
+                    in_run = true;
+                }
+            } else {
+                in_run = false;
+            }
+        }
+    }
+    // 一行至少要这么些白像素才可能是字（太稀疏的是噪点）
+    let white_min = (w as f64 * 0.020).max(6.0) as usize;
+    let mut blocks2: Vec<(usize, usize)> = Vec::new();
+    let mut cur2: Option<usize> = None;
+    let mut gap2 = 0usize;
+    for y in 0..h {
+        let line = whites[y] >= white_min && runs[y] >= 6;
+        if line {
+            if cur2.is_none() {
+                cur2 = Some(y);
+            }
+            gap2 = 0;
+        } else if cur2.is_some() {
+            gap2 += 1;
+            if gap2 > ROW_GAP {
+                if let Some(y0) = cur2.take() {
+                    blocks2.push((y0, y.saturating_sub(gap2)));
+                }
+                gap2 = 0;
+            }
+        }
+    }
+    if let Some(y0) = cur2 {
+        blocks2.push((y0, h.saturating_sub(1)));
+    }
+    // 无描边通道的门槛比描边通道更高：宁可漏，不可误把白色画面当字幕。
+    //
+    // 下面这四条是拿真实素材标定出来的（有字幕的 ROYD-284 抽 5 帧 vs
+    // 无字幕的 NMSL-006 抽 4 帧）：
+    //   · 字高 14~40 行：960 宽下汉字就这个高度。太矮是噪点，太高是床单/墙。
+    //   · 填充率 0.03~0.20：笔画只占块的一小部分；超过 0.20 是整片白。
+    //   · 列白像素中位 run / 块高 ≤ 0.25：字形上下有缺口；白色物体整列通到底。
+    //   · 跨度 ≥ 0.22 宽：一整行字幕。
+    // 无字幕样本里唯一漏进来的块填充率 0.267（>0.20）被第二条挡掉。
+    for (y0, y1) in blocks2 {
+        let bh = y1.saturating_sub(y0) + 1;
+        if !(14..=40).contains(&bh) || bh > max_h {
+            continue;
+        }
+        let (mut lo, mut hi) = (w, 0usize);
+        let mut cnt = 0usize;
+        for y in y0..=y1 {
+            for x in 0..w {
+                if gray[y * w + x] > WHITE {
+                    cnt += 1;
+                    lo = lo.min(x);
+                    hi = hi.max(x);
+                }
+            }
+        }
+        let area = (bh * w) as f64;
+        let fill = cnt as f64 / area;
+        if !(0.030..=0.20).contains(&fill) {
+            continue;
+        }
+        if !(hi >= lo && (hi - lo + 1) as f64 >= w as f64 * 0.22) {
+            continue;
+        }
+        // 每列白像素的最长垂直连续段，取中位数 —— 字形上下有缺口，白块没有。
+        let mut vruns: Vec<usize> = Vec::with_capacity(hi - lo + 1);
+        for x in lo..=hi {
+            let mut run = 0usize;
+            let mut mx = 0usize;
+            for y in y0..=y1 {
+                if gray[y * w + x] > WHITE {
+                    run += 1;
+                    if run > mx {
+                        mx = run;
+                    }
+                } else {
+                    run = 0;
+                }
+            }
+            vruns.push(mx);
+        }
+        if vruns.is_empty() {
+            continue;
+        }
+        vruns.sort_unstable();
+        let med = vruns[vruns.len() / 2] as f64 / bh as f64;
+        if med <= 0.25 {
+            return true;
+        }
+    }
     false
 }
 
@@ -720,6 +828,32 @@ duration=4835.067937
         assert!(info.has_video, "应该认出视频流");
         assert!(info.soft.is_none(), "这部片没有内封字幕流");
         assert!(hard_sub(t, p, info.duration), "应该检出画面里的硬字幕");
+    }
+
+    /// 真机验证 C：**无描边白字**的硬字幕（ROYD-284）。
+    /// 这部片子的字幕是纯白、没有黑描边，旧实现必漏检，正是通道 2 针对的场景。
+    #[test]
+    #[ignore]
+    fn real_video_with_outline_less_hard_sub() {
+        let Some(t) = tools() else {
+            println!("跳过：没找到 ffmpeg / ffprobe");
+            return;
+        };
+        let p = r"L:\迅雷下载\1027\489155.com@ROYD-284-C.mp4";
+        if !std::path::Path::new(p).is_file() {
+            println!("跳过：样本不在 {p}");
+            return;
+        }
+        let info = probe(t, p);
+        println!(
+            "duration={:.1}s soft={:?} has_video={}",
+            info.duration, info.soft, info.has_video
+        );
+        assert!(info.soft.is_none(), "这部片没有内封字幕流");
+        assert!(
+            hard_sub(t, p, info.duration),
+            "无描边白字也该被通道 2 检出"
+        );
     }
 
     /// 真机验证 B：干净样本（120 秒测试片，无字幕流、画面里也没字幕）
