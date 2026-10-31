@@ -21,10 +21,10 @@ use std::time::Duration;
 ///
 /// 放 Gitee 而不是 GitHub 的原因：`raw.githubusercontent.com` 在国内
 /// 绝大多数网络下直接连不上，用户拿到的将永远是「检查失败」。
-pub const VERSION_URL: &str = "https://gitee.com/T2887/asmr-translator/raw/main/version.json";
+pub const VERSION_URL: &str = "https://gitee.com/aaa15/asmr-translator/raw/main/version.json";
 
 /// 项目主页（下载页兜底用）
-pub const RELEASES_PAGE: &str = "https://gitee.com/T2887/asmr-translator/releases";
+pub const RELEASES_PAGE: &str = "https://gitee.com/aaa15/asmr-translator";
 
 /// 一次检查结果
 #[derive(Debug, Clone)]

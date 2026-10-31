@@ -1,7 +1,7 @@
 {
-  "version": "1.28",
-  "url": "https://gitee.com/T2887/asmr-translator/raw/main/dist/ASMR-Translator-Setup_v1.28.exe",
-  "page": "https://gitee.com/T2887/asmr-translator/releases",
+  "version": "1.28.1",
+  "url": "https://github.com/T2887/asmr-translator/releases/download/v1.28.1/ASMR-Translator-Setup_v1.28.1.exe",
+  "page": "https://github.com/T2887/asmr-translator/releases/tag/v1.28.1",
   "notes": "v1.28 更新内容：\n· 新增：启动时自动检查新版本，发现可一键下载安装\n· 新增：下载失败自动提供网盘镜像\n· 修复：老显卡（计算能力 < 7.5）不再崩溃，自动切兼容模式\n· 修复：人声分离内存不足时明确报错，不再静默「完成」却零字幕\n· 修复：字幕预检、崩溃日志落盘（_崩溃日志.txt）\n\n注意：本次只需更新主程序，运行环境包没变，不用重下。",
   "mirrors": [
     {"name": "百度网盘", "url": "https://pan.baidu.com/s/1UrvC4AaxsV-BBJWOrTNUdg?pwd=c82t"},
