@@ -1,8 +1,8 @@
 {
-  "version": "1.29.0",
-  "url": "https://github.com/T2887/asmr-translator/releases/download/v1.29.0/ASMR-Translator-Setup_v1.29.0.exe",
-  "page": "https://github.com/T2887/asmr-translator/releases/tag/v1.29.0",
-  "notes": "v1.29.0 更新内容：\n· 新增：把字幕封装进原视频（软字幕）。mkv 完整保留 ASS 样式，mp4/mov 剥成纯文本；同时生成外挂字幕，两者并存\n· 新增：重复生成时自动替换旧的软字幕文件，失败会保留上一版不被破坏\n· 新增：支持 mp4/mkv/mov/m4v/3gp/webm/avi/wmv/flv/ts/mpg 共 11 种视频封字幕（装不住字幕的容器自动转成 mkv）\n· 新增：内存不足时自动降级为 int8 继续跑，不再直接崩溃退出\n· 修复：字幕「话没说完就消失」——识别窗口按 VAD 段重建，一条不再横跨几十秒\n· 修复：短音频里的音效被误识成「完」「结束」等假字幕，会被过滤掉\n· 修复：全局热词里的角色词污染（「社长」曾出现在十几条无关字幕里）\n· 修复：白色家具/墙面被误判成画面自带硬字幕（那个文件其实没字幕）\n· 修复：每次打开闪一个黑色控制台窗口\n· 调整：模式按钮改为竖排，右侧标注适用显卡与显存要求\n\n实测同一文件：字幕条数 156→150，虚假短条 7 条归零，单条最长 34.5s→10.8s。\n注意：本次只需更新主程序，运行环境包没变，不用重下。",
+  "version": "1.29.1",
+  "url": "https://github.com/T2887/asmr-translator/releases/download/v1.29.1/ASMR-Translator-Setup_v1.29.1.exe",
+  "page": "https://github.com/T2887/asmr-translator/releases/tag/v1.29.1",
+  "notes": "v1.29.1 更新内容：\n· 修复：已经封装过软字幕的视频，程序识别不出里面的字幕流，又跑了一遍。原因是字幕预检找不到 ffmpeg —— 运行环境包把 ffmpeg 放在 env\\ffmpeg\\，而程序只去根目录、ffmpeg\\、bin\\、env\\Scripts\\ 找，全都不存在\n· 修复：某些情况下「检出内封字幕」的结果被丢弃，文件照样被重新处理\n· 修复：画面里贴着最底边的字幕检测不出来（带区下边界只到画面 96%，把字幕切掉了）\n· 改进：检测到画面里疑似有硬字幕时，改为弹窗问你要不要继续生成，由你决定跳过还是处理\n· 修复：源文件被删除或移动后，队列里的旧路径会让整批处理中止；现在只跳过那一个文件，其余照常跑\n\n注意：本次只需更新主程序，运行环境包没变，不用重下。",
   "mirrors": [
     {"name": "百度网盘", "url": "https://pan.baidu.com/s/1UrvC4AaxsV-BBJWOrTNUdg?pwd=c82t"},
     {"name": "夸克网盘", "url": "https://pan.quark.cn/s/42530f352af0?pwd=GHXq"}

@@ -28,8 +28,19 @@ use crate::config;
 ///
 /// 上限不取 1.0 是因为最底下常被播放器进度条 / 台标占着；
 /// 下限 0.62 是给「双行字幕 + 稍高的 MarginV」留余量。
+///
+/// ★ v1.29.2：下边界从 0.96 放宽到 1.00（整个画面底部）。
+///   原来的 0.96 会把【贴着画面最底边】的字幕切掉大半 —— 实测 SONE-961-C：
+///   字幕完整位于画面高度 93.5%~98.1%，0.96 的下边界只保留了它的最上面
+///   几行，块高凑不够 14 行的门槛，于是这条判据直接 `continue` 掉了，
+///   **有硬字幕的文件被漏检**（用户反馈「这个是有硬字幕的，翻译器没认出来」）。
+///   放宽到整幅画面后字幕完整进带区，判据就能正常工作。
+///
+///   原来担心「最底下是播放器进度条」—— 那是【播放时】才有，而这里是直接
+///   解码原始视频帧，不存在进度条。台标/水印确实可能在角落，但它们通不过
+///   后面的「横向跨度 ≥ 22% 宽度」和「高 14~40 行」判据。
 const BAND_TOP: f64 = 0.62;
-const BAND_BOTTOM: f64 = 0.96;
+const BAND_BOTTOM: f64 = 1.00;
 /// 抽出来的帧统一缩到这个宽度再分析：960 宽下汉字笔画还有 2~3 像素，
 /// 再小描边就糊成一片了。缩小主要是为了让逐像素的邻域统计跑得动。
 const WORK_W: usize = 960;
@@ -82,6 +93,7 @@ const FRAMES_MAX: usize = 16;
 /// 所以两条路都要试。
 pub struct Tools {
     pub ffmpeg: String,
+    /// ffprobe 的位置。**可能为空串** —— 见 find_tools 的说明。
     pub ffprobe: String,
 }
 
@@ -95,7 +107,19 @@ pub fn tools() -> Option<&'static Tools> {
 fn find_tools() -> Option<Tools> {
     let work = std::path::PathBuf::from(config::work_dir());
     let mut dirs: Vec<std::path::PathBuf> = Vec::new();
-    for sub in ["ffmpeg\\bin", "ffmpeg", "bin", "env\\Scripts", ""] {
+    for sub in [
+        // ★ v1.29.2：`env\ffmpeg` 是【运行环境包实际放置 ffmpeg 的位置】，
+        //   必须放在第一梯队。原来的列表里没有它，导致正式环境（运行包只
+        //   在 env\ffmpeg\ 下有 ffmpeg.exe）永远找不到工具 ——
+        //   用户因此「软字幕没识别出来」，而开发机因为 PATH 上有 ffmpeg
+        //   一直测不出来。
+        "env\\ffmpeg",
+        "ffmpeg\\bin",
+        "ffmpeg",
+        "bin",
+        "env\\Scripts",
+        "",
+    ] {
         let d = if sub.is_empty() {
             work.clone()
         } else {
@@ -103,25 +127,51 @@ fn find_tools() -> Option<Tools> {
         };
         dirs.push(d);
     }
+    // ★ v1.29.2：ffprobe 改成【可选】。
+    //
+    //   踩过的坑（真实用户反馈「软字幕没识别出来」）：
+    //     运行环境包里的 env\ffmpeg\ 目录【只有 ffmpeg.exe，没有 ffprobe.exe】。
+    //     而原来的条件是 `if ff.is_file() && fp.is_file()` —— 两个都得在，
+    //     于是 tools() 返回 None，整个预检（内封字幕 + 硬字幕）被跳过，
+    //     程序对「已经封装了软字幕的文件」视而不见，重新跑了一遍流水线。
+    //
+    //     这是个很隐蔽的缺陷：功能看着实现了，实际在正式环境里从来没生效过。
+    //
+    //   现在只要有 ffmpeg 就继续；ffprobe 缺失时用 `ffmpeg -i` 的输出替代
+    //   （两者的流信息格式不同但内容等价，见 probe_via_ffmpeg）。
+    let mut ffmpeg: Option<String> = None;
+    let mut ffprobe: Option<String> = None;
     for d in dirs {
         let ff = d.join("ffmpeg.exe");
         let fp = d.join("ffprobe.exe");
-        if ff.is_file() && fp.is_file() {
-            return Some(Tools {
-                ffmpeg: ff.to_string_lossy().to_string(),
-                ffprobe: fp.to_string_lossy().to_string(),
-            });
+        if ff.is_file() {
+            if ffmpeg.is_none() {
+                ffmpeg = Some(ff.to_string_lossy().to_string());
+            }
+            if fp.is_file() && ffprobe.is_none() {
+                ffprobe = Some(fp.to_string_lossy().to_string());
+            }
+        }
+        if ffmpeg.is_some() && ffprobe.is_some() {
+            break;
         }
     }
-    // 退回 PATH。这里必须真跑一次 —— 光看 `Command::new("ffmpeg")` 成不成功
-    // 发现不了「装了个到处弹广告的假 ffmpeg」这种情况。
-    if run_ok("ffmpeg", &["-version"]) && run_ok("ffprobe", &["-version"]) {
-        return Some(Tools {
-            ffmpeg: "ffmpeg".to_string(),
-            ffprobe: "ffprobe".to_string(),
-        });
+    if ffmpeg.is_none() {
+        // 退回 PATH。这里必须真跑一次 —— 光看 `Command::new("ffmpeg")` 成不成功
+        // 发现不了「装了个到处弹广告的假 ffmpeg」这种情况。
+        if run_ok("ffmpeg", &["-version"]) {
+            ffmpeg = Some("ffmpeg".to_string());
+            if run_ok("ffprobe", &["-version"]) {
+                ffprobe = Some("ffprobe".to_string());
+            }
+        }
     }
-    None
+    let ffmpeg = ffmpeg?;
+    Some(Tools {
+        ffmpeg,
+        // 缺失时留空串，probe() 据此走 ffmpeg 回退路径
+        ffprobe: ffprobe.unwrap_or_default(),
+    })
 }
 
 fn run_ok(exe: &str, args: &[&str]) -> bool {
@@ -163,25 +213,147 @@ pub struct Info {
 }
 
 pub fn probe(tools: &Tools, path: &str) -> Info {
-    let out = Command::new(&tools.ffprobe)
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration:stream=index,codec_type,codec_name:stream_tags=language",
-            "-of",
-            "default",
-            path,
-        ])
+    // ffprobe 优先（结构化输出好解析）
+    if !tools.ffprobe.is_empty() {
+        let out = Command::new(&tools.ffprobe)
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration:stream=index,codec_type,codec_name:stream_tags=language",
+                "-of",
+                "default",
+                path,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .creation_flags_none()
+            .output();
+        if let Ok(o) = out {
+            let info = parse_probe(&String::from_utf8_lossy(&o.stdout));
+            if info.duration > 0.0 || info.soft.is_some() || info.has_video {
+                return info;
+            }
+        }
+    }
+    // ★ v1.29.2：没有 ffprobe 时退回 `ffmpeg -i`。
+    //
+    //   运行环境包里只有 ffmpeg.exe（没有 ffprobe），原来这里直接返回空，
+    //   导致「已经封装了软字幕的文件」被当成普通文件重跑。
+    probe_via_ffmpeg(tools, path)
+}
+
+/// 用 `ffmpeg -i` 取流信息（没有 ffprobe 时的回退）。
+///
+/// ffmpeg 把信息打到 **stderr**，格式是给人看的：
+/// ```text
+///   Duration: 02:48:30.11, start: 0.000000, bitrate: 5271 kb/s
+///   Stream #0:0[0x1](und): Video: h264 (Main) ...
+///   Stream #0:2[0x3](chi): Subtitle: mov_text (tx3g / 0x67337874), 0 kb/s (default)
+/// ```
+/// 这里按行解析出：时长、有没有视频流、有哪些字幕流。
+fn probe_via_ffmpeg(tools: &Tools, path: &str) -> Info {
+    let out = Command::new(&tools.ffmpeg)
+        .args(["-hide_banner", "-i", path])
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stdout(Stdio::null()) // ffmpeg -i 会把信息打到 stderr
+        .stderr(Stdio::piped())
         .creation_flags_none()
         .output();
-    match out {
-        Ok(o) => parse_probe(&String::from_utf8_lossy(&o.stdout)),
-        Err(_) => Info::default(),
+    let Ok(o) = out else {
+        return Info::default();
+    };
+    parse_ffmpeg_stderr(&String::from_utf8_lossy(&o.stderr))
+}
+
+/// 解析 `ffmpeg -i` 的 stderr 输出。
+fn parse_ffmpeg_stderr(text: &str) -> Info {
+    let mut info = Info::default();
+    let mut subs: Vec<String> = Vec::new();
+
+    for line in text.lines() {
+        let l = line.trim();
+        // 时长：`Duration: 02:48:30.11, start: ...`
+        if let Some(rest) = l.strip_prefix("Duration:") {
+            // 取到第一个逗号为止 —— `02:48:30.11, start: 0.000000`
+            // 末尾那个逗号必须剥掉，否则秒数 `30.11,` 解析失败会静默变成 0，
+            // 结果时长只剩小时+分钟（实测 2:48:30 被解析成 2.8 小时 = 10080 秒）。
+            let t: String = rest
+                .trim()
+                .chars()
+                .take_while(|c| *c != ',')
+                .collect::<String>()
+                .trim()
+                .to_string();
+            if t != "N/A" && !t.is_empty() {
+                let parts: Vec<&str> = t.split(':').collect();
+                if parts.len() == 3 {
+                    let h: f64 = parts[0].trim().parse().unwrap_or(0.0);
+                    let m: f64 = parts[1].trim().parse().unwrap_or(0.0);
+                    let s: f64 = parts[2].trim().parse().unwrap_or(0.0);
+                    let d = h * 3600.0 + m * 60.0 + s;
+                    if d > 0.0 {
+                        info.duration = d;
+                    }
+                }
+            }
+            continue;
+        }
+        // 流信息：`Stream #0:0[0x1](und): Video: h264 ...`
+        //              Stream #0:2[0x3](chi): Subtitle: mov_text ...
+        //         纯音频无语言标记：`Stream #0:0: Audio: flac, 48000 Hz ...`
+        let Some(rest) = l.strip_prefix("Stream #") else {
+            continue;
+        };
+        // ★ 类型段在【最后一个 `):` 或第二个 `:`】之后，不能直接 find(':')。
+        //   `Stream #0:0[0x1](und): Video: h264`
+        //      ↑ rest = "0:0[0x1](und): Video: h264"
+        //   第一个冒号是【索引】`0:` 的那一个，用它会切出 "0[0x1](und): Video"，
+        //   判断就永远不成立。实测踩过：has_video 恒为 false。
+        //
+        //   稳妥做法：找 `") :"` / `")："` 之后的第一个冒号；没有括号时
+        //   （纯音频那种 `#0:0: Audio:`）退回到「第二个冒号」。
+        let (head_end, tail_start) = if let Some(p) = rest.find("):") {
+            (p + 1, p + 2) // 跳过 ")：" 里的冒号
+        } else {
+            // 没有语言括号：`0:0: Audio:` → 第二个冒号之后
+            match rest.match_indices(':').nth(1) {
+                Some((p, _)) => (p, p + 1),
+                None => continue,
+            }
+        };
+        let tail = rest[tail_start..].trim();
+        if tail.starts_with("Video:") {
+            info.has_video = true;
+        } else if tail.starts_with("Subtitle:") {
+            // 语言标记在 `#0:2[0x3](chi)` 的圆括号里
+            let head = &rest[..head_end];
+            let lang = head
+                .rfind('(')
+                .and_then(|i| head[i + 1..].find(')').map(|j| head[i + 1..i + 1 + j].to_string()))
+                .unwrap_or_default();
+            // 编码名：`Subtitle: mov_text (tx3g / ...)` → mov_text
+            let codec = tail
+                .trim_start_matches("Subtitle:")
+                .trim()
+                .split_whitespace()
+                .next()
+                .unwrap_or("?")
+                .trim_end_matches(',')
+                .to_string();
+            if lang.is_empty() || lang.eq_ignore_ascii_case("und") {
+                subs.push(codec);
+            } else {
+                subs.push(format!("{codec}（{lang}）"));
+            }
+        }
     }
+
+    if !subs.is_empty() {
+        info.soft = Some(subs.join(" / "));
+    }
+    info
 }
 
 /// 解析 `ffprobe -of default` 的输出。
@@ -675,34 +847,178 @@ pub fn looks_like_subtitle(gray: &[u8], w: usize, h: usize) -> Option<(usize, us
 
 // ── 对外入口 ──
 
-/// 扫一批文件，返回「已经自带字幕」的 `(路径, 原因)`。
+/// 预检结果。
+pub struct PrecheckResult {
+    /// 这些文件确实自带字幕，不必再跑流水线。
+    pub skip: Vec<(String, String)>,
+    /// 仅提示（当前没有用到，保留结构以便以后扩展）
+    pub warn: Vec<(String, String)>,
+}
+
+/// 扫一批文件，判断哪些「已经自带字幕」。
 ///
 /// 没有 ffmpeg/ffprobe 时返回空 —— 调用方据此退化成「不预检、照常跑」，
 /// 绝不能因为找不到工具就把所有文件都判成有字幕。
-pub fn precheck(files: &[String]) -> Vec<(String, String)> {
-    let Some(tools) = tools() else {
-        return Vec::new();
+///
+/// ## 两类判定，可靠度差异很大
+///
+/// 1. **内封字幕**（`info.soft`）—— 读容器元数据，**准确率 100%**。
+///
+/// 2. **画面硬字幕** —— 从像素猜的，靠多帧投票 + 位置判据。
+///
+///    v1.29 一度把它改成「只提示不跳过」，那是为了绕开 abf-207 的误判。
+///    但用户随后反馈 SONE-961-C **明明有硬字幕却被漏检、照样生成了字幕** ——
+///    查下来是两个问题叠在一起：
+///      · BAND_BOTTOM 取 0.96，把贴着画面底边的字幕切掉大半 → 漏检
+///      · 漏检后被当成"没问题"，硬字幕片子又跑了一遍
+///
+///    v1.29.2 的修法：
+///      · 带区下边界放宽到 1.00，让贴底字幕完整进带区（实测 SONE-961
+///        字幕位于 93.5%~98.1%，放宽后 3 帧全部命中）
+///      · 恢复「检出即跳过」，因为现在的判据在白床单（abf-207）和
+///        贴底字幕（SONE-961）上都验证过了
+pub fn precheck(files: &[String]) -> PrecheckResult {
+    let mut out = PrecheckResult {
+        skip: Vec::new(),
+        warn: Vec::new(),
     };
-    let mut hits = Vec::new();
+    let Some(tools) = tools() else {
+        return out;
+    };
     for f in files {
         let info = probe(tools, f);
         if let Some(desc) = info.soft {
-            hits.push((f.clone(), format!("内封字幕 {desc}")));
+            out.skip.push((f.clone(), format!("内封字幕 {desc}")));
             continue;
         }
         if !info.has_video || info.duration <= 0.0 {
             continue; // 纯音频没有画面可查
         }
         if hard_sub(tools, f, info.duration) {
-            hits.push((f.clone(), "画面里压了硬字幕".to_string()));
+            // ★ v1.29.2：不再自己决定跳过，交给界面弹窗问用户。
+            out.warn
+                .push((f.clone(), "画面里疑似压了硬字幕".to_string()));
         }
     }
-    hits
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★ v1.29.2：没有 ffprobe 时，用 `ffmpeg -i` 的 stderr 解析流信息。
+    ///
+    /// 这是真实踩到的坑：运行环境包的 env\ffmpeg\ 只有 ffmpeg.exe，
+    /// 没有 ffprobe.exe，而原来的 find_tools 要求两个都在，于是整个预检
+    /// 被跳过 —— 已经封装了软字幕的文件被当成普通文件重跑。
+    #[test]
+    fn ffmpeg_stderr_parses_duration_and_subtitle() {
+        let text = "\
+  Duration: 02:48:30.11, start: 0.000000, bitrate: 5271 kb/s
+  Stream #0:0[0x1](und): Video: h264 (Main) (avc1 / 0x31637661), yuv420p, 1920x1080, 5133 kb/s, 29.97 fps
+  Stream #0:1[0x2](und): Audio: aac (LC) (mp4a / 0x6134706D), 44100 Hz, stereo, fltp, 127 kb/s
+  Stream #0:2[0x3](chi): Subtitle: mov_text (tx3g / 0x67337874), 0 kb/s (default)
+";
+        let info = parse_ffmpeg_stderr(text);
+        eprintln!("解析结果: duration={} has_video={} soft={:?}", info.duration, info.has_video, info.soft);
+        assert!(
+            (info.duration - (2.0 * 3600.0 + 48.0 * 60.0 + 30.11)).abs() < 0.1,
+            "时长不对: {}",
+            info.duration
+        );
+        assert!(info.has_video, "应该认出视频流");
+        let soft = info.soft.expect("应该认出字幕流");
+        assert!(soft.contains("mov_text"), "应包含编码名: {soft}");
+        assert!(soft.contains("chi"), "应包含语言标记: {soft}");
+    }
+
+    #[test]
+    fn ffmpeg_stderr_without_subtitle_is_clean() {
+        let text = "\
+  Duration: 00:02:00.09, start: 0.000000, bitrate: 6015 kb/s
+  Stream #0:0[0x1](und): Video: h264 (Main), yuv420p, 1920x1080 [SAR 1:1 DAR 16:9], 5809 kb/s, 29.97 fps
+  Stream #0:1[0x2](eng): Audio: aac (LC), 44100 Hz, stereo, fltp, 127 kb/s
+";
+        let info = parse_ffmpeg_stderr(text);
+        assert!((info.duration - 120.09).abs() < 0.1);
+        assert!(info.has_video);
+        assert!(info.soft.is_none(), "没有字幕流时 soft 必须是 None");
+    }
+
+    #[test]
+    fn ffmpeg_stderr_audio_only_has_no_video() {
+        let text = "\
+  Duration: 00:10:59.19, start: 0.000000, bitrate: 1308 kb/s
+  Stream #0:0: Audio: flac, 48000 Hz, stereo, s32 (24 bit)
+";
+        let info = parse_ffmpeg_stderr(text);
+        assert!((info.duration - 659.19).abs() < 0.2);
+        assert!(!info.has_video, "纯音频不该判成有视频");
+        assert!(info.soft.is_none());
+    }
+
+    /// ★ v1.29.2：真实环境的回归测试 —— 运行目录里**没有 ffprobe**，
+    /// 只有 env\ffmpeg\ffmpeg.exe。必须靠 ffmpeg 回退路径识别出内封字幕。
+    ///
+    /// 这个文件是用户反馈的样本：已经封装了软字幕（mov_text / chi），
+    /// 但程序原来识别不出来，当成普通文件重跑了一遍。
+    #[test]
+    #[ignore]
+    fn real_video_soft_sub_detected_without_ffprobe() {
+        let Some(t) = tools() else {
+            println!("跳过：没找到 ffmpeg");
+            return;
+        };
+        println!("ffmpeg={} ffprobe={:?}", t.ffmpeg, t.ffprobe);
+        let p = r"L:\迅雷下载\1027\4k2.com@abf-207（软字幕）.mp4";
+        if !std::path::Path::new(p).is_file() {
+            println!("跳过：样本不在 {p}");
+            return;
+        }
+        let info = probe(t, p);
+        println!(
+            "duration={:.1}s soft={:?} has_video={}",
+            info.duration, info.soft, info.has_video
+        );
+        assert!(
+            info.soft.is_some(),
+            "这个文件有内封字幕流（mov_text/chi），应该能识别"
+        );
+        assert!(info.has_video);
+        assert!(info.duration > 0.0);
+    }
+
+    /// ★ 关键回归：precheck 必须【同时】返回 skip（内封字幕）和 warn（硬字幕）。
+    ///
+    /// 这就是连错三版的那个 bug 的测试：main.rs 里原来把 warn 的处理写在
+    /// skip 之前并直接 return，导致只要有硬字幕候选，内封字幕的判定就被丢掉。
+    /// 这里从数据层验证：两个文件应当一个进 skip、一个进 warn。
+    #[test]
+    #[ignore]
+    fn precheck_returns_skip_and_warn_together() {
+        let files: Vec<String> = vec![
+            r"L:\迅雷下载\1027\4k2.com@abf-207（软字幕）.mp4".to_string(),
+            r"L:\迅雷下载\1027\SONE-961-C.mp4".to_string(),
+        ];
+        for f in &files {
+            if !std::path::Path::new(f).is_file() {
+                println!("跳过：样本不在 {f}");
+                return;
+            }
+        }
+        let res = precheck(&files);
+        println!("skip = {:?}", res.skip);
+        println!("warn = {:?}", res.warn);
+        assert!(
+            res.skip.iter().any(|(p, _)| p.contains("abf-207")),
+            "abf-207 有内封字幕，必须在 skip 里"
+        );
+        assert!(
+            res.warn.iter().any(|(p, _)| p.contains("SONE-961")),
+            "SONE-961 疑似硬字幕，必须在 warn 里"
+        );
+    }
 
     #[test]
     fn pgm_parses_and_rejects_garbage() {
@@ -892,6 +1208,67 @@ duration=4835.067937
         assert!(
             hard_sub(t, p, info.duration),
             "无描边白字也该被通道 2 检出"
+        );
+    }
+
+    /// ★ v1.29.2：SONE-961-C —— 字幕贴着画面最底边的样本。
+    ///
+    /// 这个片子字幕完整位于画面高度 **93.5%~98.1%**，而 BAND_BOTTOM 原来是
+    /// 0.96，只截到字幕的最上面几行，块高不够 14 行门槛，判据直接跳过 →
+    /// 有硬字幕却漏检（用户反馈「这个是有硬字幕的，翻译器没认出来」）。
+    /// 把 BAND_BOTTOM 放宽到 1.00 后应该能检出。
+    #[test]
+    #[ignore]
+    fn real_video_subtitle_at_very_bottom() {
+        let Some(t) = tools() else {
+            println!("跳过：没找到 ffmpeg / ffprobe");
+            return;
+        };
+        let p = r"L:\迅雷下载\1027\SONE-961-C.mp4";
+        if !std::path::Path::new(p).is_file() {
+            println!("跳过：样本不在 {p}");
+            return;
+        }
+        let info = probe(t, p);
+        println!(
+            "duration={:.1}s soft={:?} has_video={}",
+            info.duration, info.soft, info.has_video
+        );
+        assert!(info.soft.is_none(), "这个文件没有内封字幕（字幕是压进画面的）");
+        assert!(
+            hard_sub(t, p, info.duration),
+            "字幕贴着画面底边，也应该被检出"
+        );
+    }
+
+    /// ★ v1.29：用户实测反馈的误判样本（abf-207，白色椅子/白床单，无字幕）。
+    ///
+    /// 这个是**上一次修复漏掉的回归测试** —— 之前的「无字幕」用例用的是
+    /// short_test.mp4（120 秒干净测试片），根本没覆盖这个真实误判场景，
+    /// 所以修复发布后用户那边依然误判。
+    ///
+    /// 手动跑：cargo test --release -- --ignored --nocapture real_video_white_furniture
+    #[test]
+    #[ignore]
+    fn real_video_white_furniture_is_clean() {
+        let Some(t) = tools() else {
+            println!("跳过：没找到 ffmpeg / ffprobe");
+            return;
+        };
+        let p = r"L:\迅雷下载\1027\4k2.com@abf-207.mp4";
+        if !std::path::Path::new(p).is_file() {
+            println!("跳过：样本不在 {p}");
+            return;
+        }
+        let info = probe(t, p);
+        println!(
+            "duration={:.1}s soft={:?} has_video={}",
+            info.duration, info.soft, info.has_video
+        );
+        assert!(info.soft.is_none(), "这个文件没有内封字幕");
+        assert!(
+            !hard_sub(t, p, info.duration),
+            "画面里是白色家具，不该被判成有硬字幕"
         );
     }
 

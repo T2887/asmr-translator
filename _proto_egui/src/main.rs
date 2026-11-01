@@ -91,12 +91,21 @@ struct App {
     /// 扫描期间按钮显示「检查字幕…」且不可点。
     prechecking: bool,
     /// 后台扫描的结果通道。Some = 还在扫，None = 没在扫。
-    precheck_rx: Option<std::sync::mpsc::Receiver<Vec<(String, String)>>>,
+    precheck_rx: Option<std::sync::mpsc::Receiver<subscan::PrecheckResult>>,
     /// 这一批文件已经扫过了。收到结果就置 true ——
     /// 否则 start() 每次重入都会再扫一遍（队列一变就重置成 false）。
     prechecked: bool,
     /// 路径 → 跳过原因（`内封字幕 subrip（chi）` 这类）。命中的不进流水线。
     skip_note: std::collections::HashMap<String, String>,
+    /// ★ v1.29.2：预检发现「画面里压了硬字幕」时，不直接跳过，而是弹窗问用户。
+    /// Some = 有待确认的列表（弹窗开着）；None = 没有。
+    ///
+    /// 为什么要问：硬字幕检测是从画面像素猜的，可靠度远不如内封字幕的元数据。
+    /// 实测它会把白床单的片子误判成有字幕（abf-207），那种情况下直接跳过
+    /// 等于把用户要处理的文件静默吃掉了。让用户自己决定更稳妥。
+    pending_sub_ask: Option<Vec<(String, String)>>,
+    /// 用户在上一个弹窗里选了「仍然处理」。下次点开始不再重复问同一批文件。
+    asked_and_continue: bool,
     /// 额外生成一份日文字幕（`<视频名>.jpn.srt`）。只有兼容模式能开 ——
     /// 全量/精简模式走 Whisper 的 translate 任务，日文在模型内部就没了。
     jpn_sub: bool,
@@ -236,6 +245,8 @@ impl Default for App {
             precheck_rx: None,
             prechecked: false,
             skip_note: std::collections::HashMap::new(),
+            pending_sub_ask: None,
+            asked_and_continue: false,
             jpn_sub: false,
             jpn_separate: false,
             sized_to_screen: false,
@@ -2280,29 +2291,55 @@ impl eframe::App for App {
         if self.precheck_rx.is_some() {
             let got = self.precheck_rx.as_ref().map(|rx| rx.try_recv());
             match got {
-                Some(Ok(hits)) => {
+                Some(Ok(res)) => {
                     self.precheck_rx = None;
                     self.prechecking = false;
                     self.prechecked = true;
                     self.skip_note.clear();
-                    if hits.is_empty() {
+                    self.asked_and_continue = false;
+
+                    // ★ 先把【确定有字幕的】写进 skip_note，再去处理需询问的。
+                    //
+                    //   踩过的坑（连错三版才找到）：
+                    //     原来这里把 `if !res.warn.is_empty() { ...; return; }`
+                    //     写在了处理 res.skip 的代码【前面】，于是只要清单里
+                    //     有一个「疑似硬字幕」的文件，就直接 return 去弹窗，
+                    //     后面那些【内封字幕】的判定结果全被丢掉了 ——
+                    //     abf-207（内封 mov_text）明明识别出来了，却没进
+                    //     skip_note，自然就被当成普通文件重跑。
+                    //     日志上表现为「预检只提了硬字幕，一个字都没提内封」。
+                    //
+                    //   正确顺序：确定的先落账 → 再问不确定的。
+                    if res.skip.is_empty() {
                         self.push_log("[预检] 没有发现自带字幕的文件");
                     } else {
-                        let n = hits.len();
-                        for (p, reason) in hits {
-                            self.skip_note.insert(p, reason);
+                        let n = res.skip.len();
+                        for (p, reason) in &res.skip {
+                            self.skip_note.insert(p.clone(), reason.clone());
+                            let name = std::path::Path::new(p)
+                                .file_name()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_else(|| p.clone());
+                            self.push_log(format!("[预检] 已有字幕：{name} —— {reason}"));
                         }
                         self.push_log(format!(
                             "[预检] {n} 个文件自带字幕，下面开始跳过的部分是它们"
                         ));
                     }
-                    // 结果已就绪、start() 里也不会阻塞 → 直接开跑。
-                    //
-                    // 原来这里是置 `pending_start` 等下一帧，但那样中间隔了一帧，
-                    // 用户这一帧里改了队列 / 点了停止的话，start() 会拿着旧的
-                    // `skip_note` 和 `already[]` 去分派 —— 索引和路径都可能对不上。
+
+                    // 再处理「画面疑似硬字幕」——这类不可靠，交给用户决定。
+                    if !res.warn.is_empty() {
+                        let n = res.warn.len();
+                        self.push_log(format!(
+                            "[预检] {n} 个文件画面里疑似有硬字幕，等你确认"
+                        ));
+                        self.pending_sub_ask = Some(res.warn);
+                        return;
+                    }
+
                     ctx.request_repaint();
                     self.start();
+                    return;
                 }
                 Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
                     self.precheck_rx = None;
@@ -3289,6 +3326,137 @@ impl eframe::App for App {
         // 启动时读到队列文件才会出现。两个选择：
         //   恢复 → 填回列表、从上次的位置继续（已经有字幕的不会重跑）
         //   清空 → 丢弃队列，从空列表重新开始
+        // ── 「检测到硬字幕，要跳过吗？」弹窗（v1.29.2）──
+        //
+        // 为什么交给你决定：硬字幕检测是从画面像素猜的。
+        // 实测它会两种错都犯 ——
+        //   · 把白床单/白椅子误判成字幕（abf-207，其实没字幕）
+        //   · 漏掉贴着画面最底边的字幕（SONE-961，其实有字幕）
+        // 与其自作主张跳过你真正想处理的文件，不如让你看一眼。
+        if self.pending_sub_ask.is_some() {
+            let items = self.pending_sub_ask.clone().unwrap_or_default();
+            let mut choice_skip = false;
+            let mut choice_go = false;
+            let mut choice_cancel = false;
+
+            egui::Modal::new(egui::Id::new("hard_sub_modal"))
+                .backdrop_color(Color32::from_rgba_unmultiplied(0x1f, 0x1e, 0x1d, 96))
+                .frame(
+                    Frame::new()
+                        .fill(CARD)
+                        .corner_radius(12.0)
+                        .inner_margin(Margin::same(20))
+                        .stroke(Stroke::new(1.0, CARD_LINE))
+                        .shadow(Shadow {
+                            offset: [0, 10],
+                            blur: 30,
+                            spread: 0,
+                            color: Color32::from_rgba_unmultiplied(0x1f, 0x1e, 0x1d, 40),
+                        }),
+                )
+                .show(&ctx, |ui| {
+                    ui.set_width(460.0);
+                    ui.label(
+                        RichText::new("检测到画面里可能有硬字幕")
+                            .size(16.0)
+                            .color(INK)
+                            .family(FontFamily::Name("bold".into())),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(
+                            "这些文件的画面里好像已经压着字幕了。要继续生成字幕吗？",
+                        )
+                        .size(12.5)
+                        .color(INK2),
+                    );
+                    ui.add_space(10.0);
+
+                    // 文件清单
+                    egui::Frame::new()
+                        .fill(SUNK)
+                        .corner_radius(8.0)
+                        .inner_margin(Margin::same(10))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            egui::ScrollArea::vertical()
+                                .id_salt("hard_sub_list")
+                                .max_height(120.0)
+                                .show(ui, |ui| {
+                                    for (p, reason) in &items {
+                                        let name = std::path::Path::new(p)
+                                            .file_name()
+                                            .map(|s| s.to_string_lossy().to_string())
+                                            .unwrap_or_else(|| p.clone());
+                                        ui.label(
+                                            RichText::new(format!("· {name}"))
+                                                .size(12.0)
+                                                .color(INK2),
+                                        );
+                                        ui.label(
+                                            RichText::new(format!("    {reason}"))
+                                                .size(11.0)
+                                                .color(INK3),
+                                        );
+                                    }
+                                });
+                        });
+
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(
+                            "说明：这个判断是从画面像素猜出来的，可能不准。\
+                             如果这些片子其实没有字幕，选「仍然生成」即可。",
+                        )
+                        .size(11.0)
+                        .color(INK3),
+                    );
+                    ui.add_space(14.0);
+
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        if pill(ui, "仍然生成字幕", ACCENT_DEEP, ACCENT_DEEP, Color32::WHITE, true)
+                            .clicked()
+                        {
+                            choice_go = true;
+                        }
+                        if ghost_button(ui, "跳过这些文件").clicked() {
+                            choice_skip = true;
+                        }
+                        if ghost_button(ui, "先不处理").clicked() {
+                            choice_cancel = true;
+                        }
+                    });
+                });
+
+            if choice_go {
+                // 用户说继续 —— 硬字幕文件照常进流水线，且这次不再问
+                self.push_log(format!(
+                    "[预检] 你选择了仍然生成，{} 个疑似硬字幕的文件照常处理",
+                    items.len()
+                ));
+                self.asked_and_continue = true;
+                self.pending_sub_ask = None;
+                ctx.request_repaint();
+                self.start();
+            } else if choice_skip {
+                // 用户说跳过 —— 记进 skip_note，后面按「已有字幕」跳过
+                self.push_log(format!(
+                    "[预检] 你选择了跳过，{} 个疑似硬字幕的文件不处理",
+                    items.len()
+                ));
+                for (p, reason) in items {
+                    self.skip_note.insert(p, reason);
+                }
+                self.pending_sub_ask = None;
+                ctx.request_repaint();
+                self.start();
+            } else if choice_cancel {
+                self.push_log("[预检] 已取消，本次不处理");
+                self.pending_sub_ask = None;
+            }
+        }
+
         // ── 「发现新版本」弹窗 ──
         //
         // 方案 C：先试程序内下载（体验最好），失败就退回「打开下载页 / 网盘镜像」。

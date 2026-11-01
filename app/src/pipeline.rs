@@ -1028,13 +1028,36 @@ pub fn prepare_0pre_cancellable(
     }
 
     let mut registered = 0usize;
+    // ★ v1.29.1：这里必须检查源文件是否存在。
+    //
+    //   踩过的坑（用户实测）：
+    //     他先把原片删了（只留已经封装好的「（软字幕）.mp4」），但队列里
+    //     还残留着旧路径。原来的实现不看文件在不在，照样往清单里写、照样
+    //     报「1 个文件已就绪」，然后到第 1 步 Python 才发现文件没了，
+    //     以退出码 1 中止 —— 【整个队列】停在第一个文件上，后面排队的
+    //     全都不跑了。用户看到的是「第1步失败，流水线中止」，很吓人。
+    //
+    //   改成：准备阶段就查，不存在就记一条明确的日志并【跳过这个文件】，
+    //   不中断整批（返回的 registered 只数真实存在的）。
+    let mut missing: Vec<String> = Vec::new();
     for f in files {
         let name = std::path::Path::new(f)
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| f.clone());
+        if !std::path::Path::new(f).is_file() {
+            missing.push(name.clone());
+            logs.push(format!("  [准备] {name} —— 源文件已不存在，跳过"));
+            continue;
+        }
         logs.push(format!("  [准备] {name}"));
         registered += 1;
+    }
+    if !missing.is_empty() {
+        logs.push(format!(
+            "  [准备] {} 个文件的源文件找不到了（可能已删除或移动过），本次不处理它们",
+            missing.len()
+        ));
     }
     logs.push(format!("  [准备] {registered} 个文件已就绪"));
 
