@@ -17,6 +17,42 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Receiver};
 use std::time::Duration;
 
+/// ★ 用户实测反馈「每次打开都闪过一个黑窗口」—— 根因就在这里。
+///
+///   本文件启动 2 秒后会自动检查更新，走的是 `curl.exe`（老系统退
+///   PowerShell）。这些子进程如果【不带 CREATE_NO_WINDOW】，Windows 就会
+///   给它们开一个黑色控制台窗口，在界面上闪一下。
+///
+///   v1.28 加入自动更新时漏了这个标志；同一时期 softsub.rs 的 ffmpeg
+///   探测也漏了。凡是起子进程的地方都必须带，一个都不能漏。
+///
+/// 下面给 Command 加一个 `.no_window()` 扩展方法，各调用点串上即可。
+#[cfg(windows)]
+trait NoWindow {
+    fn no_window(&mut self) -> &mut Self;
+}
+
+#[cfg(windows)]
+impl NoWindow for Command {
+    fn no_window(&mut self) -> &mut Self {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        self.creation_flags(CREATE_NO_WINDOW)
+    }
+}
+
+#[cfg(not(windows))]
+trait NoWindow {
+    fn no_window(&mut self) -> &mut Self;
+}
+
+#[cfg(not(windows))]
+impl NoWindow for Command {
+    fn no_window(&mut self) -> &mut Self {
+        self
+    }
+}
+
 /// 版本清单地址。
 ///
 /// 放 Gitee 而不是 GitHub 的原因：`raw.githubusercontent.com` 在国内
@@ -157,6 +193,7 @@ fn http_get_text(url: &str, timeout_secs: u64) -> Result<String, String> {
             url,
         ])
         .stdin(Stdio::null())
+        .no_window()
         .output()
     {
         if out.status.success() {
@@ -183,6 +220,7 @@ fn http_get_text(url: &str, timeout_secs: u64) -> Result<String, String> {
     match Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
         .stdin(Stdio::null())
+        .no_window()
         .output()
     {
         Ok(o) if o.status.success() => {
@@ -259,6 +297,7 @@ pub fn download_blocking(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
+        .no_window()
         .spawn()
         .map_err(|e| format!("启动 curl 失败：{}", e))?;
 
@@ -309,6 +348,7 @@ fn http_head_length(url: &str) -> Result<u64, String> {
     let out = Command::new("curl.exe")
         .args(["-sSI", "-L", "--max-time", "10", url])
         .stdin(Stdio::null())
+        .no_window()
         .output()
         .map_err(|e| e.to_string())?;
     let text = String::from_utf8_lossy(&out.stdout);
@@ -325,9 +365,12 @@ fn http_head_length(url: &str) -> Result<u64, String> {
 
 /// 用默认浏览器打开网址（下载页 / 网盘镜像都走这个）
 pub fn open_url(url: &str) {
+    // cmd /c start 同样会闪一个控制台窗口，这里也压掉。
+    // 注意：压的是【cmd 自己】的窗口，浏览器照常正常弹出。
     let _ = Command::new("cmd")
         .args(["/c", "start", "", url])
         .stdin(Stdio::null())
+        .no_window()
         .spawn();
 }
 
@@ -336,6 +379,7 @@ pub fn run_installer(path: &Path) -> Result<(), String> {
     Command::new(path)
         .args(["/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"])
         .stdin(Stdio::null())
+        .no_window()
         .spawn()
         .map(|_| ())
         .map_err(|e| format!("无法启动安装程序：{}", e))

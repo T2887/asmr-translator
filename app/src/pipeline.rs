@@ -541,6 +541,23 @@ pub fn finalize_subtitles_with(
     dest_dir: &str,
     fmt: crate::srt::SubFmt,
 ) -> Vec<String> {
+    finalize_subtitles_opt(files, copy_to_video, dest_dir, fmt, false)
+}
+
+/// 完整签名：多一个「是否把字幕封装进原视频」的开关。
+///
+/// `embed_soft` 与 `fmt` 是**正交**的：
+///   · fmt    决定生成什么字幕文件（srt / ass / 两个都要）
+///   · embed  决定要不要额外把这些字幕封装进视频容器
+/// 所以没有把 embed 做成 SubFmt 的第四个变体 —— 否则「SRT+ASS+封装」
+/// 这类组合就要膨胀成指数级的枚举。
+pub fn finalize_subtitles_opt(
+    files: &[String],
+    copy_to_video: bool,
+    dest_dir: &str,
+    fmt: crate::srt::SubFmt,
+    embed_soft: bool,
+) -> Vec<String> {
     // 源目录永远是 3asr\（四个脚本把字幕生成在那儿，改不了）；
     // 目标目录才是用户可以改的那个。
     let src = config::dir_asr();
@@ -549,7 +566,7 @@ pub fn finalize_subtitles_with(
     } else {
         dest_dir.trim().to_string()
     };
-    finalize_subtitles_fmt(&src, &dst, files, copy_to_video, fmt)
+    finalize_subtitles_fmt(&src, &dst, files, copy_to_video, fmt, embed_soft)
 }
 
 /// 旧签名（只出 SRT）—— 单元测试走这条，语义就是「和加 ASS 之前完全一样」。
@@ -560,7 +577,14 @@ fn finalize_subtitles_in(
     files: &[String],
     copy_to_video: bool,
 ) -> Vec<String> {
-    finalize_subtitles_fmt(srt_dir, dest_dir, files, copy_to_video, crate::srt::SubFmt::Srt)
+    finalize_subtitles_fmt(
+        srt_dir,
+        dest_dir,
+        files,
+        copy_to_video,
+        crate::srt::SubFmt::Srt,
+        false,
+    )
 }
 
 /// 实际的收尾逻辑。
@@ -576,6 +600,7 @@ fn finalize_subtitles_fmt(
     files: &[String],
     copy_to_video: bool,
     fmt: crate::srt::SubFmt,
+    embed_soft: bool,
 ) -> Vec<String> {
     let mut logs = Vec::new();
     // ASS 单独计数：「SRT 搬成功了、ASS 没写出来」不属于整个文件失败，
@@ -830,6 +855,99 @@ fn finalize_subtitles_fmt(
         summary.push_str(&format!("；ASS 生成 {ass_ok} 个、失败 {ass_bad} 个"));
     }
     logs.push(summary);
+
+    // ── ④ 软字幕：把字幕封装进原视频 ──
+    //
+    //   放在最后做，因为前面所有步骤都只是「整理文件」，失败了不影响别的；
+    //   封装要跑 ffmpeg、可能很慢（大文件几十秒），放在最后不会拖累前面的
+    //   搬字幕。而且它需要「字幕已经落到最终位置」——只有到这一步才知道
+    //   每个视频旁边到底有没有字幕、叫什么名。
+    if embed_soft {
+        logs.extend(embed_softsubs(srt_dir, dest_dir, fmt, &video_map));
+    } else {
+        // ★ v1.29.1：开关【关掉】时也要清掉上次强杀留下的 .tmp 半成品。
+        //
+        //   不清的话，用户取消过一次、或程序被强杀，目录里就永远躺着一个
+        //   `xxx（软字幕）.tmp.mp4` —— 几 GB 的垃圾，而且下次再开开关时
+        //   ffmpeg 可能因为同名文件存在而报错。
+        //   注意：这里【只】删 .tmp，绝不删已经完成的正经软字幕 ——
+        //   用户只是暂时关掉开关，不代表想删掉已生成的文件。
+        let cleaned = crate::softsub::cleanup_tmp_files(dest_dir, files);
+        for c in cleaned {
+            logs.push(c);
+        }
+    }
+    logs
+}
+
+/// 为每个视频找它旁边的中文字幕，封装进去。
+///
+/// 只处理**确实匹配到视频**的条目 —— 找不到视频的字幕（被放进输出目录的
+/// 那些）没有可封装的载体，跳过并说明原因。
+fn embed_softsubs(
+    srt_dir: &str,
+    dest_dir: &str,
+    fmt: crate::srt::SubFmt,
+    video_map: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    let mut logs = Vec::new();
+    let mut ok = 0usize;
+    let mut skip = 0usize;
+    let mut bad = 0usize;
+
+    for (stem, video) in video_map {
+        // 字幕的最终位置：视频旁边（这是收尾的默认落点）
+        let video_dir = std::path::Path::new(video)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| srt_dir.to_string());
+
+        // 字幕可能落在这三个地方，都要找：
+        //   ① 视频旁边（勾了「放视频旁边」时的落点，也是默认）
+        //   ② dest_dir（不勾「放视频旁边」时用户指定的输出目录）
+        //   ③ srt_dir（3asr 源目录，理论上收尾后不该还有，兜底）
+        let candidates = [
+            format!(r"{video_dir}\{stem}.chs.ass"),
+            format!(r"{video_dir}\{stem}.chs.srt"),
+            format!(r"{dest_dir}\{stem}.chs.ass"),
+            format!(r"{dest_dir}\{stem}.chs.srt"),
+            format!(r"{srt_dir}\{stem}.chs.ass"),
+            format!(r"{srt_dir}\{stem}.chs.srt"),
+        ];
+        // fmt 决定实际该找哪个：只出 ASS 时别拿 SRT 去封装
+        let sub = candidates
+            .iter()
+            .find(|p| {
+                let is_ass = p.to_lowercase().ends_with(".ass");
+                let exists = std::path::Path::new(p).is_file();
+                exists && if is_ass { fmt.want_ass() } else { fmt.want_srt() }
+            })
+            .cloned();
+
+        let Some(sub) = sub else {
+            skip += 1;
+            logs.push(format!("[软字幕] {stem} 没有可用的字幕文件，跳过"));
+            continue;
+        };
+
+        let lang = crate::softsub::lang_tag_of(&sub);
+        let out = crate::softsub::embed(video, &sub, lang);
+        if out.out_path.is_some() {
+            ok += 1;
+        } else {
+            // 「纯音频不能封装」是预期内的正常情况，单独计数免得总结说假话
+            if out.message.contains("纯音频") || out.message.contains("跳过") {
+                skip += 1;
+            } else {
+                bad += 1;
+            }
+        }
+        logs.push(out.message);
+    }
+
+    logs.push(format!(
+        "[软字幕] 完成：封装成功 {ok} 个，跳过 {skip} 个，失败 {bad} 个"
+    ));
     logs
 }
 
@@ -1476,6 +1594,7 @@ mod tests {
             &files,
             true,
             crate::srt::SubFmt::Ass,
+            false,
         );
 
         let ass = vid.join("第八集.chs.ass");
@@ -1508,10 +1627,169 @@ mod tests {
             &files,
             true,
             crate::srt::SubFmt::Both,
+            false,
         );
 
         assert!(vid.join("第九集.chs.srt").is_file(), "SRT 也要在");
         assert!(vid.join("第九集.chs.ass").is_file(), "ASS 也要在");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ★ v1.29：用户问的正是这个组合 ——「字幕放视频旁」+「软字幕」同时勾选。
+    ///
+    /// 预期行为（必须实测确认，不能靠读代码推断）：
+    ///   视频旁边同时出现：
+    ///     ① 测试片.chs.srt   ← 外挂字幕，播放器可自动加载
+    ///     ② 测试片（软字幕）.mp4 ← 内嵌字幕轨的视频副本
+    ///   原视频不动。
+    #[test]
+    #[ignore]
+    fn sidecar_and_embedded_coexist() {
+        let root = std::env::temp_dir().join("asmr_sidecar_embed");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("vid")).unwrap();
+        std::fs::create_dir_all(root.join("3asr")).unwrap();
+
+        let Some(ff) = crate::softsub::ffmpeg_exe() else {
+            eprintln!("没有 ffmpeg，跳过");
+            return;
+        };
+        let vid = root.join("vid").join("测试片.mp4");
+        let st = std::process::Command::new(&ff)
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "testsrc=size=320x240:rate=15:duration=3"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=3"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"])
+            .arg(&vid)
+            .status()
+            .unwrap();
+        assert!(st.success());
+
+        std::fs::write(
+            root.join("3asr").join("测试片_中文字幕.srt"),
+            "1\n00:00:00,500 --> 00:00:02,500\n外挂字幕内容\n",
+        )
+        .unwrap();
+
+        let logs = finalize_subtitles_fmt(
+            &root.join("3asr").to_string_lossy(),
+            &root.join("vid").to_string_lossy(),
+            &[vid.to_string_lossy().to_string()],
+            true,  // ★ 字幕直接放到视频旁边
+            crate::srt::SubFmt::Srt,
+            true,  // ★ 同时勾选软字幕
+        );
+        for l in &logs {
+            eprintln!("{l}");
+        }
+
+        let sidecar = root.join("vid").join("测试片.chs.srt");
+        let embedded = root.join("vid").join("测试片（软字幕）.mp4");
+
+        assert!(sidecar.is_file(), "没生成外挂字幕: {logs:?}");
+        assert!(embedded.is_file(), "没生成软字幕视频: {logs:?}");
+        assert!(vid.is_file(), "原视频被删了");
+
+        // 外挂字幕内容正确
+        let txt = std::fs::read_to_string(&sidecar).unwrap();
+        assert!(txt.contains("外挂字幕内容"));
+
+        // 内嵌的确实带字幕流
+        let probe = std::process::Command::new(&ff)
+            .args(["-hide_banner", "-i"])
+            .arg(&embedded)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&probe.stderr).contains("Subtitle:"),
+            "软字幕视频里没有字幕流"
+        );
+
+        // 目录里应该正好这两份产物 + 原视频
+        eprintln!("\n=== 视频目录内容 ===");
+        if let Ok(rd) = std::fs::read_dir(root.join("vid")) {
+            for e in rd.flatten() {
+                let n = e.file_name().to_string_lossy().to_string();
+                let sz = e.metadata().map(|m| m.len()).unwrap_or(0);
+                eprintln!("  {n}  ({sz} bytes)");
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 端到端：finalize + 软字幕封装（真实 ffmpeg、真实视频文件）。
+    ///
+    /// 默认 `#[ignore]`：普通 cargo test 不该依赖 ffmpeg 和真实素材。
+    /// 手工跑：cargo test --release -- --ignored finalize_then_embed_soft
+    #[test]
+    #[ignore]
+    fn finalize_then_embed_soft() {
+        let root = std::env::temp_dir().join("asmr_e2e_soft");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("videos")).unwrap();
+        std::fs::create_dir_all(root.join("3asr")).unwrap();
+
+        // 造一个 3 秒视频
+        let Some(ff) = crate::softsub::ffmpeg_exe() else {
+            eprintln!("没有 ffmpeg，跳过");
+            return;
+        };
+        let vid = root.join("videos").join("测试片.mp4");
+        let st = std::process::Command::new(&ff)
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "testsrc=size=640x360:rate=15:duration=3"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=3"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"])
+            .arg(&vid)
+            .status()
+            .unwrap();
+        assert!(st.success(), "造视频失败");
+
+        // 3asr 里放一份脚本产出的字幕（命名要符合收尾约定）
+        std::fs::write(
+            root.join("3asr").join("测试片_中文字幕.srt"),
+            "1\n00:00:00,500 --> 00:00:02,500\n第一句字幕\n",
+        )
+        .unwrap();
+
+        let files = vec![vid.to_string_lossy().to_string()];
+        // 用带显式源/目标目录的版本 —— 顶层 finalize_subtitles_opt 会把源目录
+        // 写死成 config::dir_asr()（真实的 3asr），测试必须能指定临时目录。
+        let logs = finalize_subtitles_fmt(
+            &root.join("3asr").to_string_lossy(),
+            &root.join("videos").to_string_lossy(),
+            &files,
+            true, // 放视频旁边
+            crate::srt::SubFmt::Srt,
+            true, // ★ 开启软字幕封装
+        );
+        for l in &logs {
+            eprintln!("{l}");
+        }
+
+        // ① 字幕搬到了视频旁边
+        let moved_srt = root.join("videos").join("测试片.chs.srt");
+        assert!(moved_srt.is_file(), "字幕没搬到视频旁: {logs:?}");
+
+        // ② 生成了带字幕流的视频副本
+        let soft = root.join("videos").join("测试片（软字幕）.mp4");
+        assert!(soft.is_file(), "没生成软字幕视频: {logs:?}");
+
+        // ③ 原视频必须还在且大小未变（embed 不能覆盖原文件）
+        assert!(vid.is_file(), "原视频被删了！");
+
+        let out_len = std::fs::metadata(&soft).unwrap().len();
+        let src_len = std::fs::metadata(&vid).unwrap().len();
+        eprintln!("原视频 {src_len} bytes，软字幕版 {out_len} bytes");
+        assert!(out_len > 0);
+
+        // ④ 日志里要说清楚封装成功
+        assert!(
+            logs.iter().any(|l| l.contains("已封装")),
+            "日志里没有封装成功记录: {logs:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

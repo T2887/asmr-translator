@@ -47,6 +47,126 @@ fn parse_time(s: &str) -> Option<f64> {
     Some(h * 3600.0 + m * 60.0 + sec)
 }
 
+/// 解析 ASS/SSA 的 `Dialogue` 行，返回纯文本 Cue 列表。
+///
+/// ★ v1.29 为什么需要这个（方案B）：
+///   用户选「仅 ASS / 两个都要」再勾软字幕时，要把字幕塞进视频容器。
+///   mkv 能直接装 ASS 流（`-c:s copy`，样式表完整保留），但 mp4/mov/3gp
+///   【根本装不了 ass】—— 实测报 `Could not find tag for codec ass in
+///   stream #0`。webm 更严，只吃 webvtt。
+///   所以这些容器只能走 mov_text / srt / webvtt，而 ffmpeg 拿 ASS 转这些
+///   格式时会留下 `<font face="SimHei" size="52">…</font>` 这种标签，
+///   部分播放器会把标签当成正文显示出来。
+///   这里自己读 ASS、剥掉 `{...}` 覆盖标记和 `<font>` 标签，生成干净的
+///   纯文本 Cue，再由调用方写一份临时 SRT 供 ffmpeg 使用。
+///
+/// 只处理 `Dialogue:` 行；`Comment:` 跳过（那是注释，不该显示）。
+/// 时间格式 `h:mm:ss.cc`（百分秒），换算成秒。
+pub fn read_ass(path: &Path) -> Result<Vec<Cue>, String> {
+    let raw = std::fs::read(path).map_err(|e| format!("读不了 {}: {e}", path.display()))?;
+    let text = String::from_utf8_lossy(&raw);
+    let text = text.trim_start_matches('\u{feff}').replace("\r\n", "\n");
+
+    let mut cues = Vec::new();
+    // 事件区里 Format 行决定字段顺序，但本项目的 ASS 永远是
+    // Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+    // —— 与前 9 个逗号固定、Text 是最后一个字段。
+    for line in text.lines() {
+        let line = line.trim_start();
+        let Some(rest) = line.strip_prefix("Dialogue:") else {
+            continue;
+        };
+        // 按逗号切 9 次，剩下的整体是 Text（字幕正文里可以有逗号）
+        let parts: Vec<&str> = rest.splitn(10, ',').collect();
+        if parts.len() < 10 {
+            continue;
+        }
+        let Some(start) = parse_ass_time(parts[1]) else {
+            continue;
+        };
+        let Some(end) = parse_ass_time(parts[2]) else {
+            continue;
+        };
+        let body = parts[9].trim();
+        let plain = strip_ass_markup(body);
+        if !plain.is_empty() {
+            cues.push(Cue { start, end, text: plain });
+        }
+    }
+    Ok(cues)
+}
+
+/// `0:00:01.50` → 1.5 秒。ASS 用百分秒（两位小数）。
+fn parse_ass_time(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let mut parts = s.split(':');
+    let h: f64 = parts.next()?.parse().ok()?;
+    let m: f64 = parts.next()?.parse().ok()?;
+    let sec: f64 = parts.next()?.parse().ok()?;
+    Some(h * 3600.0 + m * 60.0 + sec)
+}
+
+/// 剥掉 ASS 的内联标记，只留纯文本。
+///
+/// 处理三类：
+///   `{\c&H0000FF&}` 之类的中括号覆盖标记 → 整段删掉
+///   `<font ...>` / `</font>` 之类的 HTML 标签 → 删掉，但保留里面的文字
+///   `\N`（硬换行）→ 换成真正的换行；`\n`（软换行）同理
+///
+/// 保留 `\h`（不换行空格）→ 普通空格。
+pub fn strip_ass_markup(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            // 覆盖标记：整段 {...} 丢弃
+            '{' => {
+                for ch in chars.by_ref() {
+                    if ch == '}' {
+                        break;
+                    }
+                }
+            }
+            // HTML 风格标签：<font ...> </font> <i> <b> 等
+            '<' => {
+                let mut tag = String::new();
+                let mut closed = false;
+                for ch in chars.by_ref() {
+                    if ch == '>' {
+                        closed = true;
+                        break;
+                    }
+                    tag.push(ch);
+                }
+                if !closed {
+                    // 没有配对的 >，当正文处理（宁可多显示也不要吞字）
+                    out.push('<');
+                    out.push_str(&tag);
+                }
+            }
+            '\\' => {
+                match chars.next() {
+                    // 硬换行 / 软换行 → 真换行
+                    Some('N') | Some('n') => out.push('\n'),
+                    // 不换行空格
+                    Some('h') => out.push(' '),
+                    // 其它转义（\i \b \u \pos 之类）一律丢弃
+                    Some(_) => {}
+                    None => out.push('\\'),
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    // 逐行 trim，去掉裁剪后留下的首尾空白
+    out.lines()
+        .map(|l| l.trim())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
 pub fn fmt_time(t: f64) -> String {
     let ms = (t.max(0.0) * 1000.0).round() as u64;
     let h = ms / 3_600_000;
@@ -442,6 +562,68 @@ pub fn tidy_dir(srt_dir: &Path, app_dir: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★ v1.29 方案B：ASS 内联标记必须被剥干净。
+    ///
+    /// 为什么要紧：mp4/mov/3gp 装不了 ASS，只能转纯文本。如果这些
+    /// `{\c&H...}` / `<font ...>` 没剥掉，它们会原样变成字幕正文，
+    /// 用户看到的就是一堆乱码标签而不是译文。
+    #[test]
+    fn strip_ass_markup_removes_overrides_and_tags() {
+        // 覆盖标记（颜色）
+        assert_eq!(strip_ass_markup(r"{\c&H0000FF&}红色文字"), "红色文字");
+        // 多个覆盖标记
+        assert_eq!(
+            strip_ass_markup(r"{\pos(100,200)}{\b1}加粗{\b0} 正常"),
+            "加粗 正常"
+        );
+        // font 标签（ffmpeg 转格式时自己加的）
+        assert_eq!(
+            strip_ass_markup(r#"<font face="SimHei" size="52">正文</font>"#),
+            "正文"
+        );
+        // 硬换行 \N → 真换行
+        assert_eq!(strip_ass_markup(r"第一行\N第二行"), "第一行\n第二行");
+        // 不换行空格 \h → 普通空格
+        assert_eq!(strip_ass_markup(r"a\hb"), "a b");
+        // 其它转义一律丢弃
+        assert_eq!(strip_ass_markup(r"\i斜体\i0"), "斜体0");
+        // 干净的文本原样返回
+        assert_eq!(strip_ass_markup("纯净文字"), "纯净文字");
+        // 空串
+        assert_eq!(strip_ass_markup(""), "");
+        // 没有配对的 '<' 不该吞掉后面的字
+        assert_eq!(strip_ass_markup("a<b"), "a<b");
+    }
+
+    /// ASS 读取：Dialogue 行解析 + 跳过 Comment + 正文里的逗号不被切坏。
+    #[test]
+    fn read_ass_parses_dialogue_lines() {
+        let dir = std::env::temp_dir().join("asmr_ass_read_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("a.ass");
+        std::fs::write(
+            &p,
+            "[Script Info]\nScriptType: v4.00+\n\n\
+[V4+ Styles]\nFormat: Name, Fontname, Fontsize\nStyle: Default,SimHei,52\n\n\
+[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+Dialogue: 0,0:00:01.00,0:00:03.50,Default,,0,0,0,,你好，世界\n\
+Comment: 0,0:00:01.00,0:00:03.50,Default,,0,0,0,,这是注释不该出现\n\
+Dialogue: 0,0:00:04.00,0:00:06.00,Default,,0,0,0,,{\\i1}斜体{\\i0}收尾\n",
+        )
+        .unwrap();
+
+        let cues = read_ass(&p).unwrap();
+        assert_eq!(cues.len(), 2, "Comment 行不该被读进来");
+        assert!((cues[0].start - 1.0).abs() < 0.01);
+        assert!((cues[0].end - 3.5).abs() < 0.01);
+        // 正文里的逗号必须完整保留（splitn(10) 的边界要正确）
+        assert_eq!(cues[0].text, "你好，世界");
+        // 覆盖标记剥掉
+        assert_eq!(cues[1].text, "斜体收尾");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parse_and_format_roundtrip() {

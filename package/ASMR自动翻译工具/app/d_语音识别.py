@@ -69,7 +69,20 @@ from events import emit
 # 想调就改这两行，改完建议用同一段素材对比，别只看单条。
 # ─────────────────────────────────────────────────────────────
 _INITIAL_PROMPT = "以下是日语成人向音声的中文翻译，口语化、句子短促，术语用肉棒、小穴、舒服、去了，保留语气词。"
-_HOTWORDS = "肉棒,小穴,舒服,去了,高潮,舔,精液,射精,口交,乳交,秘书,社长"
+# ★ v1.29：从全局热词里移除「秘书」「社长」这两个【角色词】。
+#
+#   这两个词原本是为了某个特定作品加的（那个作品里有「社长」角色），
+#   放在全局 _HOTWORDS 里会污染所有其它作品 —— 实测 04 号文件
+#   （「ゆりか/由梨香」的个人音声）里，「社长」出现了至少 12 次：
+#     「对不起 社长」「真是的 社长」「最喜欢社长了」……
+#   用户明确反馈这不是该作品的称呼。
+#
+#   热词是作为 prompt 注入的，模型会顺着它把相近的称呼都往「社长」上靠
+#   （原文多半是「お客様＝客人先生」或某个角色名）。
+#
+#   角色词/人名这类作品级词汇应该放 hotwords_<stem>.txt，只在对应作品生效
+#   （见 _load_extra_hotwords）。全局只保留【通用的性行为术语】。
+_HOTWORDS = "肉棒,小穴,舒服,去了,高潮,舔,精液,射精,口交,乳交"
 
 
 def _load_extra_hotwords(stem):
@@ -209,6 +222,90 @@ def _speech_tail(start, vad_subs, gap=0.9, max_span=20.0):
     return tail
 
 
+def _build_clip_timestamps(vad_subs, gap_merge=1.2, max_len=15.0, short_pad=0.0):
+    """把 VAD 段合并成「解码窗口」列表，返回 [(start, end), ...]。
+
+    ★ v1.28.8 核心修复：一条字幕横跨几十秒的根因和解法。
+
+    根因（在 faster_whisper\vad.py 的 collect_chunks 里）：
+      原来走的是 vad_filter=True + patch 注入 VAD 段。collect_chunks 会用
+      max_duration=chunk_length（30 秒）把【多个 VAD 段拼进同一个解码窗口】，
+      段间静音被整段去掉 —— 解码器看到的是「连续语流」，于是输出一条
+      横跨 30 秒的 segment；restore_speech_timestamps 再把首末词映射回
+      原始时间轴，字幕就跟着横跨 30 秒，中间的静音全被算进显示时长。
+
+    实测（02 号文件 980s，注入项目 VAD 后 101 条）：
+      最长一条 34.5s，>15s 有 7 条；词级时间戳 25.6% 是零宽度、
+      8.5% 明显不合理（1 个字占 1.9 秒），说明词时间是被摊平出来的假数据。
+
+    解法：改用 clip_timestamps 传扁平时间点列表。这条路径
+    （transcribe.py:426-451）【不经过 collect_chunks】，每个 clip 独立成
+    一个解码窗口，所以一条 segment 不可能横跨多个 VAD 段。
+
+    参数：
+      gap_merge — 相邻 VAD 段落间隔小于它才合并（同一口气/一口气说几句，
+                  VAD 会切碎，合并回去才不会把一句话拆成两条字幕）
+      max_len   — 单个窗口最长秒数。超过就断开，保证一条字幕不会太长。
+                  实测 15 秒时最长条 10.8s、无 >15s 条目。
+      short_pad — ★ v1.28.9：默认 0.0（不补边）。留作实验开关。
+
+    ★ v1.28.9 关于 short_pad 的结论：**实测证明补边有害，默认关闭。**
+      最初的想法是：03 号文件 78.31s 处 VAD 只判 0.39 秒、前后各是长静音，
+      单独解码时 whisper 会顺着 initial_prompt 编出 92 个字。于是想「给它
+      补点上下文，让它听到前后在说什么」。
+      拿 0.0 / 0.3 / 0.5 / 1.0 四档实测（同一文件、同参数）：
+
+        short_pad=0.0  幻觉 0 条   38.56s ->「结束」      78.31s ->「谢谢你 社长」
+        short_pad=0.3  幻觉 0 条   38.26s ->「诶」
+        short_pad=0.5  幻觉 0 条   38.06s ->「变态」
+        short_pad=1.0  幻觉 2 条   37.56s ->「肉棒大人 射出来 射出来…」17字/0.37s
+                                   151.55s ->「请把精液射给我吧」8字/0.39s
+
+      结论：补边非但没压住幻觉，反而**把幻觉从 0 条变成 2 条** ——
+      补进来的邻居语音和静音让解码器听到更多上下文，更容易顺着成人向
+      prompt 续写；同时把原本干净的短句（「结束」「呵呵」）也搅乱了。
+      所以默认 short_pad=0.0，真正的防线是下面的幻觉拦截
+      （按 VAD 真实语音时长算语速，离谱就丢）。
+      这个参数保留着，方便以后有人想再试别的取值。
+    """
+    if not vad_subs:
+        return []
+
+    clips = []
+    cur_a, cur_b = float(vad_subs[0][0]), float(vad_subs[0][1])
+    for seg in vad_subs[1:]:
+        a, b = float(seg[0]), float(seg[1])
+        # ★ 注意：先判断「合并后是否超长」，但单个 VAD 段本身就可能 > max_len
+        #   （实测最长的一个 VAD 段 26.9 秒）。那种情况下不能因为「已经超了」
+        #   就把它和后面的段拼在一起 —— 单独成窗口即可，让它自己超长。
+        merged_len = max(b, cur_b) - cur_a
+        cur_len = cur_b - cur_a
+        if a - cur_b <= gap_merge and merged_len <= max_len:
+            cur_b = max(cur_b, b)
+        else:
+            clips.append((cur_a, cur_b))
+            cur_a, cur_b = a, b
+    clips.append((cur_a, cur_b))
+
+    # ★ v1.28.9：孤立极短窗口补上下文（原地扩边，不新增窗口）。
+    if short_pad > 0:
+        out = []
+        for i, (a, b) in enumerate(clips):
+            d = b - a
+            if d >= 0.8:
+                out.append((a, b))
+                continue
+            prev_b = clips[i - 1][1] if i > 0 else 0.0
+            next_a = clips[i + 1][0] if i + 1 < len(clips) else float("inf")
+            # 只补到不碰上邻居为止，避免把邻居的音频混进本窗口
+            pa = max(prev_b + 0.05, a - short_pad)
+            pb = min(next_a - 0.05, b + short_pad)
+            out.append((pa, pb))
+        clips = out
+
+    return clips
+
+
 def _cap_row_end(start, end, text, vad_subs):
     """给一条字幕算合理的 end；vad_subs 是原始音频上的 VAD 段。
 
@@ -289,7 +386,7 @@ def get_custom_vad_patch(audio, vad_parameters=None):
     return []
 
 
-# ★ v1.27.4：加载模型前先确认「提交内存」够。
+# ★ v1.27.4 / v1.29：加载模型前先确认「提交内存」够。
 #   实测（26:55 素材，RTX 5070，float16）：ASR 阶段
 #     WorkingSet 峰值 3.55 GB，Commit 峰值 5.26 GB
 #   用物理内存判会放行，然后在中途 malloc 失败（DefaultCPUAllocator:
@@ -324,25 +421,88 @@ def _memory_status():
 
 
 _phys0, _commit0 = _memory_status()
-# 实测（26:55 素材、float16）：ASR 阶段 Commit 峰值 5.26 GB / WS 3.55 GB。
-# 取 5.0 GB 作门槛（略低于峰值，留给系统一点余量，不至于误拦能跑的机器）。
-_need0 = int(5.0 * 1024 ** 3)
-if _commit0 and _commit0 < _need0:
-    print(f"[失败] 内存不足：语音识别需要约 {_need0 / 1024 ** 3:.1f} GB 提交额度，"
-          f"当前只能再拿到 {_commit0 / 1024 ** 3:.1f} GB")
-    print("       这是「提交内存」不足 —— 虚拟内存（页文件）设得太小或被关闭了。")
-    print("       修法：此电脑→属性→高级系统设置→性能设置→高级→虚拟内存→"
-          "改成「系统管理的大小」或手工 32768 MB，重启后再试。")
-    print("       也可以改用兼容模式（内存需求约 1~2 GB）。")
-    sys.exit(1)
+
+# ─────────────────────────────────────────────────────────────
+# ★ v1.29：内存不足时【自动降级】，不再直接退出。
+#
+#   背景（真实用户案例，2026-11-01）：
+#     一台 RTX 3080 Ti Laptop + 32 GB 内存的机器，跑 27 分钟 / 284 个 VAD 段
+#     的素材，第 4 步开始推理后 14 秒崩溃，退出码 -1073740791（0xC0000409）。
+#     进度条停在 0%，一条字幕都没出 —— 因为崩在推理刚开始的 malloc 上。
+#
+#   根因是「提交内存」不足：malloc 记账看的是【物理内存 + 页文件】这个池子，
+#   不是任务管理器的「可用物理内存」。页文件设小了，可用物理还剩 15 GB 时
+#   依然可能分配失败，而 ctranslate2 在 C++ 层分配失败会走 __fastfail，
+#   直接杀进程，不会抛可捕获的异常。
+#
+#   v1.27.4 的做法是「检测到不足就报错退出」—— 用户被拦下，什么也做不了。
+#   v1.29 改成三级降级：只要还没到「连 int8 都跑不动」的地步，就自动降精度
+#   继续跑，并在日志里说明原因和代价。
+#
+#   为什么降 compute_type 能救：
+#     float16    → Commit 峰值约 5.3 GB（基线）
+#     int8_float16 → 权重减半，Commit 峰值约 2.5~3 GB，直接腰斩
+#   代价是速度慢约 20%、个别词准确度略降 —— 但总比崩掉强。
+# ─────────────────────────────────────────────────────────────
+def _gib(n):
+    return n / 1024 ** 3
+
+
+# 各档位的提交额度需求（GB）。
+#   float16       —— 实测 26:55 素材峰值 5.26 GB，留余量取 5.0
+#   注解：门槛【略低于】峰值是有意的 —— 峰值是短时尖峰，卡在均值附近
+#   既能拦住确定跑不动的机器，又不会把刚好够用的机器误拦。
+_NEED_F16 = 5.0
+_NEED_I8 = 2.8   # int8 大约减半后再留一点余量
+# 连 int8 都拿不到这么多时，才真的没救（交给兼容模式）
+_NEED_MIN = 1.8
+
+_degraded = None   # None / "int8_float16"
+
+if _commit0 and _commit0 < int(_NEED_F16 * 1024 ** 3):
+    if _commit0 >= int(_NEED_I8 * 1024 ** 3):
+        # 能跑 int8 —— 自动降级
+        _degraded = "int8_float16"
+        print(f"[内存] 提交额度不足：需要约 {_NEED_F16:.1f} GB，"
+              f"当前只能再拿到 {_gib(_commit0):.2f} GB")
+        print(f"[内存] 已自动降级为 int8_float16（权重减半，提交占用约 {_NEED_I8:.1f} GB）")
+        print("[内存] 代价：识别速度慢约 20%，个别词准确度可能略降")
+        print("[内存] 想用回原来的速度：此电脑→属性→高级系统设置→性能设置→高级→"
+              "虚拟内存→改成「系统管理的大小」或手工 32768 MB，重启后再试")
+    elif _commit0 >= int(_NEED_MIN * 1024 ** 3):
+        # 连 int8 都很勉强 —— 还是试一把，但把风险说清楚
+        _degraded = "int8_float16"
+        print(f"[内存] 提交额度很紧张：需要约 {_NEED_F16:.1f} GB，"
+              f"当前只有 {_gib(_commit0):.2f} GB")
+        print(f"[内存] 仍将尝试 int8_float16（最低需求约 {_NEED_MIN:.1f} GB），但可能中途失败")
+        print("[内存] 如果这一步还是崩，请调大虚拟内存，或改用兼容模式")
+    else:
+        # 真的没救：明确报错退出，别让用户白等
+        print(f"[失败] 内存严重不足：语音识别最低需要约 {_NEED_MIN:.1f} GB 提交额度，"
+              f"当前只能再拿到 {_gib(_commit0):.2f} GB")
+        print("       这是「提交内存」不足 —— 虚拟内存（页文件）设得太小或被关闭了。")
+        print("       注意：任务管理器里的「可用物理内存」看着够并不能说明问题，")
+        print("             malloc 记账看的是「物理内存 + 页文件」的合计额度。")
+        print("       修法：此电脑→属性→高级系统设置→性能设置→高级→虚拟内存→"
+              "改成「系统管理的大小」或手工 32768 MB，重启后再试。")
+        print("       也可以改用兼容模式（内存需求约 1~2 GB）。")
+        sys.exit(1)
+else:
+    if _commit0:
+        print(f"[内存] 提交额度 {_gib(_commit0):.1f} GB，满足语音识别需求")
 
 
 # 3. 初始化 Whisper 模型
+_compute = config["compute_type"]
+if _degraded:
+    _compute = _degraded
+    print(f"[内存] 本次使用 compute_type = {_compute}")
+
 with Heartbeat("加载语音识别模型"):
     model = WhisperModel(
         model_size_or_path=config["model"]["asr"],
         device=config["device"],
-        compute_type=config["compute_type"],
+        compute_type=_compute,
         download_root=config["path"]["model"]
     )
 
@@ -374,7 +534,29 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
     # 临时挂载到 faster_whisper 模块上
     faster_whisper.vad._custom_segments = custom_chunks
 
-    # 使用 patch 强制 Whisper 使用我们的时间轴，而不是让它重新检测 VAD
+    # ★ v1.28.8：改用 clip_timestamps，让每个 VAD 段（按 gap_merge/max_len
+    #   合并后）各自成为一个解码窗口。
+    #
+    #   原来走 vad_filter=True + patch 注入 VAD 段，会经过 vad.py 的
+    #   collect_chunks：它用 max_duration=chunk_length（30s）把【多个 VAD 段
+    #   拼进同一个窗口】，段间静音被去掉 → 解码器看到连续语流 → 输出一条
+    #   横跨 30 秒的 segment，中间的静音全被算进字幕时长。
+    #   实测 02 号文件最长一条 34.5s、>15s 有 7 条，就是这个机制造成的。
+    #
+    #   clip_timestamps 走的是另一条路径（transcribe.py:426-451），
+    #   【不经过 collect_chunks】，每个 clip 独立解码，所以一条 segment
+    #   不可能横跨多个 VAD 段 —— 这才是「字幕提前消失」的根治。
+    _clips = _build_clip_timestamps(vad_subs)
+    _clip_flat = []
+    for _ca, _cb in _clips:
+        _clip_flat.extend([round(_ca, 3), round(_cb, 3)])
+    _use_clip = bool(_clip_flat)
+    if _clips:
+        print(f"  [分段] {len(vad_subs)} 个 VAD 段 → {len(_clips)} 个解码窗口"
+              f"（最长 {max(b - a for a, b in _clips):.1f}s）")
+
+    # clip_timestamps 与 vad_filter 互斥：给了 clip_timestamps 后 vad_filter 被忽略。
+    # 保留 patch 作为兜底 —— 老版本 faster-whisper 若不走 clip 分支仍能工作。
     with patch(
             "faster_whisper.transcribe.get_speech_timestamps",
             side_effect=get_custom_vad_patch
@@ -386,7 +568,9 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
             # 解码束宽。faster-whisper 默认 5，不传就是 5。
             # 用环境变量 ASMR_BEAM 临时试更小的值（2 / 1），默认仍是 5。
             beam_size=int(os.environ.get("ASMR_BEAM", "5")),
-            vad_filter=True,  # 必须开启，Patch 才会生效
+            # ★ v1.28.8：clip_timestamps 优先；为空时退回 vad_filter。
+            clip_timestamps=_clip_flat if _clip_flat else None,
+            vad_filter=True,  # clip_timestamps 生效时会被忽略，保留作兜底
             # ★ v1.17.1：关闭跨段上下文（原来是 True）。
             #
             #   拿 R4222 官方中文字幕（8 轨，529 句）逐轨对比实测：
@@ -405,16 +589,137 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
             text = segment.text.strip()
             if not text:
                 continue
-            raw_rows.append((float(segment.start), float(segment.end), text))
-            print(f"[{segment.start:.2f}s -> {segment.end:.2f}s]: {text}")
+            _a, _b = float(segment.start), float(segment.end)
+
+            # ★ v1.28.9：拦截「短窗口里的长幻觉」。
+            #
+            #   实测（03 号文件，78.31s）：VAD 只判出 0.39 秒语音（78.31~78.70），
+            #   下一个语音段要到 91.88s 才开始，中间 13 秒是纯静音。
+            #   whisper 却输出 78.31 -> 83.57、92 个字：
+            #     「随时都可以射在里面哦 随时都可以 随时允许你射在里面
+            #       随时都可以 随时都可以 把精液射在我的手手上 把蛋蛋汁涂满 …」
+            #   这种重复排比是幻觉的典型特征 —— 真实语速根本容纳不下。
+            #
+            #   两道拦截：
+            #     ① 时间夹到所属解码窗口内（向上留 0.6 秒缓冲，解码器确实会
+            #        略微越过 clip 边界，实测正常条目超出 0.5~1.2 秒）。
+            #     ② 字数超过「真实语音时长 × 语速上限」就丢弃。
+            #
+            #   ★ 注意②用的是【VAD 真实语音时长】，不是窗口时长。
+            #   窗口在短段两侧补过上下文（short_pad），按窗口算会放宽上限，
+            #   等于让幻觉又溜过去。这里取本条实际覆盖到的 VAD 语音总量。
+            #   中文口语实测中位 3.5 字/秒，取 9.0 作为硬上限，
+            #   正常条目碰不到，只拦「5 秒塞 92 字」这种。
+            if _use_clip and _clip_flat:
+                _win = None
+                for _i in range(0, len(_clip_flat) - 1, 2):
+                    if abs(_clip_flat[_i] - _a) < 0.4:
+                        _win = (_clip_flat[_i], _clip_flat[_i + 1])
+                        break
+                if _win is not None:
+                    # 本条覆盖的真实语音时长
+                    _speech_len = 0.0
+                    for _vs in vad_subs:
+                        _va, _vb = float(_vs[0]), float(_vs[1])
+                        _ov = min(_b, _vb) - max(_a, _va)
+                        if _ov > 0:
+                            _speech_len += _ov
+                    if _speech_len <= 0:
+                        _speech_len = _win[1] - _win[0]
+                    _n = len(_re.sub(r"[^\u4e00-\u9fff]", "", text))
+                    # ★ 阈值要同时满足「绝对字数多」和「语速离谱」，缺一不可：
+                    #   · 只卡语速会误杀真短句 —— 实测 38.56s 处 VAD 判 0.37 秒，
+                    #     whisper 出「呵呵」2 个字（5.4 字/秒，完全正常），
+                    #     但按 9.0 字/秒的硬线算，「呵呵」是 5.4<9 不该拦；
+                    #     17 个字的幻觉才是 45.8 字/秒，由「≥8 字」这一条一起卡住。
+                    #   · 只卡字数会误杀长句 —— 15 秒说 30 个字很正常。
+                    #   所以：字数 ≥ 8 且 语速 > 12 字/秒，才判定为幻觉。
+                    #   真实的短促叫喊（「再来一次 再来一次」之类）字数也够，
+                    #   但它的语速不会超过 12 —— 因为 VAD 判定的语音时长会跟着变长。
+                    if _n >= 8 and _n / max(0.25, _speech_len) > 12.0:
+                        print(f"  [幻觉拦截] {_a:.2f}->{_b:.2f} 真实语音 {_speech_len:.2f}s "
+                              f"却识别出 {_n} 字（{_n/_speech_len:.1f} 字/秒），"
+                              f"丢弃：{text[:40]}…")
+                        continue
+
+                    # ★ v1.29：短条过滤 ——「完」「结束」「再见」这类假字幕。
+                    #
+                    #   实测（04 号文件）：一条「完」显示 1.00 秒，但 pyannote VAD
+                    #   判定那里真实语音只有 0.43 秒（43% 覆盖）。同文件里 22 条
+                    #   短于 1.2 秒的字幕，真实语音普遍只有 0.3~0.5 秒：
+                    #     2.39s  0.42s →「结束」
+                    #    81.08s  0.34s →「结束」
+                    #   165.64s  0.32s →「结束」
+                    #   197.86s  0.35s →「再见」
+                    #   201.76s  0.43s →「完」
+                    #   856.22s  0.32s →「结束」
+                    #
+                    #   0.3~0.4 秒的音频装不下一个完整词，whisper 在这么短的窗口里
+                    #   把 ASMR 的唇齿音、气声、轻舔声这些【音效】解读成了音节。
+                    #   这类字幕纯属噪声，会打断观看节奏。
+                    #
+                    #   ★ 判据必须两头卡，否则会误杀真实的短促应答：
+                    #     · 真实语音 < 0.45 秒（物理上装不下一个词）
+                    #     · 且输出 ≥ 2 个中文字（排除「诶」「啊」这类单字语气词 ——
+                    #       它们本来就短，是真实内容）
+                    #   实测对照组：452.29s 那条「我这边会更加卖力...」真实语音
+                    #   0.95 秒，不受影响；「诶？」「好」这类单字也都能留下。
+                    #
+                    # ★ v1.29 补充：单字的「完」也要拦，但不能一刀切按单字拦。
+                    #   实测 04 号文件里最后一轮仍有几条漏网，它们的真实语音时长
+                    #   和真实语气词几乎一样，光靠时长区分不了：
+                    #     165.64s  VAD 0.32s →「完」     ← 该拦
+                    #     201.76s  VAD 0.44s →「完」     ← 该拦
+                    #     103.37s  VAD 1.35s →「完」     ← 真实短句，保留
+                    #       5.84s  VAD 0.40s →「哇」     ← 真实语气词，保留
+                    #      42.76s  VAD 0.51s →「呵呵」   ← 真实语气词，保留
+                    #   区别在【词义】：完成/结束类词在 ASMR 里多半是「終わり」
+                    #   之类的音效被误读；「哇/呵呵/唉/好/诶」是真的短促反应。
+                    #   所以补一张完成类词表，只在时长也极短时才按它拦。
+                    END_WORDS = (
+                        "完", "完毕", "结束", "完了", "完蛋", "再见", "拜拜",
+                        "完成", "到此为止", "时间到",
+                    )
+                    _is_end_word = text.strip().rstrip("。！？.!?").strip() in END_WORDS
+                    if _speech_len < 0.45 and (_n >= 2 or _is_end_word):
+                        print(f"  [短条过滤] {_a:.2f}->{_b:.2f} 真实语音仅 {_speech_len:.2f}s，"
+                              f"疑似音效误识，丢弃：{text}")
+                        continue
+                    _b = min(_b, _win[1] + 0.6)
+
+            raw_rows.append((_a, _b, text))
+            print(f"[{_a:.2f}s -> {_b:.2f}s]: {text}")
             # 结构化事件：和上面那行【同一份数据】，只是给 Rust 侧一个
             # 不依赖文本格式的入口（正则继续兜底，两者等价）。
-            emit("sub", f"{segment.start:.2f}", f"{segment.end:.2f}", text)
+            emit("sub", f"{_a:.2f}", f"{_b:.2f}", text)
 
-        # ★ v1.7.1：写盘前收缩每条的 end。
-        #   直接写 segment.end 会出现"一句话挂两百秒"，原因见 _cap_row_end 上方。
+        # ★ v1.28.8：clip_timestamps 模式下，segment 的 start/end 就是该解码
+        #   窗口的真实语音区间，【不需要也不该】再做事后收缩/补长。
+        #
+        #   为什么必须跳过：_cap_row_end 里有一条「end 偏早就补到 VAD 段尾，
+        #   最多补 5 秒」的规则。那是为【旧方案】准备的 —— 旧方案把多个 VAD 段
+        #   拼进一个 30 秒窗口，segment.end 被映射得很不可靠，才需要拿 VAD 段尾
+        #   来兜。换成 clip 方案后 segment.end 已经准了，这条规则反而把每条
+        #   的 end 往后撑 5 秒。
+        #
+        #   实测（02 号文件）：跳过前 121 条里有 26 处重叠、其中 23 处重叠 >2 秒，
+        #   而重叠量恰好集中在 5.00 秒 —— 正是这里的 5.0 秒补长造成的。
+        #   边界情况（起点重复、极短窗口）只做最小修正，不做时长猜测。
         asr_rows = []
         for i, (a, b, t) in enumerate(raw_rows):
+            if _use_clip:
+                nb = b
+                # 解码窗口之间天然不重叠；这里只保证时长下限，避免一闪而过。
+                if i + 1 < len(raw_rows):
+                    nxt = raw_rows[i + 1][0]
+                    if nxt > a:
+                        # 允许最多重叠 0.6 秒（后一条覆盖前一条），与 srt.rs 一致
+                        nb = min(nb, nxt + 0.6)
+                        nb = max(nb, min(a + 1.2, nxt))
+                if nb <= a:
+                    nb = a + 0.8
+                asr_rows.append((a, nb, t))
+                continue
             nb = _cap_row_end(a, b, t, vad_subs)
             if i + 1 < len(raw_rows):
                 nxt = raw_rows[i + 1][0]
@@ -436,8 +741,12 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
         _shrunk = sum(1 for r0, r1 in zip(raw_rows, asr_rows) if r1[1] < r0[1] - 0.01)
         _before = sum(b - a for a, b, _t in raw_rows)
         _after = sum(b - a for a, b, _t in asr_rows)
-        print(f"  [时间轴] 收缩 {_shrunk}/{len(asr_rows)} 条字幕的结束时间"
-              f"（总时长 {_before:.0f}s → {_after:.0f}s）")
+        if _use_clip:
+            print(f"  [时间轴] 解码窗口模式：{len(asr_rows)} 条，总时长 {_after:.0f}s"
+                  f"（未做事后收缩）")
+        else:
+            print(f"  [时间轴] 收缩 {_shrunk}/{len(asr_rows)} 条字幕的结束时间"
+                  f"（总时长 {_before:.0f}s → {_after:.0f}s）")
 
         # 一次性写盘（不要放在循环里逐条写）
         write_srt(asr_log_path, asr_rows)

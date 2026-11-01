@@ -15,6 +15,7 @@ mod backend;
 mod cancel;
 mod config;
 mod pipeline;
+mod softsub;
 mod srt;
 mod ui;
 

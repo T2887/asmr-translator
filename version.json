@@ -1,8 +1,8 @@
 {
-  "version": "1.28.7",
-  "url": "https://github.com/T2887/asmr-translator/releases/download/v1.28.7/ASMR-Translator-Setup_v1.28.7.exe",
-  "page": "https://github.com/T2887/asmr-translator/releases/tag/v1.28.7",
-  "notes": "v1.28.7 更新内容：\n· 修复：字幕「话还没说完就消失」——结束时间不再被 VAD 语音段尾卡死，改以大模型时间戳为准\n· 修复：相邻两条字幕允许短暂重叠 0.6 秒，播放器用后一条覆盖，不再硬切\n· 修复：硬字幕预检新增「纯白无描边」通道（ROYD-284 这类漏检的能检出了）\n· 修复：翻译失败的半句不再悄悄写进字幕，会重试并明确报错\n· 新增：环境变量 ASMR_BEAM 可调语音识别束宽（默认 5，一般不用动）\n\n实测同一段音频：被压缩的字幕 99/147 → 32/146，字幕总时长 626s → 1229s。\n注意：本次只需更新主程序，运行环境包没变，不用重下。",
+  "version": "1.29.0",
+  "url": "https://github.com/T2887/asmr-translator/releases/download/v1.29.0/ASMR-Translator-Setup_v1.29.0.exe",
+  "page": "https://github.com/T2887/asmr-translator/releases/tag/v1.29.0",
+  "notes": "v1.29.0 更新内容：\n· 新增：把字幕封装进原视频（软字幕）。mkv 完整保留 ASS 样式，mp4/mov 剥成纯文本；同时生成外挂字幕，两者并存\n· 新增：重复生成时自动替换旧的软字幕文件，失败会保留上一版不被破坏\n· 新增：支持 mp4/mkv/mov/m4v/3gp/webm/avi/wmv/flv/ts/mpg 共 11 种视频封字幕（装不住字幕的容器自动转成 mkv）\n· 新增：内存不足时自动降级为 int8 继续跑，不再直接崩溃退出\n· 修复：字幕「话没说完就消失」——识别窗口按 VAD 段重建，一条不再横跨几十秒\n· 修复：短音频里的音效被误识成「完」「结束」等假字幕，会被过滤掉\n· 修复：全局热词里的角色词污染（「社长」曾出现在十几条无关字幕里）\n· 修复：白色家具/墙面被误判成画面自带硬字幕（那个文件其实没字幕）\n· 修复：每次打开闪一个黑色控制台窗口\n· 调整：模式按钮改为竖排，右侧标注适用显卡与显存要求\n\n实测同一文件：字幕条数 156→150，虚假短条 7 条归零，单条最长 34.5s→10.8s。\n注意：本次只需更新主程序，运行环境包没变，不用重下。",
   "mirrors": [
     {"name": "百度网盘", "url": "https://pan.baidu.com/s/1UrvC4AaxsV-BBJWOrTNUdg?pwd=c82t"},
     {"name": "夸克网盘", "url": "https://pan.quark.cn/s/42530f352af0?pwd=GHXq"}

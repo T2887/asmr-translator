@@ -74,12 +74,14 @@ pub fn spawn(
     out_dir: String,
     // 收尾时要产出哪种字幕文件（SRT / ASS / 两个都要）
     sub_fmt: srt::SubFmt,
+    // 是否把字幕作为软字幕封装进原视频（v1.29）
+    embed_soft: bool,
 ) -> Worker {
     let (tx, rx) = channel::<Ev>();
     let cancel = CancellationToken::new();
     let token = cancel.clone();
     thread::spawn(move || {
-        run_all(tx, token, jobs, mode, copy_to_video, out_dir, sub_fmt);
+        run_all(tx, token, jobs, mode, copy_to_video, out_dir, sub_fmt, embed_soft);
     });
     Worker { cancel, rx }
 }
@@ -102,6 +104,7 @@ fn run_all(
     copy_to_video: bool,
     out_dir: String,
     sub_fmt: srt::SubFmt,
+    embed_soft: bool,
 ) {
     let total = jobs.len();
     let n_stages = pipeline::stages(mode).len();
@@ -250,7 +253,13 @@ fn run_all(
         log(&tx, "=== 开始整理字幕 ===");
         logs(
             &tx,
-            pipeline::finalize_subtitles_with(&[file.clone()], copy_to_video, &out_dir, sub_fmt),
+            pipeline::finalize_subtitles_opt(
+                &[file.clone()],
+                copy_to_video,
+                &out_dir,
+                sub_fmt,
+                embed_soft,
+            ),
         );
         // 中间产物在下一个文件开始前清掉：磁盘上永远只有一个文件的中间产物
         let _ = pipeline::purge_process_files(true);

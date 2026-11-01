@@ -281,7 +281,9 @@ pub fn hard_sub(tools: &Tools, path: &str, duration: f64) -> bool {
     // 短片（几分钟）也能有 6 个采样点，长片到 16 帧封顶（约 10 秒成本）。
     let n = ((duration / 60.0) as usize).clamp(6, FRAMES_MAX);
     let mut tried = 0usize;
-    let mut votes = 0usize;
+    // ★ v1.29：记录每帧命中的【块中心 y】，不再只数票数。
+    let mut centers: Vec<usize> = Vec::new();
+    let mut heights: Vec<usize> = Vec::new();
     for i in 0..n {
         // 掐掉片头和片尾各 10%：片头常有标题卡、片尾常有水印和演职员表，
         // 那里的白字黑底会被误当成字幕。
@@ -293,17 +295,61 @@ pub fn hard_sub(tools: &Tools, path: &str, duration: f64) -> bool {
         let ts = duration * frac;
         if let Some((w, h, gray)) = grab_gray(tools, path, ts) {
             tried += 1;
-            if looks_like_subtitle(&gray, w, h) {
-                votes += 1;
-                // 三帧都命中就足够定案：命中率必然 ≥ 3/tried，
-                // 在 tried ≤ 16 时都超过 VOTE_RATIO，没必要再抽。
-                if votes >= 3 {
-                    return true;
-                }
+            if let Some((y0, y1)) = looks_like_subtitle(&gray, w, h) {
+                centers.push((y0 + y1) / 2);
+                heights.push(h);
             }
         }
     }
-    tried > 0 && votes >= VOTE_MIN && (votes as f64) / (tried as f64) >= VOTE_RATIO
+
+    if tried == 0 || centers.len() < VOTE_MIN {
+        return false;
+    }
+
+    // ── 字幕位置判据（v1.29 新增）──
+    //
+    //   为什么需要它：abf-207 那部片子里有白色椅子、白床单，单帧看它们的
+    //   白色像素分布和真字幕几乎无法区分（列 run 中位、行内段数都实测过，
+    //   两边分布重叠）。所以要靠跨帧信息来判。
+    //
+    //   实测三组真实素材（16 帧采样，块中心 y 已打印）：
+    //     200gana-2535（有硬字幕）   命中 3 帧，中心 y = [42, 180, 7]
+    //     ROYD-284（无描边硬字幕）   命中 4 帧，中心 y = [176, 173, 14, 118]
+    //     abf-207（白色椅子，无字幕）命中 0 帧
+    //
+    //   注意前两部虽然真有字幕，命中帧里也混着【画面里的白色物体】
+    //   （上面 42 / 14 / 118 就是），所以不能用"全部命中帧都聚在同一位置"
+    //   那种严格判据 —— 实测会连真字幕一起判掉（聚类分别只有 1/3、2/4）。
+    //
+    //   更准的判据是【字幕该在的位置】：硬字幕压在画面底部。
+    //   本函数收到的 gray 已经是裁好的底部带（0.62~0.96 画面高度），
+    //   字幕通常在带的下 60%，而白色家具、墙面多出现在带的【上部】。
+    //   数命中帧里有多少落在带的下半部：
+    //     真字幕：176/173（ROYD）、180（200gana）都落在下段 ✓
+    //     白色物体：42/14/7 明显在上段
+    let band_h = heights.first().copied().unwrap_or(1).max(1);
+    let low_zone = (band_h as f64 * 0.40) as usize; // 带高 40% 处以下算字幕常见区
+    let in_low = centers.iter().filter(|&&cy| cy >= low_zone).count();
+
+    // 判据：至少 VOTE_MIN 帧命中，命中比例过线，且至少 1 帧落在底部字幕区。
+    //   这么宽是因为真字幕出现频率本来就低（16 帧里只有 3~4 帧有字）。
+    //   abf-207 那种命中 0 帧的情况，前面 `centers.len() < VOTE_MIN` 就挡住了。
+    let ok_ratio = (centers.len() as f64) / (tried as f64) >= VOTE_RATIO;
+    let ok_low = in_low >= 1;
+
+    // 诊断输出：设 ASMR_SUBSCAN_DEBUG=1 时打印，方便拿真实素材标定阈值。
+    if std::env::var("ASMR_SUBSCAN_DEBUG").is_ok() {
+        eprintln!(
+            "[subscan] {path}\n  采样 {tried} 帧，命中 {} 帧\n  命中帧块中心 y = {:?}\n  带高 {band_h}，底部字幕区 y >= {low_zone}，落在该区 {} 帧\n  比例 {:?} 底部 {:?}",
+            centers.len(),
+            centers,
+            in_low,
+            ok_ratio,
+            ok_low
+        );
+    }
+
+    ok_ratio && ok_low
 }
 
 /// 抽一帧、裁底部条带、缩到 960 宽、转灰度，返回 `(宽, 高, 像素)`。
@@ -419,9 +465,9 @@ fn parse_pgm(buf: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
 ///   1. 白像素（> 200）
 ///   2. 白像素周围 7×7 窗口里有足够多的黑（描边）
 ///   3. 命中的像素聚成「横向一条」
-pub fn looks_like_subtitle(gray: &[u8], w: usize, h: usize) -> bool {
+pub fn looks_like_subtitle(gray: &[u8], w: usize, h: usize) -> Option<(usize, usize)> {
     if w == 0 || h == 0 || gray.len() < w * h {
-        return false;
+        return None;
     }
     // 暗像素的积分图：用来 O(1) 求任意小窗口的黑像素个数
     let mut integral = vec![0u32; (w + 1) * (h + 1)];
@@ -529,7 +575,7 @@ pub fn looks_like_subtitle(gray: &[u8], w: usize, h: usize) -> bool {
             }
         }
         if hi >= lo && (hi - lo + 1) as f64 >= w as f64 * BLOCK_MIN_SPAN {
-            return true;
+            return Some((y0, y1));
         }
     }
 
@@ -614,33 +660,17 @@ pub fn looks_like_subtitle(gray: &[u8], w: usize, h: usize) -> bool {
         if !(hi >= lo && (hi - lo + 1) as f64 >= w as f64 * 0.22) {
             continue;
         }
-        // 每列白像素的最长垂直连续段，取中位数 —— 字形上下有缺口，白块没有。
-        let mut vruns: Vec<usize> = Vec::with_capacity(hi - lo + 1);
-        for x in lo..=hi {
-            let mut run = 0usize;
-            let mut mx = 0usize;
-            for y in y0..=y1 {
-                if gray[y * w + x] > WHITE {
-                    run += 1;
-                    if run > mx {
-                        mx = run;
-                    }
-                } else {
-                    run = 0;
-                }
-            }
-            vruns.push(mx);
-        }
-        if vruns.is_empty() {
-            continue;
-        }
-        vruns.sort_unstable();
-        let med = vruns[vruns.len() / 2] as f64 / bh as f64;
-        if med <= 0.25 {
-            return true;
-        }
+
+        // ★ v1.29：这里原来的判据是「每列白像素最长连续段 / 块高 ≤ 0.25」，
+        //   实测它【分不开】文字和白色物体，等于没判：
+        //     真实字幕（ROYD-284，纯白无描边）   列 run 中位 = 0.000
+        //     白色椅子（abf-207，误判样本）      列 run 中位 = 0.000
+        //   我一度想改用「行内白像素段数」，但扫描全片后发现两边分布几乎一样
+        //   （中位都是 6），同样无效 —— 单帧的静态统计特征根本不可靠。
+        //   真正的判据放在上层：多帧之间的【位置一致性】，见 hard_sub()。
+        return Some((y0, y1));
     }
-    false
+    None
 }
 
 // ── 对外入口 ──
@@ -727,14 +757,20 @@ mod tests {
     fn subtitle_bar_with_outline_is_detected() {
         let (w, h) = (320, 120);
         let g = with_bar(w, h, 70, 30, true);
-        assert!(looks_like_subtitle(&g, w, h), "白字黑描边应该被检出");
+        assert!(
+            looks_like_subtitle(&g, w, h).is_some(),
+            "白字黑描边应该被检出"
+        );
     }
 
     #[test]
     fn plain_white_bar_without_outline_is_ignored() {
         let (w, h) = (320, 120);
         let g = with_bar(w, h, 70, 30, false);
-        assert!(!looks_like_subtitle(&g, w, h), "没有黑描边的白块不该算字幕");
+        assert!(
+            looks_like_subtitle(&g, w, h).is_none(),
+            "没有黑描边的白块不该算字幕"
+        );
     }
 
     #[test]
@@ -747,14 +783,17 @@ mod tests {
                 g[y * w + x] = 255;
             }
         }
-        assert!(!looks_like_subtitle(&g, w, h), "小色块不该算字幕");
+        assert!(
+            looks_like_subtitle(&g, w, h).is_none(),
+            "小色块不该算字幕"
+        );
     }
 
     #[test]
     fn flat_frame_is_ignored() {
         let (w, h) = (320, 120);
-        assert!(!looks_like_subtitle(&vec![60u8; w * h], w, h));
-        assert!(!looks_like_subtitle(&vec![255u8; w * h], w, h));
+        assert!(looks_like_subtitle(&vec![60u8; w * h], w, h).is_none());
+        assert!(looks_like_subtitle(&vec![255u8; w * h], w, h).is_none());
     }
 
     #[test]

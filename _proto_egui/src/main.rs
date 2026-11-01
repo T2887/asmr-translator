@@ -19,6 +19,8 @@ mod config;
 mod pipeline;
 #[path = "../../app/src/srt.rs"]
 mod srt;
+#[path = "../../app/src/softsub.rs"]
+mod softsub;
 mod cancel;
 mod subscan;
 mod updater;
@@ -78,6 +80,13 @@ struct App {
     /// 收尾时产出哪种字幕文件：仅 SRT / 仅 ASS / 两个都要。
     /// 默认「仅 SRT」—— 老用户升级后产物不变，不会突然多出一堆 .ass。
     sub_fmt: srt::SubFmt,
+    /// ★ v1.29：把生成的字幕**作为软字幕封装进原视频**。
+    ///
+    /// 与 `sub_fmt` 正交：那边决定产出什么格式的文件，这边决定要不要
+    /// 额外产出一个带字幕轨的视频副本（`xxx（软字幕）.mkv|mp4`）。
+    /// 默认关 —— 老用户升级后不会凭空多出几 GB 的视频副本。
+    /// 纯音频输入（.flac/.mp3）封装字幕没有意义，运行时会被跳过。
+    embed_soft: bool,
     /// 点「开始处理」后正在后台扫「这个片子是不是已经自带字幕」。
     /// 扫描期间按钮显示「检查字幕…」且不可点。
     prechecking: bool,
@@ -222,6 +231,7 @@ impl Default for App {
             to_video: true,
             force_redo: false,
             sub_fmt: srt::SubFmt::Srt,
+            embed_soft: false,
             prechecking: false,
             precheck_rx: None,
             prechecked: false,
@@ -829,6 +839,7 @@ impl App {
             self.to_video,
             out,
             self.sub_fmt,
+            self.embed_soft,
         ));
     }
 
@@ -869,10 +880,17 @@ impl App {
         let arch_old = self.gpu_cap > 0.0 && self.gpu_cap < 7.5;
         if arch_old {
             let who = plain_device_name(&self.cuda_name);
-            return if who.is_empty() {
-                "显卡太老（计算能力低于 7.5），请用兼容模式".to_string()
+            // 说明「为什么只能用兼容模式」时把 Vulkan 一起带上：
+            // 老卡用户最想知道的是「那我还能不能加速」，而不是只有一句请用兼容模式。
+            let tail = if self.has_vulkan {
+                "只能兼容模式（Vulkan 加速）"
             } else {
-                format!("显卡太老（{who}），请用兼容模式")
+                "只能兼容模式（纯 CPU）"
+            };
+            return if who.is_empty() {
+                format!("显卡太老（计算能力低于 7.5），{tail}")
+            } else {
+                format!("显卡太老（{who}），{tail}")
             };
         }
         let (name, accel) = self.accel();
@@ -1217,18 +1235,28 @@ impl App {
                 // 界面上表现为「第2步退出码 1」，用户看不出是显卡太老。所以这里
                 // 直接把全量/精简判为不可用，并把模式锁到兼容模式（纯 CPU 设计，
                 // 速度比「全量 + CPU」快得多）。
+                // ★ 措辞要点：兼容模式【不是】纯 CPU。
+                //   它的翻译环节跑 llama.cpp，优先用 Vulkan 加速，只有枚举不到
+                //   Vulkan 设备时才退回纯 CPU。原来那句「它同样是纯 CPU 运行」
+                //   在用户开了 Vulkan 的情况下是错的 —— 而 Vulkan 恰恰是老卡
+                //   用户最关心的（GTX 10 系用 Vulkan 比纯 CPU 快好几倍）。
                 let arch_old = cap > 0.0 && cap < 7.5;
                 self.gpu_cap = cap;
                 if arch_old {
                     self.push_log(format!(
-                        "[显卡] 检测到 {cuda_name}（计算能力 {cap:.1}），低于 7.5"
+                        "[显卡] 检测到 {cuda_name}（计算能力 {cap:.1}），低于 7.5（Turing 之前的老架构）"
                     ));
                     self.push_log(
-                        "[显卡] 新版 PyTorch 的 cuDNN 已不再支持这么老的显卡，全量/精简模式在 GPU 上会直接报错",
+                        "[显卡] 新版 PyTorch 的 cuDNN 已不再为 SM < 7.5 提供 kernel，全量/精简模式只要一上 GPU 就会报错（表现为第2步「退出码 1」）",
                     );
                     self.push_log(
-                        "[显卡] 已锁定为兼容模式：它同样是纯 CPU 运行，但速度快得多，也没有显存要求",
+                        "[显卡] 已锁定为兼容模式：语音转写走 SenseVoice（CPU），翻译走 llama.cpp —— 有 Vulkan 设备时用 Vulkan 加速，没有才退回纯 CPU",
                     );
+                    if self.has_vulkan {
+                        self.push_log(
+                            "[显卡] 本机检测到 Vulkan 设备，兼容模式会用它加速翻译",
+                        );
+                    }
                 }
                 // 总显存判断硬件资格；当前空余显存判断此刻是否安全启动。
                 // 全量约 4 GB 峰值 + 1 GB 余量，精简约 2 GB + 1 GB 余量。
@@ -1780,6 +1808,7 @@ fn chip(ui: &mut Ui, label: &str, selected: bool, enabled: bool) -> egui::Respon
     );
     resp
 }
+
 
 /// 复选框（对应 WinUI 的 check_row）：16px 方框，选中橙底白勾。
 fn wcheck(ui: &mut Ui, checked: bool, text: &str) -> egui::Response {
@@ -2682,6 +2711,26 @@ impl eframe::App for App {
                                         .size(11.0)
                                         .color(INK3),
                                     );
+                                    // ★ v1.29：把字幕封装进原视频（软字幕）。
+                                    ui.add_space(3.0);
+                                    if wcheck(ui, self.embed_soft, "把字幕封装进原视频（软字幕）").clicked()
+                                    {
+                                        self.embed_soft = !self.embed_soft;
+                                        self.push_log(format!(
+                                            "[设置] 软字幕封装：{}",
+                                            if self.embed_soft { "开" } else { "关" }
+                                        ));
+                                    }
+                                    if self.embed_soft {
+                                        ui.label(
+                                            RichText::new(
+                                                "会额外生成一个「原文件名（软字幕）.mkv/mp4」，音视频不重编码、原文件不动；\
+                                                 可在播放器里开关/换语言。纯音频（flac/mp3）无法封装，会自动跳过。",
+                                            )
+                                            .size(11.0)
+                                            .color(INK3),
+                                        );
+                                    }
                                     // 日文字幕只有兼容模式有原文可用：
                                     //   全量/精简走 Whisper 的 translate 任务（日语直接进、中文直接出），
                                     //   日文在模型内部就丢掉了 —— 想拿日文得再跑一次识别，
@@ -2719,7 +2768,14 @@ impl eframe::App for App {
                             });
                             ui.add_space(col_gap);
                             // 右列：设备状态 + 处理模式胶囊 + 说明
+                            //
+                            // ★ 限宽：竖排后每行是「胶囊 + 右侧说明」，
+                            //   不限宽说明文字会横向溢出卡片内边距被裁掉
+                            //   （实测截图里右端的小字就是被切掉的）。
+                            let right_w = (total_w - left_w - col_gap - 6.0).max(180.0);
                             ui.vertical(|ui| {
+                                ui.set_min_width(right_w);
+                                ui.set_max_width(right_w);
                                 ui.spacing_mut().item_spacing.y = 12.0;
                                 ui.vertical(|ui| {
                                     ui.spacing_mut().item_spacing.y = 3.0;
@@ -2731,38 +2787,51 @@ impl eframe::App for App {
                                     });
                                 });
                                 ui.vertical(|ui| {
-                                    ui.spacing_mut().item_spacing.y = 8.0;
                                     ui.label(RichText::new("处理模式").size(11.0).color(INK3));
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 8.0;
-                                        if chip(ui, "全量模式", self.mode == RunMode::Full, self.full_ok)
-                                            .clicked()
-                                            && self.mode != RunMode::Full
-                                        {
-                                            self.mode = RunMode::Full;
-                                            self.push_log("[模式] 当前使用: 全量模式");
-                                        }
-                                        if chip(ui, "精简模式", self.mode == RunMode::Lite, self.lite_ok)
-                                            .clicked()
-                                            && self.mode != RunMode::Lite
-                                        {
-                                            self.mode = RunMode::Lite;
-                                            self.push_log("[模式] 当前使用: 精简模式");
-                                        }
-                                        if chip(ui, "兼容模式", self.mode == RunMode::Compat, true).clicked()
-                                            && self.mode != RunMode::Compat
-                                        {
-                                            self.mode = RunMode::Compat;
-                                            self.push_log("[模式] 当前使用: 兼容模式");
-                                        }
-                                    });
-                                    ui.label(
-                                        RichText::new(
-                                            "全量模式需 N 卡显存 ≥ 8 GB；精简模式 ≥ 6 GB；兼容模式用于低于 6 GB / 非 N 独立显卡 / 核显",
-                                        )
-                                        .size(11.0)
-                                        .color(INK3),
-                                    );
+                                    // ★ 竖排三条：左边是与原来【完全同尺寸】的胶囊，
+                                    //   右边跟一句该模式的说明。
+                                    //   胶囊尺寸由 chip() 自己按文字算，这里只负责
+                                    //   竖着排 + 在它右边补说明，不改变按钮本身大小。
+                                    //
+                                    //   行间距 10px：原来是 6px，三个胶囊竖着贴太紧，
+                                    //   视觉上挤成一坨（用户要求放大）。10px 既拉开
+                                    //   呼吸感，又不会让右列比左列高出太多。
+                                    ui.spacing_mut().item_spacing.y = 10.0;
+                                    ui.add_space(2.0);
+                                    let modes: [(RunMode, &str, &str, bool); 3] = [
+                                        (RunMode::Full, "全量模式", "GTX16系 / RTX20系及以上，显存≥8GB", self.full_ok),
+                                        (RunMode::Lite, "精简模式", "GTX16系 / RTX20系及以上，显存≥6GB", self.lite_ok),
+                                        (RunMode::Compat, "兼容模式", "GTX10系及更早、非N卡、核显（支持Vulkan加速）", true),
+                                    ];
+                                    for (m, title, hint, ok) in modes {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 10.0;
+                                            let resp = chip(ui, title, self.mode == m, ok);
+                                            // ★ 灰按钮要说清为什么灰。
+                                            //   老卡（计算能力 < 7.5）的用户看到全量/精简
+                                            //   变灰但没有任何提示，只能猜。悬停时给出原因。
+                                            if !ok {
+                                                let why = if self.gpu_cap > 0.0
+                                                    && self.gpu_cap < 7.5
+                                                {
+                                                    "显卡计算能力低于 7.5（Turing 之前的老架构），\
+                                                     新版 PyTorch 的 cuDNN 不支持，全量/精简一上 GPU 就报错"
+                                                } else if !self.has_gpu {
+                                                    "没检测到可用的 NVIDIA 显卡"
+                                                } else {
+                                                    "显存不足（或被其他程序占用），暂时开不了这个模式"
+                                                };
+                                                resp.clone().on_hover_text(why);
+                                            }
+                                            if resp.clicked() && self.mode != m {
+                                                self.mode = m;
+                                                self.push_log(format!("[模式] 当前使用: {title}"));
+                                            }
+                                            ui.label(
+                                                RichText::new(hint).size(10.5).color(INK3),
+                                            );
+                                        });
+                                    }
                                 });
                             });
                         });
