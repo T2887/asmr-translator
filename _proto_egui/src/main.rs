@@ -2616,7 +2616,8 @@ impl eframe::App for App {
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 2.0;
                             ui.label(
-                                RichText::new(format!("ASMR 日语语音 → 中文翻译  v{}", config::APP_VERSION))
+                                // 同样走 app_title()，和窗口标题保持同一真源
+                                RichText::new(config::app_title())
                                     .font(FontId::new(26.0, FontFamily::Name("bold".into())))
                                     .color(INK),
                             );
@@ -3863,7 +3864,16 @@ fn main() -> eframe::Result<()> {
         .with_decorations(false)
         .with_inner_size([1280.0, 1000.0])
         .with_min_inner_size([900.0, 600.0])
-        .with_title(format!("ASMR 日语语音 → 中文翻译  v{}", config::APP_VERSION));
+        // ★ 必须调 config::app_title()，不能在这里自己拼字符串。
+        //
+        //   踩过的坑：这里原来写的是
+        //     format!("ASMR 日语语音 → 中文翻译  v{}", config::APP_VERSION)
+        //   —— 和 config::app_title() 里那份是**两处独立实现**。
+        //   于是我在 app_title() 里加的「诊断版」分支对 egui 版完全无效：
+        //   改了 DIAG_MODE=true、编译、跑起来，标题还是原样。
+        //   （app_title 当时只被旧的 app/src/ui.rs 调用，egui 版没接。）
+        //   统一到 app_title() 一处，标题就只有一个真源了。
+        .with_title(config::app_title());
     // 任务栏 / 标题栏图标：和 WinUI 版同一张 assets/icon.png
     if let Some((rgba, width, height)) = icon_rgba() {
         viewport = viewport.with_icon(egui::IconData {
