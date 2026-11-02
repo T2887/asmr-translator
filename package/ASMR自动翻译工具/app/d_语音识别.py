@@ -102,7 +102,16 @@ _HOTWORDS = "肉棒,小穴,舒服,去了,高潮,舔,精液,射精,口交,乳交"
 # __fastfail 本身抓不到（它不经过 Python 异常机制），但「最后一行写到哪里」
 # 足以定位崩溃点。
 # ─────────────────────────────────────────────────────────────
-_DIAG_PATH = os.path.join(os.getcwd(), "_诊断.txt")
+# 诊断文件写到哪里：
+#   优先 ASMR_DATA_DIR（Rust 侧明确告诉 Python「该往哪写」的可写目录），
+#   没有才退回 cwd。
+#
+#   为什么不能只用 cwd：backend.rs 起 Python 时 .current_dir(work_dir)，
+#   那是【程序安装目录】。装进 Program Files 后那里不可写，诊断文件
+#   一个字都写不出来 —— 而 _diag() 的异常是静默吞掉的，用户会拿到一个
+#   空的/根本没有的 _诊断.txt，白跑一趟。
+_DIAG_DIR = os.environ.get("ASMR_DATA_DIR", "").strip() or os.getcwd()
+_DIAG_PATH = os.path.join(_DIAG_DIR, "_诊断.txt")
 _DIAG_PROGRESS_EVERY = int(os.environ.get("ASMR_DIAG_EVERY", "10"))
 
 # ★ 诊断功能由环境变量 ASMR_DIAG=1 开启（默认关闭）。
