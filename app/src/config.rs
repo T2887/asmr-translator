@@ -895,9 +895,28 @@ pub fn python_exe() -> String {
 ///     实测从 120 秒降到 0 秒；进程活着但没有监听时仍按超时兜底。
 pub const APP_VERSION: &str = "1.29.1";
 
+/// ★ 诊断模式开关（编译期常量，默认关闭）。
+///
+/// 用途：给「第4步推理崩溃但查不出原因」的用户单独打一版。
+/// 开启后 Python 侧会收到 `ASMR_DIAG=1`，把崩之前的最后动作逐行写进
+/// `<数据目录>/_诊断.txt`，包含阶段标记、每 N 段的进度、提交内存、显存、
+/// 以及能捕获到的异常 traceback。
+///
+/// **正常工作版本必须保持 false**：诊断会额外写文件、每 10 段起一次
+/// `nvidia-smi` 子进程，属于纯开销。
+///
+/// 打诊断版的做法：把这个常量改成 true → 编译 → 打包，
+/// 版本号保持 APP_VERSION 不变（自动更新比较时 `1.29.1-debug` 与 `1.29.1`
+/// 解析结果相同，不会互相误报）。
+pub const DIAG_MODE: bool = false;
+
 /// 窗口标题
 pub fn app_title() -> String {
-    format!("ASMR 日语语音 → 中文翻译  v{APP_VERSION}")
+    if DIAG_MODE {
+        format!("ASMR 日语语音 → 中文翻译  v{APP_VERSION} [诊断版]")
+    } else {
+        format!("ASMR 日语语音 → 中文翻译  v{APP_VERSION}")
+    }
 }
 
 /// 界面左上角那个小 logo 的路径（exe 同目录下的 assets\icon.png）。

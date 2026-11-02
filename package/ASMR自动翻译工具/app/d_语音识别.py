@@ -85,6 +85,101 @@ _INITIAL_PROMPT = "以下是日语成人向音声的中文翻译，口语化、�
 _HOTWORDS = "肉棒,小穴,舒服,去了,高潮,舔,精液,射精,口交,乳交"
 
 
+# ─────────────────────────────────────────────────────────────
+# 【诊断版专用】崩溃现场记录（v1.29.1-debug）
+#
+# 背景：用户的 3080 Ti Laptop 机器在第4步推理约 14 秒时崩溃，
+#   退出码 -1073740791（0xC0000409 = __fastfail，进程级强杀，
+#   Python 捕获不到任何异常），且【内存充足】（提交额度可用 48 GB，
+#   语音识别只需约 5 GB）。原来的日志只留下「退出码」三个字，
+#   完全不知道崩在做什么。
+#
+# 这版把「崩之前的最后动作」逐行落盘到 _诊断.txt，每写一行都 flush：
+#   · 阶段标记：加载模型 → 建解码窗口 → 调 transcribe → 开始遍历 segments
+#   · 进度：每 PROGRESS_EVERY 段记一次「第几段 / 第几秒 / 提交内存 / 显存」
+#   · 可捕获异常：MemoryError / CUDA error 这类能抓到的，连 traceback 一起写
+#
+# __fastfail 本身抓不到（它不经过 Python 异常机制），但「最后一行写到哪里」
+# 足以定位崩溃点。
+# ─────────────────────────────────────────────────────────────
+_DIAG_PATH = os.path.join(os.getcwd(), "_诊断.txt")
+_DIAG_PROGRESS_EVERY = int(os.environ.get("ASMR_DIAG_EVERY", "10"))
+
+# ★ 诊断功能由环境变量 ASMR_DIAG=1 开启（默认关闭）。
+#
+#   为什么做成开关而不是直接写死：
+#     正式版不该在用户目录里多出一个 _诊断.txt，也不该每 10 段就开一次文件
+#     + 起一次 nvidia-smi 子进程（那是明显的额外开销）。
+#     诊断版由 Rust 侧传入 ASMR_DIAG=1（见 backend.rs 的 .env(...)），
+#     两个版本共用同一份 Python 脚本，只是编译时打的开关不同。
+_DIAG_ON = os.environ.get("ASMR_DIAG", "0") == "1"
+
+
+def _diag(msg):
+    """写一行诊断并立刻 flush —— 进程被强杀时缓冲区里的内容会丢。"""
+    if not _DIAG_ON:
+        return
+    try:
+        import datetime as _dt
+        with open(_DIAG_PATH, "a", encoding="utf-8", newline="\n") as f:
+            f.write(f"[{_dt.datetime.now().strftime('%H:%M:%S.%f')[:-3]}] {msg}\n")
+            f.flush()
+    except Exception:
+        pass
+
+
+def _mem_now():
+    """返回 (可用物理 GB, 可提交 GB)，读不到给 (0,0)。"""
+    if not _DIAG_ON:
+        return (0.0, 0.0)
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _MS(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", wintypes.DWORD),
+                ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        st = _MS()
+        st.dwLength = ctypes.sizeof(_MS)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            return (st.ullAvailPhys / 1024 ** 3, st.ullAvailPageFile / 1024 ** 3)
+    except Exception:
+        pass
+    return (0.0, 0.0)
+
+
+def _vram_now():
+    """nvidia-smi 读当前显存占用，失败返回空串。"""
+    if not _DIAG_ON:
+        return ""
+    try:
+        import subprocess as _sp
+        o = _sp.run(["nvidia-smi", "--query-gpu=memory.used,memory.total",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=5)
+        line = o.stdout.strip().splitlines()[0]
+        used, total = [x.strip() for x in line.split(",")]
+        return f"{used}/{total} MiB"
+    except Exception:
+        return "?"
+
+
+if _DIAG_ON:
+    _diag(f"===== 诊断版启动 pid={os.getpid()} =====")
+    _diag(f"Python {sys.version.split()[0]}  平台 {sys.platform}")
+    _diag(f"device={config['device']} compute_type={config.get('compute_type')}")
+
+
 def _load_extra_hotwords(stem):
     """按作品补充热词（v1.17.1）。
 
@@ -498,6 +593,7 @@ if _degraded:
     _compute = _degraded
     print(f"[内存] 本次使用 compute_type = {_compute}")
 
+_diag("→ 开始加载 WhisperModel")
 with Heartbeat("加载语音识别模型"):
     model = WhisperModel(
         model_size_or_path=config["model"]["asr"],
@@ -505,6 +601,7 @@ with Heartbeat("加载语音识别模型"):
         compute_type=_compute,
         download_root=config["path"]["model"]
     )
+_diag(f"✓ WhisperModel 加载完成  提交可用 {_mem_now()[1]:.1f} GB  显存 {_vram_now()}")
 
 # 4. 开始推理循环
 emit("stage", "start", 4)
@@ -555,6 +652,9 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
         print(f"  [分段] {len(vad_subs)} 个 VAD 段 → {len(_clips)} 个解码窗口"
               f"（最长 {max(b - a for a, b in _clips):.1f}s）")
 
+    _diag(f"→ 准备调用 transcribe  窗口 {len(_clips)} 个  clip_flat {len(_clip_flat)} 个"
+          f"  提交可用 {_mem_now()[1]:.1f} GB  显存 {_vram_now()}")
+
     # clip_timestamps 与 vad_filter 互斥：给了 clip_timestamps 后 vad_filter 被忽略。
     # 保留 patch 作为兜底 —— 老版本 faster-whisper 若不走 clip 分支仍能工作。
     with patch(
@@ -584,8 +684,17 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
             log_progress=True
         )
 
+        # ★ 关键：faster-whisper 的 transcribe 返回的是【惰性生成器】——
+        #   调用那一刻并不推理，真正跑起来是开始迭代 segments 的时候。
+        #   用户就是崩在这里，所以下面每 N 段打一次点。
+        _diag("→ 开始遍历 segments（真正的推理从这里开始）")
         raw_rows = []
+        _seg_i = 0
         for segment in segments:
+            _seg_i += 1
+            if _seg_i % _DIAG_PROGRESS_EVERY == 1:
+                _diag(f"  推理中 第 {_seg_i} 段  t={segment.start:.1f}s  "
+                      f"提交可用 {_mem_now()[1]:.1f} GB  显存 {_vram_now()}")
             text = segment.text.strip()
             if not text:
                 continue
@@ -738,6 +847,7 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
                 nb = a + 0.8
             asr_rows.append((a, nb, t))
 
+        _diag(f"✓ segments 遍历完成  共 {_seg_i} 段  提交可用 {_mem_now()[1]:.1f} GB")
         _shrunk = sum(1 for r0, r1 in zip(raw_rows, asr_rows) if r1[1] < r0[1] - 0.01)
         _before = sum(b - a for a, b, _t in raw_rows)
         _after = sum(b - a for a, b, _t in asr_rows)
@@ -750,6 +860,7 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
 
         # 一次性写盘（不要放在循环里逐条写）
         write_srt(asr_log_path, asr_rows)
+        _diag(f"✓ 字幕已写盘 {asr_log_path}")
 
     print(f"处理完成，保存至: {asr_log_path}")
 
@@ -768,6 +879,7 @@ print("\n所有 ASR 任务处理完毕！")
 #   os._exit 不跑 atexit / finally、不析构 C++ 对象。对马上要结束的进程没有
 #   代价（显存和句柄由内核回收）。必须先手动 flush：os._exit 不会替你刷缓冲，
 #   否则最后几行日志会丢。
+_diag("✓ 所有任务完成，准备 os._exit(0)")
 sys.stdout.flush()
 sys.stderr.flush()
 os._exit(0)

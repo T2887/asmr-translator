@@ -323,6 +323,13 @@ pub fn run_script(
                 "0"
             },
         )
+        // ★ 诊断开关：诊断版编译时（config::DIAG_MODE = true）传 1，
+        //   让 d_语音识别.py 把崩溃现场逐行写进 _诊断.txt。
+        //   正式版传 0，Python 侧所有诊断代码直接跳过（不写文件、不起子进程）。
+        .env(
+            "ASMR_DIAG",
+            if crate::config::DIAG_MODE { "1" } else { "0" },
+        )
         // 程序目录不可写时（装进了 Program Files），Python 会试着把
         // __pycache__ 写到脚本旁边，每次启动都失败一次、还刷一行警告。
         // 这种情况直接关掉字节码缓存；可写时保留，启动能快点。
