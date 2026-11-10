@@ -73,6 +73,28 @@ pub struct UpdateInfo {
     pub download_url: String,
     /// 备用镜像：(名字, 地址)，一般是百度网盘 / 夸克网盘
     pub mirrors: Vec<(String, String)>,
+    /// ★ 环境包补丁（v1.30 起）。
+    ///
+    /// 背景：老用户装的是 1.29 那版运行环境包，里面**没有 Haas-ja 模型**
+    /// （459 MB）。只更新主程序的话，Haas-ja 加载失败会静默降级到 SenseVoice ——
+    /// 功能不坏，但拿不到这次识别准确率的提升。
+    ///
+    /// 重下 12 GB 全量环境包对老用户太贵，所以单独做一个 490 MB 的补丁包。
+    /// 清单里给出版本和地址，程序自己判断「我缺不缺」再决定提示。
+    pub runtime_patch: Option<RuntimePatch>,
+}
+
+/// 环境包补丁
+#[derive(Debug, Clone)]
+pub struct RuntimePatch {
+    /// 这个补丁对应的环境包版本，如 "1.30.0"
+    pub version: String,
+    /// 补丁包下载地址
+    pub url: String,
+    /// 补丁包大小（MB），用来在界面上给用户预期
+    pub size_mb: u32,
+    /// 补丁说明
+    pub notes: String,
 }
 
 impl UpdateInfo {
@@ -174,7 +196,53 @@ pub fn parse_manifest(raw: &str) -> Option<UpdateInfo> {
         notes: json_str(raw, "notes").unwrap_or_default(),
         download_url,
         mirrors: json_mirrors(raw),
+        runtime_patch: json_runtime_patch(raw),
     })
+}
+
+/// 解析可选的 `runtime_patch` 段。
+///
+/// 形状：
+/// ```json
+/// "runtime_patch": {
+///   "version": "1.30.0",
+///   "url": "https://.../ASMR-运行环境补丁_v1.30.0.exe",
+///   "size_mb": 490,
+///   "notes": "补上 Haas-ja 语音识别模型"
+/// }
+/// ```
+/// 没有这一段（老清单）就返回 None，不报错。
+fn json_runtime_patch(raw: &str) -> Option<RuntimePatch> {
+    let i = raw.find("\"runtime_patch\"")?;
+    let rest = &raw[i..];
+    let l = rest.find('{')?;
+    let r = rest.find('}')?;
+    if r <= l {
+        return None;
+    }
+    let body = &rest[l..=r];
+
+    let url = json_str(body, "url").unwrap_or_default();
+    if url.trim().is_empty() {
+        return None; // 没有地址等于没有补丁
+    }
+    Some(RuntimePatch {
+        version: json_str(body, "version").unwrap_or_default(),
+        url,
+        size_mb: json_u32(body, "size_mb").unwrap_or(0),
+        notes: json_str(body, "notes").unwrap_or_default(),
+    })
+}
+
+/// 取一个整数型字段（`"size_mb": 490` 这种，不带引号）
+fn json_u32(raw: &str, key: &str) -> Option<u32> {
+    let pat = format!("\"{key}\"");
+    let i = raw.find(&pat)?;
+    let rest = &raw[i + pat.len()..];
+    let colon = rest.find(':')?;
+    let tail = rest[colon + 1..].trim_start();
+    let num: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+    num.parse().ok()
 }
 
 /// 用系统自带工具把 URL 内容读成字符串。
@@ -390,6 +458,34 @@ pub fn download_dir(data_dir: &str) -> PathBuf {
     Path::new(data_dir).join("_更新")
 }
 
+// ─────────────────────── 环境包补丁：本地缺不缺 ───────────────────────
+
+/// 判断本地是否【缺少】Haas-ja 语音识别模型。
+///
+/// 用途：决定要不要在「发现新版本」弹窗里额外提示装环境包补丁。
+///
+/// 为什么要检测而不是单纯按版本号判断：
+///   · 全新安装的用户拿到的环境包【已经带】这个模型，不该再被提示装补丁
+///   · 老用户升级主程序后环境里没有它，才需要提示
+///   只看版本号会把前者也骚扰一遍。
+///
+/// 判定标准：`model\Haas-ja-v1.0\` 下五个文件齐全才算有。
+/// 少任何一个都算缺（残缺的模型加载会失败，等于没有）。
+pub fn needs_runtime_patch(work_dir: &str) -> bool {
+    const FILES: [&str; 5] = [
+        "encoder.quantized.onnx",
+        "encoder.data",
+        "decoder.onnx",
+        "joiner.onnx",
+        "tokens.txt",
+    ];
+    let dir = Path::new(work_dir).join("model").join("Haas-ja-v1.0");
+    if !dir.is_dir() {
+        return true;
+    }
+    !FILES.iter().all(|f| dir.join(f).is_file())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,5 +518,93 @@ mod tests {
         assert_eq!(info.mirrors[0].0, "百度网盘");
         assert!(info.is_newer_than("1.27.4"));
         assert!(!info.is_newer_than("1.28"));
+        // 老清单没有 runtime_patch 段，不该报错，也不该有补丁
+        assert!(info.runtime_patch.is_none());
     }
+
+    /// 带 runtime_patch 的新清单要能解析出补丁信息。
+    #[test]
+    fn manifest_parse_runtime_patch() {
+        let raw = r##"{
+          "version": "1.30.0",
+          "url": "https://example.com/main.exe",
+          "notes": "换了识别引擎",
+          "mirrors": [],
+          "runtime_patch": {
+            "version": "1.30.0",
+            "url": "https://example.com/patch.exe",
+            "size_mb": 490,
+            "notes": "补上 Haas-ja 模型"
+          }
+        }"##;
+        let info = parse_manifest(raw).expect("应能解析");
+        let p = info.runtime_patch.expect("应该有补丁段");
+        assert_eq!(p.version, "1.30.0");
+        assert_eq!(p.url, "https://example.com/patch.exe");
+        assert_eq!(p.size_mb, 490);
+        assert!(p.notes.contains("Haas-ja"));
+    }
+
+    /// 补丁段里没有 url 等于没有补丁 —— 不能因为字段残缺就弹个装不成的窗。
+    #[test]
+    fn runtime_patch_without_url_is_ignored() {
+        let raw = r##"{
+          "version": "1.30.0",
+          "url": "https://example.com/main.exe",
+          "runtime_patch": { "version": "1.30.0", "size_mb": 490 }
+        }"##;
+        let info = parse_manifest(raw).expect("应能解析");
+        assert!(info.runtime_patch.is_none(), "没有 url 就不该算补丁");
+    }
+
+    /// needs_runtime_patch：模型文件齐全才算有，缺一个都算缺。
+    #[test]
+    fn runtime_patch_detection() {
+        let root = std::env::temp_dir().join("asmr_patch_detect_test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let root_s = root.to_string_lossy().to_string();
+
+        // ① 目录都不存在 → 缺
+        assert!(needs_runtime_patch(&root_s), "没有 model 目录应判缺");
+
+        // ② 建目录但文件不全 → 仍缺
+        let d = root.join("model").join("Haas-ja-v1.0");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("encoder.quantized.onnx"), b"x").unwrap();
+        assert!(needs_runtime_patch(&root_s), "只有部分文件应判缺");
+
+        // ③ 五个文件齐全 → 不缺
+        for f in ["encoder.data", "decoder.onnx", "joiner.onnx", "tokens.txt"] {
+            std::fs::write(d.join(f), b"x").unwrap();
+        }
+        assert!(!needs_runtime_patch(&root_s), "文件齐全应判不缺");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 用仓库里真实的 version.json 验证解析 —— 保证补丁段能被读到。
+    #[test]
+    fn real_version_json_has_patch() {
+        // 从 _proto_egui/target/release/ 往上找到仓库根
+        let mut p = std::env::current_dir().unwrap();
+        for _ in 0..6 {
+            let cand = p.join("version.json");
+            if cand.is_file() {
+                let raw = std::fs::read_to_string(&cand).unwrap();
+                let info = parse_manifest(&raw).expect("真实清单应能解析");
+                println!("版本 = {}", info.version);
+                let patch = info.runtime_patch.expect("真实清单里应该有补丁段");
+                println!("补丁 = v{} ({} MB)", patch.version, patch.size_mb);
+                assert!(patch.size_mb > 0);
+                assert!(!patch.url.is_empty());
+                return;
+            }
+            if !p.pop() {
+                break;
+            }
+        }
+        panic!("找不到 version.json");
+    }
+
 }

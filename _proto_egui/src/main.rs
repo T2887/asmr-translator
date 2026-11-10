@@ -87,6 +87,14 @@ struct App {
     /// 默认关 —— 老用户升级后不会凭空多出几 GB 的视频副本。
     /// 纯音频输入（.flac/.mp3）封装字幕没有意义，运行时会被跳过。
     embed_soft: bool,
+    /// 额外产出一份 `.lrc` 同步歌词（`xxx.chs.lrc`）。
+    /// 默认关 —— 老用户升级后产物不变。
+    ///
+    /// 和 `sub_fmt` 是**正交**的：LRC 给音乐播放器显示歌词，
+    /// SRT/ASS 给视频播放器挂字幕，两个可以同时要。
+    /// ASMR 有大量纯音频（.flac/.mp3），那些用户只要歌词不要字幕，
+    /// 所以它必须是独立开关而不是格式三选一里的第四项。
+    want_lrc: bool,
     /// 点「开始处理」后正在后台扫「这个片子是不是已经自带字幕」。
     /// 扫描期间按钮显示「检查字幕…」且不可点。
     prechecking: bool,
@@ -241,6 +249,7 @@ impl Default for App {
             force_redo: false,
             sub_fmt: srt::SubFmt::Srt,
             embed_soft: false,
+            want_lrc: false,
             prechecking: false,
             precheck_rx: None,
             prechecked: false,
@@ -851,6 +860,7 @@ impl App {
             out,
             self.sub_fmt,
             self.embed_soft,
+            self.want_lrc,
         ));
     }
 
@@ -2769,6 +2779,30 @@ impl eframe::App for App {
                                             .color(INK3),
                                         );
                                     }
+                                    // ★ v1.30：额外输出 LRC 同步歌词。
+                                    //
+                                    //   ASMR 有大量纯音频（.flac/.mp3），这些用户
+                                    //   往往不要字幕、只要歌词 —— 所以做成独立开关，
+                                    //   不占上面 SRT/ASS 三选一的位置。
+                                    ui.add_space(3.0);
+                                    if wcheck(ui, self.want_lrc, "额外输出 LRC 歌词（.lrc）").clicked()
+                                    {
+                                        self.want_lrc = !self.want_lrc;
+                                        self.push_log(format!(
+                                            "[设置] LRC 歌词输出：{}",
+                                            if self.want_lrc { "开" } else { "关" }
+                                        ));
+                                    }
+                                    if self.want_lrc {
+                                        ui.label(
+                                            RichText::new(
+                                                "给音乐播放器用的逐行同步歌词，和 SRT/ASS 互不影响、可以同时要。\
+                                                 每行只有起始时间（LRC 格式本身没有结束时间）。",
+                                            )
+                                            .size(11.0)
+                                            .color(INK3),
+                                        );
+                                    }
                                     // 日文字幕只有兼容模式有原文可用：
                                     //   全量/精简走 Whisper 的 translate 任务（日语直接进、中文直接出），
                                     //   日文在模型内部就丢掉了 —— 想拿日文得再跑一次识别，
@@ -3471,6 +3505,8 @@ impl eframe::App for App {
                 let mut do_later = false;
                 let mut open_page = false;
                 let mut open_mirror: Option<String> = None;
+                // 环境包补丁的下载地址（用户点了补丁按钮才有值）
+                let mut patch_url: Option<String> = None;
 
                 let dl_active = self.downloading();
                 let (done_b, total_b) = *self.download_progress.lock().unwrap();
@@ -3517,6 +3553,73 @@ impl eframe::App for App {
                                     ui.label(RichText::new(&info.notes).size(12.5).color(INK2));
                                 });
                             ui.add_space(10.0);
+                        }
+
+                        // ★ 环境包补丁提示（v1.30 起）。
+                        //
+                        //   老用户装的是旧运行环境包，里面没有 Haas-ja 识别模型。
+                        //   只更新主程序的话会静默降级到 SenseVoice —— 程序能跑，
+                        //   但拿不到这次识别准确率的提升。所以这里明确提一句，
+                        //   并给一个 490 MB 的补丁包直链（全量环境包 12 GB，太重）。
+                        //
+                        //   只在「本地确实缺」时才提 —— 全新安装的用户环境包里
+                        //   已经带了这个模型，不该再被骚扰一遍。
+                        if let Some(patch) = info.runtime_patch.clone() {
+                            if updater::needs_runtime_patch(&self.work_dir) {
+                                ui.add_space(2.0);
+                                egui::Frame::new()
+                                    .fill(SUNK)
+                                    .corner_radius(8.0)
+                                    .stroke(Stroke::new(1.0, CARD_LINE))
+                                    .inner_margin(Margin {
+                                        left: 12,
+                                        right: 12,
+                                        top: 10,
+                                        bottom: 10,
+                                    })
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        ui.label(
+                                            RichText::new("还需要更新运行环境（推荐）")
+                                                .size(12.5)
+                                                .color(ACCENT_INK)
+                                                .family(FontFamily::Name("bold".into())),
+                                        );
+                                        ui.add_space(4.0);
+                                        let size = if patch.size_mb > 0 {
+                                            format!("约 {} MB", patch.size_mb)
+                                        } else {
+                                            String::new()
+                                        };
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "这一版换了日语识别模型（Haas-ja），识别更准，\
+                                                 但要额外装一个{}的补丁。\n\
+                                                 不装也能正常用，只是仍用旧模型。",
+                                                if size.is_empty() {
+                                                    String::new()
+                                                } else {
+                                                    format!(" {size} ")
+                                                }
+                                            ))
+                                            .size(11.5)
+                                            .color(INK2),
+                                        );
+                                        if !patch.notes.trim().is_empty() {
+                                            ui.add_space(2.0);
+                                            ui.label(
+                                                RichText::new(&patch.notes).size(11.0).color(INK3),
+                                            );
+                                        }
+                                        ui.add_space(6.0);
+                                        if pill(ui, "下载运行环境补丁", ACCENT_SOFT, ACCENT, ACCENT_INK, true)
+                                            .clicked()
+                                        {
+                                            patch_url = Some(patch.url.clone());
+                                        }
+                                    });
+                                ui.add_space(10.0);
+                            }
                         }
 
                         // 下载进度
@@ -3625,6 +3728,15 @@ impl eframe::App for App {
                     updater::open_url(updater::RELEASES_PAGE);
                 }
                 if let Some(u) = open_mirror {
+                    updater::open_url(&u);
+                }
+                // 环境包补丁：直接开浏览器下载。
+                //
+                // 为什么不复用上面的程序内下载：那条链路是「下完自动跑安装器」，
+                // 而补丁包需要用户先关掉正在运行的程序（它要往 model\ 里写 459MB），
+                // 自动安装容易撞上文件占用。交给浏览器 + 手动安装更稳。
+                if let Some(u) = patch_url {
+                    self.push_log("[更新] 已打开运行环境补丁的下载页");
                     updater::open_url(&u);
                 }
                 if do_later {

@@ -1,0 +1,33 @@
+# 兼容模式语音识别依赖（v1.30 起）
+#
+# 这个文件的作用：把「兼容模式到底依赖哪几个包、什么版本」写死。
+# 以前项目里没有依赖清单，全靠 env 里装了什么就是什么 —— 换机器重装
+# 时没人知道要装哪些、什么版本，出问题只能靠猜。
+#
+# ★ sherpa-onnx 必须锁死版本 ★
+#
+#   Haas-ja 的 ONNX 版是社区转换的，靠 sherpa-onnx 的 Parakeet-TDT 路径
+#   加载，依赖两个内部实现细节：
+#     · Kimi Delta Attention 状态被展平成 [2, B, 20480] 当 LSTM 状态传
+#     · 靠 encoder 元数据 url 里的 "tdt" 字样识别模型类型
+#   转换者自己在模型卡里写明：a future sherpa-onnx version could change。
+#
+#   所以这里用 == 而不是 >=。升级前必须先跑验证脚本：
+#       python _haas_test/bench_haas.py <样本.wav>
+#   确认识别结果没劣化再改这个版本号。
+#
+# 安装：
+#     env\python.exe -m pip install -r app\requirements-asr.txt
+
+sherpa-onnx==2.0.1
+
+# SenseVoice 回退路径要用的。Haas-ja 加载失败时自动回退到它，
+# 所以这两个不能省。
+funasr==1.4.16
+
+# Silero VAD（两个引擎共用，都在 light_asr.py 里切段）
+silero-vad
+
+# 读音频
+soundfile
+numpy

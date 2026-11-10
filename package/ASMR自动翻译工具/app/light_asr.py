@@ -1,7 +1,10 @@
-"""兼容模式 第2步：Silero VAD + SenseVoice 转写（全 CPU）。
+"""兼容模式 第2步：Silero VAD + 语音识别（全 CPU）。
 
 输入：0pre\\*.flac / *.wav / *.mp3 / *.m4a
 输出：2vad\\<名字>.json   [{start, end, text}, ...]
+
+识别引擎见 asr_engine.py：默认 Haas-ja-v1.0（日语专用），
+加载失败自动回退 SenseVoice，可用 ASMR_ASR_ENGINE 强制指定。
 
 为什么不用 pyannote：兼容模式面向没有可用 CUDA 的机器，
 pyannote 在 CPU 上很慢；Silero VAD 是 ONNX 小模型，毫秒级。
@@ -38,22 +41,11 @@ except Exception:
     pass
 
 import soundfile as sf
-from funasr import AutoModel
-from funasr.utils.postprocess_utils import rich_transcription_postprocess
-
-# SenseVoice 的 rich transcription 会把事件/情绪标签转换成 emoji：
-# <|BGM|> → 🎼、<|ANGRY|> → 😡 等。它们不是台词，送给翻译模型既无助于
-# 翻译，还会原样混进最终 SRT；兼容模式只保留真正的语音正文。
-_SENSEVOICE_MARKS = str.maketrans("", "", "🎼👏😀😭🤧😷😊😔😡😰🤢😮❓")
-
-
-def clean_sensevoice_marks(text):
-    # 当前 funasr 的 rich_transcription_postprocess 返回 str；保守兼容未来可能
-    # 返回 list/tuple 的版本，避免 `str(list)` 把 []、引号和逗号写进字幕。
-    if isinstance(text, (list, tuple)):
-        text = " ".join(map(str, text))
-    return " ".join(str(text).translate(_SENSEVOICE_MARKS).split())
 from silero_vad import get_speech_timestamps, load_silero_vad, read_audio
+
+# 识别引擎（Haas-ja 优先，失败回退 SenseVoice）。详见 asr_engine.py。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from asr_engine import load_engine
 
 # ── 数据目录前缀 ──
 #
@@ -78,11 +70,14 @@ if not files:
     sys.exit(1)
 
 print(f"兼容模式：{len(files)} 个音频")
-print("加载 Silero VAD + SenseVoice ...", flush=True)
+print("加载 Silero VAD + 语音识别模型 ...", flush=True)
 t0 = time.time()
 vad = load_silero_vad(onnx=True)
-asr = AutoModel(model=MODEL, device="cpu", disable_update=True)
-print(f"模型加载完成（{time.time() - t0:.1f}s）", flush=True)
+
+# ★ 识别引擎：默认 Haas-ja（实测最准），失败自动降级。
+#   具体策略和实测数据见 asr_engine.py 顶部注释。
+asr, _engine_note = load_engine(num_threads=4)
+print(f"模型加载完成（{time.time() - t0:.1f}s）— {_engine_note}", flush=True)
 
 os.makedirs(VAD_DIR, exist_ok=True)
 ok = 0
@@ -141,12 +136,9 @@ for idx, fp in enumerate(files, 1):
             os.close(fd)
             try:
                 sf.write(tmp, data[a:b], sr)
-                r = asr.generate(input=tmp, language="ja", use_itn=True)
-                text = clean_sensevoice_marks(
-                    rich_transcription_postprocess(
-                        r[0].get("text", "") if r else ""
-                    )
-                )
+                # 统一接口：Haas-ja / zipformer / SenseVoice 都实现 transcribe()
+                # （SenseVoice 内部的 cleaning 已在它自己的 transcribe 里做过）
+                text = asr.transcribe(tmp)
             finally:
                 try:
                     os.remove(tmp)

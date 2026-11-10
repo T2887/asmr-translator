@@ -1,8 +1,14 @@
 {
-  "version": "1.29.1",
-  "url": "https://github.com/T2887/asmr-translator/releases/download/v1.29.1/ASMR-Translator-Setup_v1.29.1.exe",
-  "page": "https://github.com/T2887/asmr-translator/releases/tag/v1.29.1",
-  "notes": "v1.29.1 更新内容：\n· 修复：已经封装过软字幕的视频，程序识别不出里面的字幕流，又跑了一遍。原因是字幕预检找不到 ffmpeg —— 运行环境包把 ffmpeg 放在 env\\ffmpeg\\，而程序只去根目录、ffmpeg\\、bin\\、env\\Scripts\\ 找，全都不存在\n· 修复：某些情况下「检出内封字幕」的结果被丢弃，文件照样被重新处理\n· 修复：画面里贴着最底边的字幕检测不出来（带区下边界只到画面 96%，把字幕切掉了）\n· 改进：检测到画面里疑似有硬字幕时，改为弹窗问你要不要继续生成，由你决定跳过还是处理\n· 修复：源文件被删除或移动后，队列里的旧路径会让整批处理中止；现在只跳过那一个文件，其余照常跑\n\n注意：本次只需更新主程序，运行环境包没变，不用重下。",
+  "version": "1.30.0",
+  "url": "https://github.com/T2887/asmr-translator/releases/download/v1.30.0/ASMR-Translator-Setup_v1.30.0.exe",
+  "page": "https://github.com/T2887/asmr-translator/releases/tag/v1.30.0",
+  "notes": "v1.30.0 更新内容：\n· 新增：兼容模式的语音识别换成 Haas-ja-v1.0（日语专用，615M 参数），识别准确率明显提升\n· 新增：可额外输出 LRC 歌词文件（.lrc），给音乐播放器显示同步歌词；和 SRT/ASS 互不影响，可同时要\n· 改进：识别引擎加载失败时自动降级到原引擎，不会因为模型问题导致跑不了\n\n实测对比（同一批素材）：\n  旧引擎 SenseVoice 在 120 秒街头对话里有多句整句崩坏（「早る時間」「順序で仕事を」等）\n  Haas-ja 全部识别正确，代价是识别环节慢约 2.4 倍（整个流程只慢 20% 左右，翻译仍走 Vulkan 加速）\n\n注意：这一版需要装「运行环境补丁」（约 490 MB）才能用上新识别模型。\n  不装也能正常跑，只是仍用旧模型。主程序会自己检测并在更新弹窗里给下载入口。\n  全新安装的用户如果装的是 v1.30.0 运行环境包，则不需要额外装补丁。",
+  "runtime_patch": {
+    "version": "1.30.0",
+    "url": "https://github.com/T2887/asmr-translator/releases/download/v1.30.0/ASMR-运行环境补丁_v1.30.0.exe",
+    "size_mb": 490,
+    "notes": "补上 Haas-ja 日语识别模型（459 MB）和 sherpa-onnx 运行库。装之前请先退出程序。"
+  },
   "mirrors": [
     {"name": "百度网盘", "url": "https://pan.baidu.com/s/1UrvC4AaxsV-BBJWOrTNUdg?pwd=c82t"},
     {"name": "夸克网盘", "url": "https://pan.quark.cn/s/42530f352af0?pwd=GHXq"}

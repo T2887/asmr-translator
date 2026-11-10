@@ -76,12 +76,14 @@ pub fn spawn(
     sub_fmt: srt::SubFmt,
     // 是否把字幕作为软字幕封装进原视频（v1.29）
     embed_soft: bool,
+    // 是否额外输出 .lrc 同步歌词（v1.30，给音乐播放器用）
+    want_lrc: bool,
 ) -> Worker {
     let (tx, rx) = channel::<Ev>();
     let cancel = CancellationToken::new();
     let token = cancel.clone();
     thread::spawn(move || {
-        run_all(tx, token, jobs, mode, copy_to_video, out_dir, sub_fmt, embed_soft);
+        run_all(tx, token, jobs, mode, copy_to_video, out_dir, sub_fmt, embed_soft, want_lrc);
     });
     Worker { cancel, rx }
 }
@@ -105,6 +107,7 @@ fn run_all(
     out_dir: String,
     sub_fmt: srt::SubFmt,
     embed_soft: bool,
+    want_lrc: bool,
 ) {
     let total = jobs.len();
     let n_stages = pipeline::stages(mode).len();
@@ -253,12 +256,13 @@ fn run_all(
         log(&tx, "=== 开始整理字幕 ===");
         logs(
             &tx,
-            pipeline::finalize_subtitles_opt(
+            pipeline::finalize_subtitles_lrc(
                 &[file.clone()],
                 copy_to_video,
                 &out_dir,
                 sub_fmt,
                 embed_soft,
+                want_lrc,
             ),
         );
         // 中间产物在下一个文件开始前清掉：磁盘上永远只有一个文件的中间产物

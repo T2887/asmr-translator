@@ -190,6 +190,61 @@ pub fn write_srt(path: &Path, cues: &[Cue]) -> Result<(), String> {
     std::fs::write(path, out).map_err(|e| format!("写不了 {}: {e}", path.display()))
 }
 
+// ─────────────────────── LRC（歌词格式） ───────────────────────
+
+/// LRC 时间戳：`[mm:ss.xx]`
+///
+/// 和 SRT 的 fmt_time 有三处不同，所以不能复用：
+///   · 没有小时段 —— LRC 只有分钟，超过 60 分钟就继续往上加分钟数
+///   · 小数点后两位（百分秒），SRT 是三位（毫秒）
+///   · 方括号包住单个起点，不是 `a --> b` 区间（LRC 只有起点，没有终点）
+pub fn fmt_lrc_time(t: f64) -> String {
+    let cs = (t.max(0.0) * 100.0).round() as u64; // 百分秒
+    let m = cs / 6000;
+    let s = (cs % 6000) / 100;
+    let cs = cs % 100;
+    format!("{m:02}:{s:02}.{cs:02}")
+}
+
+/// 写 LRC 文件（逐行同步歌词）。
+///
+/// 【为什么单独做一个开关，不塞进 SubFmt】
+///   SubFmt 是「给视频播放器用的字幕」三选一（srt / ass / 都要）。
+///   LRC 用途完全不同：给音乐播放器显示同步歌词，**且和字幕不冲突** ——
+///   同一批音频既可以出 .srt 也可以出 .lrc。
+///   所以它是独立的布尔开关（和「把字幕封装进原视频」同级）。
+///
+/// 【为什么只写起点不写终点】
+///   LRC 规范里一个时间戳标记「这句从此刻开始」，持续到下一个时间戳。
+///   信息量比 SRT 少，这是格式本身的限制，不是我们丢数据。
+///
+/// 【空文本跳过】
+///   空字幕后接空字幕会让播放器显示一段空白，观感差。
+///   直接跳过，让上一句多停留一会儿。
+pub fn write_lrc(path: &Path, cues: &[Cue]) -> Result<(), String> {
+    let mut out = String::new();
+
+    for c in cues {
+        let text = c.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        // LRC 是逐行的：字幕里的换行必须压成空格，
+        // 否则第二行没有时间戳，播放器会当非法行丢掉。
+        let one_line: String = text
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        out.push_str(&format!("[{}]{}\n", fmt_lrc_time(c.start), one_line));
+    }
+
+    std::fs::write(path, out).map_err(|e| format!("写不了 {}: {e}", path.display()))
+}
+
+
 // ─────────────────────── 字幕输出格式（SRT / ASS） ───────────────────────
 
 /// 输出字幕格式。三个选项互斥。
@@ -562,6 +617,77 @@ pub fn tidy_dir(srt_dir: &Path, app_dir: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// LRC 时间戳格式：`[mm:ss.xx]`，两位百分秒、无小时段。
+    #[test]
+    fn lrc_time_format() {
+        assert_eq!(fmt_lrc_time(0.0), "[00:00.00]".trim_matches(|c| c == '[' || c == ']'));
+        assert_eq!(fmt_lrc_time(1.23), "00:01.23");
+        assert_eq!(fmt_lrc_time(61.5), "01:01.50");
+        // 超过一小时：LRC 没有小时段，分钟继续往上加
+        assert_eq!(fmt_lrc_time(3725.0), "62:05.00");
+        // 负数不该 panic，夹到 0
+        assert_eq!(fmt_lrc_time(-5.0), "00:00.00");
+    }
+
+    /// write_lrc 的完整行为：只写起点、压平换行、跳过空文本。
+    #[test]
+    fn lrc_write_basic() {
+        let dir = std::env::temp_dir().join("asmr_lrc_test_basic");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("a.lrc");
+
+        let cues = vec![
+            Cue { start: 1.0, end: 3.0, text: "第一句".into() },
+            // 空文本必须被跳过 —— 否则播放器会显示一段空白
+            Cue { start: 3.0, end: 4.0, text: "   ".into() },
+            // 多行要压成一行，否则第二行没有时间戳会被当非法行
+            Cue {
+                start: 5.25,
+                end: 8.0,
+                text: "上半句\n下半句".replace("\\n", "\n"),
+            },
+        ];
+
+        write_lrc(&p, &cues).expect("写 LRC 不该失败");
+        let got = std::fs::read_to_string(&p).unwrap();
+
+        assert!(got.contains("[00:01.00]第一句"), "拿到: {got}");
+        assert!(got.contains("[00:05.25]上半句 下半句"), "换行没压平: {got}");
+        // 空文本那条不该出现
+        assert_eq!(got.lines().count(), 2, "空 cue 不该占一行: {got}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// LRC 每个时间戳都是起点、单调递增（和 SRT 的区间语义不同）。
+    #[test]
+    fn lrc_only_start_timestamps() {
+        let dir = std::env::temp_dir().join("asmr_lrc_test_mono");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("b.lrc");
+
+        let cues = vec![
+            Cue { start: 0.5, end: 2.0, text: "甲".into() },
+            Cue { start: 2.5, end: 5.0, text: "乙".into() },
+        ];
+        write_lrc(&p, &cues).unwrap();
+        let got = std::fs::read_to_string(&p).unwrap();
+
+        // 不该出现 SRT 那种 --> 区间
+        assert!(!got.contains("-->"), "LRC 里不该有 SRT 区间语法: {got}");
+
+        let ts: Vec<&str> = got
+            .lines()
+            .filter_map(|l| l.strip_prefix('[').and_then(|r| r.split(']').next()))
+            .collect();
+        assert_eq!(ts.len(), 2);
+        assert_eq!(ts[0], "00:00.50");
+        assert_eq!(ts[1], "00:02.50");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 
     /// ★ v1.29 方案B：ASS 内联标记必须被剥干净。
     ///
