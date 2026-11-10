@@ -53,11 +53,27 @@ AUTO_ORDER = ("haas", "sensevoice")
 # 可以手动指定、但不在自动链里的引擎
 MANUAL_ENGINES = ("haas", "zipformer", "sensevoice")
 
-# Haas-ja 量化版的目录（相对程序根目录）
-HAAS_DIR = os.path.join("model", "Haas-ja-v1.0")
+# ── 模型目录 ──
+#
+# ★ 用【相对脚本位置】的绝对路径，不依赖 cwd。
+#
+#   light_asr.py 里原来的 MODEL = os.path.join("model", "SenseVoiceSmall")
+#   是相对路径，靠 Rust 侧 .current_dir(work_dir) 命中。那种写法在
+#   「Rust 正常调用」时没问题，但两种情况会失效：
+#     · 命令行直接跑脚本（cwd 不在程序目录）
+#     · 将来有别的调用方忘了设 current_dir
+#   加载失败的表现是「模型缺失」，排查起来要绕一圈。
+#
+#   这里统一算成基于 __file__ 的绝对路径，放哪儿都能跑。
+#   （脚本在 <程序目录>\app\ 下，往上跳一层就是程序根）
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
 
-# SenseVoice 目录
-SENSEVOICE_DIR = os.path.join("model", "SenseVoiceSmall")
+# Haas-ja 量化版
+HAAS_DIR = os.path.join(_ROOT, "model", "Haas-ja-v1.0")
+
+# SenseVoice（回退用）
+SENSEVOICE_DIR = os.path.join(_ROOT, "model", "SenseVoiceSmall")
 
 # ★ sherpa-onnx 版本白名单。
 #
@@ -102,7 +118,7 @@ def haas_ready():
 #   所以两个都留着，用哪种交给配置文件决定。
 # ─────────────────────────────────────────────────────────────
 
-ZIPFORMER_DIR = os.path.join("model", "sherpa-onnx-zipformer-ja")
+ZIPFORMER_DIR = os.path.join(_ROOT, "model", "sherpa-onnx-zipformer-ja")
 
 # zipformer 的文件名带 epoch 后缀，所以按前缀匹配而不是写死全名
 ZIPFORMER_PREFIXES = ("encoder", "decoder", "joiner")
