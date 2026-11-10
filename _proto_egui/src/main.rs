@@ -88,13 +88,6 @@ struct App {
     /// 纯音频输入（.flac/.mp3）封装字幕没有意义，运行时会被跳过。
     embed_soft: bool,
     /// 额外产出一份 `.lrc` 同步歌词（`xxx.chs.lrc`）。
-    /// 默认关 —— 老用户升级后产物不变。
-    ///
-    /// 和 `sub_fmt` 是**正交**的：LRC 给音乐播放器显示歌词，
-    /// SRT/ASS 给视频播放器挂字幕，两个可以同时要。
-    /// ASMR 有大量纯音频（.flac/.mp3），那些用户只要歌词不要字幕，
-    /// 所以它必须是独立开关而不是格式三选一里的第四项。
-    want_lrc: bool,
     /// 点「开始处理」后正在后台扫「这个片子是不是已经自带字幕」。
     /// 扫描期间按钮显示「检查字幕…」且不可点。
     prechecking: bool,
@@ -249,7 +242,6 @@ impl Default for App {
             force_redo: false,
             sub_fmt: srt::SubFmt::Srt,
             embed_soft: false,
-            want_lrc: false,
             prechecking: false,
             precheck_rx: None,
             prechecked: false,
@@ -860,7 +852,6 @@ impl App {
             out,
             self.sub_fmt,
             self.embed_soft,
-            self.want_lrc,
         ));
     }
 
@@ -2739,6 +2730,7 @@ impl eframe::App for App {
                                         for (f, txt) in [
                                             (srt::SubFmt::Srt, "仅 SRT"),
                                             (srt::SubFmt::Ass, "仅 ASS"),
+                                            (srt::SubFmt::Lrc, "仅 LRC"),
                                             (srt::SubFmt::Both, "两个都要"),
                                         ] {
                                             if chip(ui, txt, self.sub_fmt == f, true).clicked()
@@ -2754,7 +2746,7 @@ impl eframe::App for App {
                                     });
                                     ui.label(
                                         RichText::new(
-                                            "ASS：黑体白字黑描边、底部居中；选「两个都要」会同时出 .srt 和 .ass",
+                                            "ASS：黑体白字黑描边、底部居中；LRC：给音乐播放器的逐行同步歌词。选「两个都要」会同时出 .srt 和 .ass",
                                         )
                                         .size(11.0)
                                         .color(INK3),
@@ -2774,30 +2766,6 @@ impl eframe::App for App {
                                             RichText::new(
                                                 "会额外生成一个「原文件名（软字幕）.mkv/mp4」，音视频不重编码、原文件不动；\
                                                  可在播放器里开关/换语言。纯音频（flac/mp3）无法封装，会自动跳过。",
-                                            )
-                                            .size(11.0)
-                                            .color(INK3),
-                                        );
-                                    }
-                                    // ★ v1.30：额外输出 LRC 同步歌词。
-                                    //
-                                    //   ASMR 有大量纯音频（.flac/.mp3），这些用户
-                                    //   往往不要字幕、只要歌词 —— 所以做成独立开关，
-                                    //   不占上面 SRT/ASS 三选一的位置。
-                                    ui.add_space(3.0);
-                                    if wcheck(ui, self.want_lrc, "额外输出 LRC 歌词（.lrc）").clicked()
-                                    {
-                                        self.want_lrc = !self.want_lrc;
-                                        self.push_log(format!(
-                                            "[设置] LRC 歌词输出：{}",
-                                            if self.want_lrc { "开" } else { "关" }
-                                        ));
-                                    }
-                                    if self.want_lrc {
-                                        ui.label(
-                                            RichText::new(
-                                                "给音乐播放器用的逐行同步歌词，和 SRT/ASS 互不影响、可以同时要。\
-                                                 每行只有起始时间（LRC 格式本身没有结束时间）。",
                                             )
                                             .size(11.0)
                                             .color(INK3),

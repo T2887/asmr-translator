@@ -262,6 +262,14 @@ pub enum SubFmt {
     Ass,
     /// 两个都出：播放器优先加载 ASS，SRT 留作备份/给不认 ASS 的软件
     Both,
+    /// 只出 .lrc 同步歌词。
+    ///
+    /// ★ v1.30 修正：原来 LRC 是个独立勾选框，可以和 SRT/ASS 同时输出。
+    ///   用户反馈这是错的 —— **要歌词的人就是只要歌词**，
+    ///   给他同时出 .srt/.ass/.lrc 三个文件既多余，播放器还可能
+    ///   把 .lrc 当字幕加载出乱子。
+    ///   所以改成和 SRT/ASS 一样是互斥的格式选项。
+    Lrc,
 }
 
 impl SubFmt {
@@ -273,11 +281,16 @@ impl SubFmt {
         matches!(self, SubFmt::Ass | SubFmt::Both)
     }
 
+    pub fn want_lrc(self) -> bool {
+        matches!(self, SubFmt::Lrc)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             SubFmt::Srt => "仅 SRT",
             SubFmt::Ass => "仅 ASS",
             SubFmt::Both => "SRT + ASS",
+            SubFmt::Lrc => "仅 LRC",
         }
     }
 }

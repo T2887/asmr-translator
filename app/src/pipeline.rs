@@ -558,26 +558,6 @@ pub fn finalize_subtitles_opt(
     fmt: crate::srt::SubFmt,
     embed_soft: bool,
 ) -> Vec<String> {
-    finalize_subtitles_lrc(files, copy_to_video, dest_dir, fmt, embed_soft, false)
-}
-
-/// 完整签名：再加一个「是否同时输出 LRC 歌词」的开关。
-///
-/// `want_lrc` 与 `fmt` / `embed_soft` 三者**两两正交**：
-///   · fmt      决定给视频播放器的字幕文件（srt / ass / 都要）
-///   · embed    决定要不要封装进视频容器
-///   · want_lrc 决定要不要额外给音乐播放器一份同步歌词
-///
-/// 为什么 LRC 不占 SubFmt 的选项位：它的用途是「音乐播放器显示歌词」，
-/// 和「视频挂字幕」不是二选一的关系 —— 同一批音频两个都出是正常需求。
-pub fn finalize_subtitles_lrc(
-    files: &[String],
-    copy_to_video: bool,
-    dest_dir: &str,
-    fmt: crate::srt::SubFmt,
-    embed_soft: bool,
-    want_lrc: bool,
-) -> Vec<String> {
     // 源目录永远是 3asr\（四个脚本把字幕生成在那儿，改不了）；
     // 目标目录才是用户可以改的那个。
     let src = config::dir_asr();
@@ -586,8 +566,10 @@ pub fn finalize_subtitles_lrc(
     } else {
         dest_dir.trim().to_string()
     };
-    finalize_subtitles_fmt(&src, &dst, files, copy_to_video, fmt, embed_soft, want_lrc)
+    finalize_subtitles_fmt(&src, &dst, files, copy_to_video, fmt, embed_soft)
 }
+
+
 
 /// 旧签名（只出 SRT）—— 单元测试走这条，语义就是「和加 ASS 之前完全一样」。
 #[cfg(test)]
@@ -603,7 +585,6 @@ fn finalize_subtitles_in(
         files,
         copy_to_video,
         crate::srt::SubFmt::Srt,
-        false,
         false,
     )
 }
@@ -621,9 +602,7 @@ fn finalize_subtitles_fmt(
     files: &[String],
     copy_to_video: bool,
     fmt: crate::srt::SubFmt,
-    embed_soft: bool,
-    want_lrc: bool,
-) -> Vec<String> {
+    embed_soft: bool) -> Vec<String> {
     let mut logs = Vec::new();
     // ASS 单独计数：「SRT 搬成功了、ASS 没写出来」不属于整个文件失败，
     // 混进 failed 里会让总结说假话。
@@ -793,7 +772,7 @@ fn finalize_subtitles_fmt(
         //   和 ASS 一样，必须在「搬走 / 删掉 SRT」之前做。
         // LRC 不影响 SRT 的去留（它只是额外产物），所以这里不用它的结果
         let mut _lrc_written = false;
-        if want_lrc {
+        if fmt.want_lrc() {
             let dst_lrc = format!(r"{dst_dir}\{stem}.{lang}.lrc");
             match crate::srt::read_srt(&path) {
                 Ok(cues) if !cues.is_empty() => {
@@ -918,7 +897,7 @@ fn finalize_subtitles_fmt(
     if fmt.want_ass() {
         summary.push_str(&format!("；ASS 生成 {ass_ok} 个、失败 {ass_bad} 个"));
     }
-    if want_lrc {
+    if fmt.want_lrc() {
         summary.push_str(&format!("；LRC 生成 {lrc_ok} 个、失败 {lrc_bad} 个"));
     }
     logs.push(summary);
@@ -1685,7 +1664,7 @@ mod tests {
             true,
             crate::srt::SubFmt::Ass,
             false,
-        false,);
+        );
 
         let ass = vid.join("第八集.chs.ass");
         assert!(ass.is_file(), "应生成 .chs.ass；日志: {logs:?}");
@@ -1718,7 +1697,7 @@ mod tests {
             true,
             crate::srt::SubFmt::Both,
             false,
-        false,);
+        );
 
         assert!(vid.join("第九集.chs.srt").is_file(), "SRT 也要在");
         assert!(vid.join("第九集.chs.ass").is_file(), "ASS 也要在");
@@ -1769,7 +1748,7 @@ mod tests {
             true,  // ★ 字幕直接放到视频旁边
             crate::srt::SubFmt::Srt,
             true,  // ★ 同时勾选软字幕
-        false,);
+        );
         for l in &logs {
             eprintln!("{l}");
         }
@@ -1854,7 +1833,7 @@ mod tests {
             true, // 放视频旁边
             crate::srt::SubFmt::Srt,
             true, // ★ 开启软字幕封装
-        false,);
+        );
         for l in &logs {
             eprintln!("{l}");
         }
