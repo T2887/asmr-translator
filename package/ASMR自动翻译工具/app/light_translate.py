@@ -373,7 +373,14 @@ def tidy_rows(rows):
 
 
 def main():
-    files = sorted(glob.glob(os.path.join(VAD_DIR, "*.json")))
+    # ★ 只取第2步（light_asr.py）产出的 <名>.json。
+    #   同一个文件如果先跑过全量模式，2vad\ 里还会留着 pyannote 的
+    #   <名>.vad.json —— 它的结构是 {"segments": [[a,b],...]}，
+    #   不是 [{start,end,text}]。原来一起 glob 进来后会先遍历到字典的
+    #   键名 'segments'，然后 r.get("text") 抛
+    #   AttributeError: 'str' object has no attribute 'get'。
+    files = [f for f in sorted(glob.glob(os.path.join(VAD_DIR, "*.json")))
+             if not f.endswith(".vad.json")]
     if not files:
         print(f"在 {VAD_DIR} 中没有找到转写结果（先跑第2步）")
         sys.exit(1)

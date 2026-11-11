@@ -20,6 +20,7 @@ SenseVoiceSmall 准得多 —— 120 秒街头对话样本里 SenseVoice 有 3 �
 绝对不能让用户因为换个模型就整个跑不了 —— 兼容模式面向的正是
 GTX10 系、核显、老机器这些最脆弱的场景。
 """
+import math
 import os
 import sys
 
@@ -117,6 +118,67 @@ def haas_ready():
 #   代价是模型小、理论上准确率不如 Haas-ja —— 但**实测说了算**，
 #   所以两个都留着，用哪种交给配置文件决定。
 # ─────────────────────────────────────────────────────────────
+# transducer 共用基类
+# ─────────────────────────────────────────────────────────────
+
+class _TransducerBase:
+    """transducer 引擎（Haas-ja / zipformer）共用逻辑。
+
+    sherpa-onnx 的离线 transducer 识别结果带三类有用信息，旧代码只取 text：
+      · text        —— 识别文本
+      · ys_log_probs —— 逐 token 的对数概率，exp(均值) 就是「置信度」
+      · timestamps   —— 逐 token 的起始时间（秒，相对本次输入音频）
+      · tokens       —— 逐 token 文本，配合 timestamps 可在长段内部切句
+
+    置信度是**过滤幻觉**的关键手段：实测纯环境音产生的幻觉
+    （「れる。」）置信度 0.40，而真实台词 0.88、真实拟声 0.77，
+    用 0.5 作门槛能滤掉幻觉又保住拟声。
+    """
+
+    def _decode(self, wav_path):
+        import soundfile as sf
+
+        samples, sr = sf.read(wav_path, dtype="float32")
+        if samples.ndim > 1:
+            samples = samples.mean(axis=1)
+        stream = self._rec.create_stream()
+        stream.accept_waveform(sr, samples)
+        self._rec.decode_stream(stream)
+        return stream.result
+
+    def transcribe(self, wav_path):
+        """返回识别出的文本（日文）。失败返回空串。"""
+        try:
+            return str(self._decode(wav_path).text).strip()
+        except Exception:
+            return ""
+
+    def transcribe_ex(self, wav_path):
+        """返回 {text, conf, tokens, timestamps}。
+
+        conf 是 exp(平均 log 概率)，0~1；空输出时给 0.0。
+        tokens/timestamps 用于在长段内部按停顿切句，长度不一定相等
+        （个别实现有 padding），调用方要按 min(len) 截断。
+        """
+        r = self._decode(wav_path)
+        text = str(r.text).strip()
+        lps = list(getattr(r, "ys_log_probs", None) or [])
+        if lps:
+            conf = math.exp(sum(lps) / len(lps))
+        else:
+            conf = 0.0
+        toks = list(getattr(r, "tokens", None) or [])
+        ts = list(getattr(r, "timestamps", None) or [])
+        n = min(len(toks), len(ts))
+        return {
+            "text": text,
+            "conf": conf,
+            "tokens": toks[:n],
+            "timestamps": [float(x) for x in ts[:n]],
+        }
+
+
+# ─────────────────────────────────────────────────────────────
 
 ZIPFORMER_DIR = os.path.join(_ROOT, "model", "sherpa-onnx-zipformer-ja")
 
@@ -154,7 +216,7 @@ def zipformer_ready():
     return ok and os.path.isfile(os.path.join(ZIPFORMER_DIR, "tokens.txt"))
 
 
-class ZipformerRecognizer:
+class ZipformerRecognizer(_TransducerBase):
     """sherpa-onnx 官方 zipformer-ja（标准 transducer，无 hack）。"""
 
     name = "zipformer-ja"
@@ -179,23 +241,8 @@ class ZipformerRecognizer:
             model_type="zipformer2",
         )
 
-    def transcribe(self, wav_path):
-        import soundfile as sf
 
-        samples, sr = sf.read(wav_path, dtype="float32")
-        if samples.ndim > 1:
-            samples = samples.mean(axis=1)
-        stream = self._rec.create_stream()
-        stream.accept_waveform(sr, samples)
-        self._rec.decode_stream(stream)
-        return str(stream.result.text).strip()
-
-
-# ─────────────────────────────────────────────────────────────
-# Haas-ja
-# ─────────────────────────────────────────────────────────────
-
-class HaasRecognizer:
+class HaasRecognizer(_TransducerBase):
     """Haas-ja-v1.0 包装。接口对齐下面 SenseVoiceRecognizer 的 transcribe()。"""
 
     name = "Haas-ja-v1.0"
@@ -225,18 +272,6 @@ class HaasRecognizer:
             # FastConformer 用 128 维 log-mel，不是 whisper 的 80
             feature_dim=128,
         )
-
-    def transcribe(self, wav_path):
-        """返回识别出的文本（日文）。失败返回空串。"""
-        import soundfile as sf
-
-        samples, sr = sf.read(wav_path, dtype="float32")
-        if samples.ndim > 1:
-            samples = samples.mean(axis=1)
-        stream = self._rec.create_stream()
-        stream.accept_waveform(sr, samples)
-        self._rec.decode_stream(stream)
-        return str(stream.result.text).strip()
 
 
 # ─────────────────────────────────────────────────────────────
