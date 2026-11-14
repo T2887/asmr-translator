@@ -100,6 +100,36 @@ def _resolve_model():
 
 MODEL = _resolve_model()
 
+# ── ASMR 领域 LoRA 适配器（v1.30.2）──────────────────────────
+# 用官方中文字幕对齐出的 1.2 万对日中句对微调（LoRA r16，Hy-MT2
+# 专属适配器）。held-out 作品实测：与官方字幕相似度 35%→42%，
+# 逐字相同 3→30 句。
+# ★ 只在 GPU（Vulkan）设备上启用：LoRA 的 delta 矩阵乘法在 CPU 上
+#   会把翻译拖慢约 2.4 倍，Vulkan 上只慢 24%（收益/代价比合适）。
+#   找不到文件 = 老环境包 → 自动不启用，行为与 v1.30.1 完全一致。
+LORA_MODEL = "hy-mt2-asmr-lora.gguf"
+_LORA_MIN_BYTES = 40 * 1024 * 1024   # 实际 77.6 MB，拦半截复制
+
+
+def _resolve_lora():
+    picked = os.environ.get("ASMR_TRANSLATE_LORA", "").strip()
+    if picked == "off":
+        return None
+    if picked and picked != "on":
+        cand = picked if os.path.isabs(picked) else os.path.abspath(
+            os.path.join("model", picked))
+    else:
+        cand = os.path.abspath(os.path.join("model", LORA_MODEL))
+    try:
+        if os.path.isfile(cand) and os.path.getsize(cand) >= _LORA_MIN_BYTES:
+            return cand
+    except OSError:
+        pass
+    return None
+
+
+LORA_PATH = _resolve_lora()
+
 SYSTEM = (
     "你是日译中字幕翻译。把用户给的日语翻译成简体中文，口语化、句子短促，"
     "只输出中文，不要保留日文，不要解释，译文必须是一行、不要换行。\n"
@@ -299,6 +329,22 @@ def translate(port, text, glossary):
     raise RuntimeError(last)
 
 
+def _sanitize_zh(s):
+    """切掉译文的控制串尾巴（v1.30.2）。
+
+    LoRA 的回合结束符是 hy 模板的私有 token，llama-server 的采样器
+    不一定把它登记成停止词 → 偶发漏出「<|...」或全角变体「＜｜...」。
+    日译中字幕里任何 < ／ ＜ 之后都不会是正文，从第一个出现处切掉。
+    """
+    s = (s or "").strip()
+    cut = len(s)
+    for mark in ("<", "＜"):
+        k = s.find(mark)
+        if 0 <= k < cut:
+            cut = k
+    return s[:cut].strip()
+
+
 def _translate_once(port, text, glossary, temp=0.1):
     system = SYSTEM
     if glossary:
@@ -313,6 +359,9 @@ def _translate_once(port, text, glossary, temp=0.1):
         "max_tokens": 320,
         "stream": False,
     }
+    if LORA_PATH:
+        # 双保险：让采样器在私有模板 token 前就停（server 认字面串）
+        payload["stop"] = ["<|hy_", "＜｜"]
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/v1/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
@@ -320,7 +369,7 @@ def _translate_once(port, text, glossary, temp=0.1):
     )
     with urllib.request.urlopen(req, timeout=120) as r:
         d = json.load(r)
-    return (d["choices"][0]["message"]["content"] or "").strip()
+    return _sanitize_zh(d["choices"][0]["message"]["content"])
 
 
 def fmt_time(t):
@@ -391,20 +440,28 @@ def main():
 
     port = free_port()
 
-    def start_server(device):
+    def start_server(device, use_lora):
+        cmd = [LLAMA, "--model", MODEL, "--host", "127.0.0.1", "--port", str(port),
+               "--device", device, "-c", "4096", "-np", "1", "--no-webui",
+               "--log-verbosity", "0"]
+        if use_lora and LORA_PATH:
+            # 加载失败宁可起不来走下面的 CPU 回退，也不静默丢增强
+            cmd += ["--lora", LORA_PATH]
         return subprocess.Popen(
-            [LLAMA, "--model", MODEL, "--host", "127.0.0.1", "--port", str(port),
-             "--device", device, "-c", "4096", "-np", "1", "--no-webui",
-             "--log-verbosity", "0"],
+            cmd,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=".",
             # CREATE_NO_WINDOW：否则翻译时会在屏幕上闪一个黑框
             creationflags=0x08000000,
         )
 
     dev, dev_name = pick_device()
+    use_lora = bool(LORA_PATH) and dev != "none"
+    if LORA_PATH:
+        print(f"[LoRA] 翻译增强适配器：{'启用（' + dev_name + '）' if use_lora else '已有但本次不启用（CPU 太慢）'}",
+              flush=True)
     print(f"[设备] 翻译使用：{dev_name}（{dev}）", flush=True)
     print(f"启动内置 llama.cpp（端口 {port}）...", flush=True)
-    proc = start_server(dev)
+    proc = start_server(dev, use_lora)
     try:
         if not wait_health(port, proc=proc):
             # 选中设备加载失败（显存不够 / OOM / 驱动问题）→ 回退 CPU 重试一次。
@@ -419,7 +476,8 @@ def main():
                 except Exception:
                     pass
             dev, dev_name = "none", "CPU"
-            proc = start_server("none")
+            use_lora = False   # CPU 回退不挂 LoRA（慢 2.4 倍）
+            proc = start_server("none", False)
             if not wait_health(port, proc=proc):
                 print("[失败] llama-server 启动超时")
                 sys.exit(1)

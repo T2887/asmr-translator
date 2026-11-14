@@ -206,6 +206,171 @@ def concat_by_segments(data, sr, segs):
     return np.concatenate(chunks, axis=0), lens
 
 
+def concat_by_segments_partial(path, sr_hint, segs, total_len):
+    """concat_by_segments 的分段读版本：不整段载入音频。
+
+    原来 read_audio 一次性把整段读进内存（2 小时 48k 立体声 float32
+    就是 1.3 GB），但这里其实只用得到 VAD 圈出的那 15%~40%。
+    soundfile 支持 start/stop 局部读，按段读再拼接，峰值内存只和
+    【语音总长】有关，和文件总长无关。
+
+    返回 (拼接数组, 每段样本数)，与 concat_by_segments 一致。
+    """
+    chunks = []
+    lens = []
+    for s, e in segs:
+        a = int(s * sr_hint)
+        b = min(int(e * sr_hint), total_len)
+        if b <= a:
+            lens.append(0)
+            continue
+        chunk, _sr = sf.read(path, start=a, stop=b, dtype="float32",
+                             always_2d=True)
+        lens.append(len(chunk))
+        chunks.append(chunk)
+    if not chunks:
+        return None, []
+    return np.concatenate(chunks, axis=0), lens
+
+
+def write_vocals_expanded(dst, segs, lens, sr, total_len, n_ch, voc_path):
+    """单批填回（保留旧签名，内部走多批核心）。"""
+    write_vocals_batches(dst, [(segs, lens, voc_path)], sr, total_len, n_ch)
+    return total_len
+
+
+def write_vocals_batches(dst, batches, sr, total_len, n_ch):
+    """把人声按 VAD 段填回原长度并【逐块写出】，不在内存里攒整段。
+
+    batches: [(该批段, 该批 lens, 该批人声 wav 路径), ...]，按时间顺序。
+
+    原来 expand_with_sr 会 np.zeros((total_len, ch)) —— 又是一份
+    和整段音频同样大的数组（2 小时 = 1.3 GB），加上 read 回来的
+    人声、sf.write 内部转换，三份叠着走。
+
+    这里改成：预开 PCM_16 输出，按段「读人声片段 → 写静音间隙 →
+    写本段」流式推进。峰值内存只和【单批语音长】有关，和文件总长无关。
+
+    语义与 expand_with_sr 完全一致：
+      · lens[i] == 0 的段跳过（不写内容，间隙自然由静音补齐）
+      · 段间重叠时后段覆盖前段已写内容（seek 回去重写）
+      · 声道数不符时复制或截断
+    批与批之间不重叠（plan_batches 保证），每批人声游标独立归零。
+    """
+    written = 0   # 输出里已写到的样本位置
+    with sf.SoundFile(dst, mode="w", samplerate=sr, channels=n_ch,
+                      subtype="PCM_16", format="WAV") as of:
+        for segs_i, lens_i, voc_path in batches:
+            info = sf.info(voc_path)
+            v_total = info.frames
+            if info.samplerate != sr:
+                # 人声文件只含【该批】语音段，整读重采样的开销只随批语音长
+                # 增长，可以接受 —— 要避免的是整段原音频（随文件总长增长）。
+                vd, vsr = sf.read(voc_path, dtype="float32", always_2d=True)
+                _idx = np.linspace(0, len(vd) - 1,
+                                   int(len(vd) / vsr * sr)).astype(np.int64)
+                vd = vd[_idx]
+                v_avail = len(vd)
+                vf = None
+            else:
+                vd = None
+                v_avail = v_total
+                vf = sf.SoundFile(voc_path, "r")
+            pos = 0   # 该批人声里的读取游标
+            try:
+                for (s, e), n in zip(segs_i, lens_i):
+                    if n <= 0:
+                        continue
+                    a = int(s * sr)
+                    b = min(a + n, total_len)
+                    n2 = min(b - a, v_avail - pos)
+                    if n2 <= 0:
+                        break
+                    if vf is None:
+                        chunk = vd[pos:pos + n2]
+                    else:
+                        vf.seek(pos)
+                        chunk = vf.read(n2, dtype="float32", always_2d=True)
+                    pos += n2
+                    if chunk.shape[1] != n_ch:
+                        if chunk.shape[1] == 1:
+                            chunk = np.repeat(chunk, n_ch, axis=1)
+                        else:
+                            chunk = chunk[:, :n_ch]
+                    chunk = np.ascontiguousarray(chunk)
+                    # 间隙补静音（先 seek 回已写末尾，再顺序写，避免跳跃写）
+                    if a > written:
+                        of.seek(written)
+                        of.write(np.zeros((a - written, n_ch), dtype="float32"))
+                        written = a
+                    # 重叠时 a < written：seek 回去覆盖，语义同旧版。
+                    # plan_batches 保证重叠段同批，跨批之间不会发生覆盖。
+                    of.seek(a)
+                    of.write(chunk)
+                    written = max(written, a + len(chunk))
+            finally:
+                if vf is not None:
+                    vf.close()
+        # 尾部补静音到原长度
+        if written < total_len:
+            of.seek(written)
+            of.write(np.zeros((total_len - written, n_ch), dtype="float32"))
+    return total_len
+
+
+def plan_batches(segs, avail_bytes):
+    """按可用提交额度决定分几批分离。
+
+    ★ v1.30.2 实测拟合（RTX 5070 同机、流式化之后，分离净增提交内存
+      vs 语音总长）：
+        语音   56.5s → 净增 5.70 GB
+        语音  534.5s → 净增 6.76 GB
+      斜率 ≈ 2.2 MB/s（语音），基线 ≈ 5.5 GB。
+      文件总长项（旧公式 1.2 MB/s × dur）已被「局部读 + 流式写」消掉。
+
+    进到这里时基线（模型 + CUDA 上下文）已经付掉了，批预算只算增量：
+        每批语音上限 = (还可提交 - 0.8 GB 安全余量) × 0.85 / 2.2 MB/s
+    额度充足时返回单批 —— 行为与不切完全一致。
+
+    重叠的 VAD 段强制同批：跨批重叠会让「后段覆盖前段」的语义失效。
+
+    ASMR_SEP_BATCH_SEC 环境变量可强制批上限（测试多批路径用）。
+    """
+    # ★ v1.30.2 修正：这里的 avail 是【文件处理时】的额度，而模型加载
+    #   （5.5 GB 基线）在批开始之前就已经付掉了 —— 预算不能再扣一次基线，
+    #   否则可用 7 GB 的机器会被算成只能放 0.7 GB 语音，明明分批能救
+    #   却被误杀。每批真正要预留的是：
+    #       该批语音 × 2.2 MB/s（分离内部张量，实测斜率）
+    #       + 0.5 GB 安全余量（拼接数组、flac 编解码缓冲）
+    #   批下限 60 秒：再切小每批固定开销占比过高，而且 BS-RoFormer
+    #   对 1~2 秒级音频本身会崩（见 MIN_SPEECH_SEC 注释）。
+    per_sec = 2.2 * 1024 * 1024
+    cap_sec = 0.0
+    if avail_bytes:
+        cap_sec = max(0.0, avail_bytes - int(0.5 * _GB)) / per_sec
+        cap_sec = max(cap_sec, 60.0)
+    try:
+        _forced = float(os.environ.get("ASMR_SEP_BATCH_SEC", "0"))
+        if _forced > 0:
+            cap_sec = _forced if cap_sec <= 0 else min(cap_sec, _forced)
+    except ValueError:
+        pass
+    total_speech = sum(e - a for a, e in segs)
+    if cap_sec <= 0 or total_speech <= cap_sec:
+        return [segs]
+    batches, cur, cur_len = [], [], 0.0
+    for s, e in segs:
+        L = e - s
+        overlap = bool(cur) and s < cur[-1][1]
+        if cur and not overlap and cur_len + L > cap_sec:
+            batches.append(cur)
+            cur, cur_len = [], 0.0
+        cur.append((s, e))
+        cur_len += L
+    if cur:
+        batches.append(cur)
+    return batches
+
 def expand_with_sr(vocals, segs, lens, sr, total_len, ch):
     out = np.zeros((total_len, ch), dtype="float32")
     pos = 0
@@ -331,120 +496,157 @@ for _idx, flac in enumerate(audio_files, 1):
         _skip.append(base)
         continue
     try:
-        data, sr = read_audio(flac)
-        dur = len(data) / sr
+        # ── 读原音频信息（不整段载入）──────────────────────────
+        # ★ v1.30.2：原来 read_audio 一次性读整段（2 小时 48k 立体声
+        #   float32 ≈ 1.3 GB 提交内存），但真正用到的只有 VAD 圈出的
+        #   15%~40%。改成只读 header，拼接时用 sf.read(start,stop)
+        #   局部读。配合下面「流式填回」，分离阶段的内存峰值不再
+        #   随文件总长增长（实测 33 分钟素材：净增 7.07 → 约 6 GB，
+        #   2 小时素材从 14 GB 降到 6 GB 出头）。
+        _ainfo = sf.info(flac)
+        sr = _ainfo.samplerate
+        total_len = _ainfo.frames
+        n_ch = _ainfo.channels
+        dur = total_len / sr
         print(f"  VAD: {len(segs)} 段 / {total_sec:.1f}s（占 {total_sec / dur * 100:.1f}%）")
 
-        merged, lens = concat_by_segments(data, sr, segs)
-        # ★ v1.27.2：整段音频（data）除了「总长度 / 声道数」之外就没用了。
-        #   先把这两个值记下来再释放 —— 80 分钟的 44.1k 立体声 float32
-        #   是 1.7 GB，不释放它会一直挂到函数结束，和下面 expand_with_sr
-        #   里再分配的同样大的数组叠在一起。注意：释放之后不能再碰 data，
-        #   下面一律用 total_len / n_ch（第一版忘了这一点，直接 NameError）。
-        total_len = len(data)
-        n_ch = data.shape[1]
-        del data
-        if merged is None or len(merged) == 0:
-            print("  [跳过] 没有可拼接的语音段")
-            _fail.append((base, "VAD 段全为空"))
-            continue
-
-        # 写临时拼接文件
-        tmp = os.path.join(tempfile.gettempdir(), f"_concat_{base}.flac")
-        write_flac(tmp, merged, sr)
-        _tmp_files.append(tmp)
-        print(f"  拼接: {len(merged) / sr:.1f}s → {os.path.basename(tmp)}")
-
         # ── v1.27.2：分离前先查可用内存 ────────────────────────
-        # 实测（RTX 5070 / GPU 加速 / 语音占比 30%）：
-        #   10 分钟音频 → 峰值 7.40 GB
-        #   40 分钟音频 → 峰值 13.86 GB
-        # 拟合：固定基线约 5.3 GB（模型 + PyTorch + 中间张量），
-        # 再按「每小时视频约 13 GB」线性增长。大头是整段音频读进内存
-        # （1 小时 44.1k 立体声 float32 就是 1.27 GB）加上分离后
-        # 填回原长度再分配一份同样大的数组。
-        # 不够就直接报错，别让它跑到一半 OOM（audio-separator 内部 OOM
-        # 时只打一行 ERROR 日志然后返回空列表，不抛异常）。
         # ★ v1.27.4：按「提交内存」判定，不再按物理内存。
-        #   实测（RTX 5070，44.1k/48k 立体声，语音密度约 30%）：
-        #     300 秒  → WS 1.91 GB / Commit 5.74 GB
-        #     900 秒  → WS 2.74 GB / Commit 6.66 GB
-        #    1800 秒  → WS 3.43 GB / Commit 7.45 GB
-        #    1615 秒  → WS 3.09 GB / Commit 7.06 GB
-        #   Commit 是 WS 的 2~3 倍 —— PyTorch/CUDA 大量 reserve 但不驻留，
-        #   判定能不能跑必须看 commit：Windows 上 malloc 失败
-        #   （DefaultCPUAllocator: not enough memory）几乎都是提交额度到顶，
-        #   物理内存不够只会换页变慢，不会分配失败。
-        #   拟合：5.5 GB 固定（模型 + CUDA 上下文）+ 每秒 1.2 MB
-        #   验算：300→5.85(实测5.74) 900→6.58(6.66) 1800→7.66(7.45) 均偏保守 5% 内
+        #   Windows 上 malloc 失败几乎都是提交额度到顶，物理不足只换页。
+        # ★ v1.30.2：流式化之后内存不再随【文件总长】增长，只随【语音总长】：
+        #     5.5 GB 固定（模型 + CUDA 上下文）+ 语音秒数 × 2.2 MB/s
+        #   （同机实测：语音 56.5s 净增 5.70 GB，语音 534.5s 净增 6.76 GB）
+        #   额度不够整跑时，plan_batches 会按额度分批 —— 每批峰值只和
+        #   该批语音长有关。只有连【一批最小 60 秒】都放不下时才报错跳过。
         _phys, _commit = _memory_status()
         # 只看提交额度。物理不足 → 系统换页（只是慢）；提交不足 → 直接 malloc 失败。
         _avail = _commit or _phys
+        _batches = plan_batches(segs, _avail)
+        _max_batch = max(sum(e - a for a, e in b) for b in _batches)
         if _avail:
-            _need = int(5.5 * 1024 ** 3 + dur * 1.2 * 1024 ** 2)
+            # 基线已付，这里只算单批增量 + 安全余量
+            _need = int(_max_batch * 2.2 * 1024 * 1024 + 0.5 * _GB)
             if _avail < _need:
-                print(f"  [失败] 内存不足：需要约 {_need / 1024 ** 3:.1f} GB 提交额度，"
-                      f"当前只能再拿到 {_avail / 1024 ** 3:.1f} GB")
-                print(f"        （{dur / 60:.0f} 分钟音频：分离固定要 5.5 GB，"
-                      f"再按每秒 1.2 MB 递增）")
+                print(f"  [失败] 内存不足：需要约 {_need / _GB:.1f} GB 提交额度，"
+                      f"当前只能再拿到 {_avail / _GB:.1f} GB")
+                print(f"        （{dur / 60:.0f} 分钟音频、其中语音 {total_sec / 60:.1f} 分钟，"
+                      f"已按额度切成 {len(_batches)} 批仍放不下）")
                 if _commit and _commit < _need:
                     print("        拦你的是「提交内存」而不是物理内存 ——")
                     print("        多半是虚拟内存（页文件）设得太小或被关闭了。")
                     print("        修法：此电脑→属性→高级系统设置→性能设置→高级→"
                           "虚拟内存→改成「系统管理的大小」或手工 32768 MB，重启后再试。")
-                print("        也可以改用兼容模式（不需要人声分离，内存需求约 1~2 GB）")
-                _fail.append((base, f"内存不足（需 {_need / 1024 ** 3:.1f} GB，"
-                                    f"有 {_avail / 1024 ** 3:.1f} GB）"))
+                print("        也可以改用兼容模式（不需要人声分离，内存需求约 2~3 GB）")
+                _fail.append((base, f"内存不足（需 {_need / _GB:.1f} GB，"
+                                    f"有 {_avail / _GB:.1f} GB）"))
                 continue
 
-        with Heartbeat(f"人声分离 {base}"):
-            voc_files = separator.separate(tmp)
-
-        voc = [f for f in voc_files if "Vocals" in f]
-        if not voc:
-            # ★ v1.27.2：走到这里不是「短音频」—— 真正短的在上游
-            #   total_sec < MIN_SPEECH_SEC 就被拦掉了。返回空列表只可能是
-            #   模型内部失败，最常见的是内存不足。必须记为失败，否则
-            #   _fail 为空 → 退出码 0 → 界面显示「完成」但没有任何字幕。
-            print("  [失败] 分离没有产出人声（常见原因：内存不足或模型加载失败）")
-            _fail.append((base, "分离未产出人声（可能内存不足）"))
-            continue
-        # 分离结果现在落在临时目录
-        vt = voc[0]
-        voc_path = vt if os.path.isabs(vt) else os.path.join(tempfile.gettempdir(), vt)
-        if os.path.isfile(voc_path):
-            _tmp_files.append(voc_path)
-        # Instrumental 也一并删掉（我们只要人声）
-        for f in voc_files:
-            if "Instrumental" in f:
-                it = f if os.path.isabs(f) else os.path.join(tempfile.gettempdir(), f)
-                if os.path.isfile(it):
-                    _tmp_files.append(it)
-
-        vd, vsr = read_audio(voc_path)
-        if vsr != sr:
-            import numpy as _np
-            idx = _np.linspace(0, len(vd) - 1, int(len(vd) / vsr * sr))
-            vd = vd[idx.astype(int)]
-        print(f"  人声: {len(vd) / sr:.1f}s")
-
-        full = expand_with_sr(vd, segs, lens, sr, total_len, n_ch)
-
-        # 命名保持和原来一致（下游靠文件名找）
         stem = os.path.splitext(os.path.basename(flac))[0]
         dst = os.path.join(config["path"]["audio"],
                            f"{stem}_(Vocals)_model_bs_roformer_ep_317_sdr_12.wav")
-        sf.write(dst, full, sr, subtype="PCM_16")
-        print(f"  填回原长度: {len(full) / sr:.1f}s → {os.path.basename(dst)}")
+
+        if len(_batches) == 1:
+            # ── 单批：行为与旧版一致 ──
+            # ★ merged 数组在闸【之后】才分配：闸不过的文件不该再为它
+            #   冒 OOM 风险（语音 2 小时 = 1.7 GB float32）。
+            merged, lens = concat_by_segments_partial(flac, sr, segs, total_len)
+            if merged is None or len(merged) == 0:
+                print("  [跳过] 没有可拼接的语音段")
+                _fail.append((base, "VAD 段全为空"))
+                continue
+            tmp = os.path.join(tempfile.gettempdir(), f"_concat_{base}.flac")
+            write_flac(tmp, merged, sr)
+            _tmp_files.append(tmp)
+            del merged
+            print(f"  拼接: {sum(lens) / sr:.1f}s → {os.path.basename(tmp)}")
+
+            with Heartbeat(f"人声分离 {base}"):
+                voc_files = separator.separate(tmp)
+
+            voc = [f for f in voc_files if "Vocals" in f]
+            if not voc:
+                # ★ v1.27.2：走到这里不是「短音频」—— 真正短的在上游
+                #   total_sec < MIN_SPEECH_SEC 就被拦掉了。返回空列表只可能是
+                #   模型内部失败，最常见的是内存不足。必须记为失败，否则
+                #   _fail 为空 → 退出码 0 → 界面显示「完成」但没有任何字幕。
+                print("  [失败] 分离没有产出人声（常见原因：内存不足或模型加载失败）")
+                _fail.append((base, "分离未产出人声（可能内存不足）"))
+                continue
+            vt = voc[0]
+            voc_path = vt if os.path.isabs(vt) else os.path.join(tempfile.gettempdir(), vt)
+            if os.path.isfile(voc_path):
+                _tmp_files.append(voc_path)
+            # Instrumental 也一并删掉（我们只要人声）
+            for f in voc_files:
+                if "Instrumental" in f:
+                    it = f if os.path.isabs(f) else os.path.join(tempfile.gettempdir(), f)
+                    if os.path.isfile(it):
+                        _tmp_files.append(it)
+
+            _vi = sf.info(voc_path)
+            print(f"  人声: {_vi.frames / _vi.samplerate:.1f}s")
+            write_vocals_expanded(dst, segs, lens, sr, total_len, n_ch, voc_path)
+        else:
+            # ── 多批：拼接文件按批写，批批分离，流式填回 ──
+            print(f"  内存不足整跑，按额度分 {len(_batches)} 批分离"
+                  f"（每批语音约 {sum(e - a for a, e in _batches[0]):.0f}s）")
+            batch_args = []
+            ok_all = True
+            for bi, bsegs in enumerate(_batches):
+                blens = []
+                bchunks = []
+                for s, e in bsegs:
+                    a = int(s * sr)
+                    b2 = min(int(e * sr), total_len)
+                    if b2 <= a:
+                        blens.append(0)
+                        continue
+                    ch_, _sr2 = sf.read(flac, start=a, stop=b2, dtype="float32",
+                                        always_2d=True)
+                    blens.append(len(ch_))
+                    bchunks.append(ch_)
+                if not bchunks:
+                    batch_args.append((bsegs, blens, None))
+                    continue
+                bmerged = np.concatenate(bchunks, axis=0)
+                del bchunks
+                btmp = os.path.join(tempfile.gettempdir(), f"_concat_{base}_b{bi}.flac")
+                write_flac(btmp, bmerged, sr)
+                _tmp_files.append(btmp)
+                del bmerged
+                with Heartbeat(f"人声分离 {base}（批 {bi + 1}/{len(_batches)}）"):
+                    voc_files = separator.separate(btmp)
+                voc = [f for f in voc_files if "Vocals" in f]
+                if not voc:
+                    print(f"  [失败] 批 {bi + 1}/{len(_batches)} 没有产出人声"
+                          f"（常见原因：内存不足）")
+                    ok_all = False
+                    break
+                vt = voc[0]
+                voc_path = (vt if os.path.isabs(vt)
+                            else os.path.join(tempfile.gettempdir(), vt))
+                # 立刻改名：下一批的输入文件名不同，输出不会撞名，但改名更稳
+                vdst = os.path.join(tempfile.gettempdir(), f"_voc_{base}_b{bi}.wav")
+                _shutil_disk.copyfile(voc_path, vdst)
+                _tmp_files.append(voc_path)
+                if os.path.isfile(voc_path):
+                    _tmp_files.append(vdst)
+                for f in voc_files:
+                    if "Instrumental" in f:
+                        it = f if os.path.isabs(f) else os.path.join(tempfile.gettempdir(), f)
+                        if os.path.isfile(it):
+                            _tmp_files.append(it)
+                batch_args.append((bsegs, blens, vdst))
+            if not ok_all:
+                _fail.append((base, "分批分离未产出人声（可能内存不足）"))
+                continue
+            write_vocals_batches(dst, [x for x in batch_args if x[2] is not None],
+                                 sr, total_len, n_ch)
+            _vi_total = sum(sf.info(x[2]).frames for x in batch_args if x[2])
+            print(f"  人声: {_vi_total / sr:.1f}s（{len(batch_args)} 批）")
+
+        print(f"  填回原长度: {total_len / sr:.1f}s → {os.path.basename(dst)}")
         _ok.append(base)
-
-        # 删掉临时拼接文件
-        try:
-            if os.path.isfile(voc_path) and tmp.lower() in voc_path.lower():
-                pass
-        except Exception:
-            pass
-
     except Exception as e:
         # 单个文件分离异常（模型限制/文件损坏）→ 记为失败，但不中止整批。
         # 只有「整批一个都没产出 且 存在失败」时才让退出码变 1（文件末尾判断）。

@@ -239,8 +239,15 @@ for idx, fp in enumerate(files, 1):
         segs = get_speech_timestamps(
             wav16, vad, sampling_rate=16000,
             min_speech_duration_ms=300,
-            min_silence_duration_ms=600,
+            # ★ v1.30.2 VAD 放宽（79 条音频 × 5 组参数网格实测）：
+            #   阈值 0.5→0.35、静音切分 600→400ms，能把官方字幕里
+            #   「听得到但没圈进语音段」的漏检从 28.2% 提到 31.5%，
+            #   识别时长只 +4%。再放宽（0.3/300ms）只多救 3 个点，
+            #   却开始圈喘息/水声 —— 幻觉由置信度闸（MIN_CONF）兜底，
+            #   不值得再冒。
+            min_silence_duration_ms=400,
             speech_pad_ms=120,
+            threshold=0.35,
             max_speech_duration_s=10,
         )
         segs = merge_segments(segs)
