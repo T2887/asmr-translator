@@ -104,3 +104,6 @@ _lora/
 _ndk/
 _ocr/
 _sv/
+
+# 本地工具（BaiduPCS-Go 等二进制，含登录态配置）
+_tools/
