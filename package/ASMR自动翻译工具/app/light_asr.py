@@ -59,6 +59,7 @@ from silero_vad import get_speech_timestamps, load_silero_vad, read_audio
 # 识别引擎（Haas-ja 优先，失败回退 SenseVoice）。详见 asr_engine.py。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from asr_engine import load_engine
+from events import emit
 
 # ── 数据目录前缀 ──
 #
@@ -78,6 +79,11 @@ EXTS = (".flac", ".wav", ".mp3", ".m4a", ".aac", ".ogg")
 
 # ── 补扫参数（全部经真实素材实测调整，改动前请重跑 _haas_test） ──
 VAD_PAD_SEC = 0.45      # VAD 段前后外扩，补回被边界切掉的音节（不重叠）
+# ★ v1.30.3：单条字幕的最大时长。
+#   ASMR-VAD 在长对话上会判出「连续语音」的超长段（实测最长 64 秒），
+#   一句字幕持续 64 秒在播放器上等于一直不换行。12 秒是「一屏能读完、
+#   又不至于切得太碎」的经验值（与 whisper 的 30s 窗口、字幕阅读速度都兼容）。
+MAX_SEG_SEC = 12.0
 MIN_HOLE_SEC = 6.0      # 空白区间至少这么长才值得补扫
 SCAN_WIN = 6.0          # 补扫窗口长度；10 秒太粗，时间戳误差会大到无法定位
 SCAN_EDGE = 0.35        # 补扫窗口与 VAD 段边界保持的距离，避免重复识别
@@ -94,9 +100,32 @@ if not files:
     sys.exit(1)
 
 print(f"兼容模式：{len(files)} 个音频")
-print("加载 Silero VAD + 语音识别模型 ...", flush=True)
+print("加载 VAD + 语音识别模型 ...", flush=True)
 t0 = time.time()
-vad = load_silero_vad(onnx=True)
+
+# ★ v1.30.3：ASMR 专用 VAD（约 500h 日文 ASMR 训练，标签含 whispered-speech）
+#   替代原 Silero。实测数据见下面 segs 处的注释。
+#   回退策略是【自动】的：模型缺失或加载异常 → 静默用回 Silero，
+#   不让用户因为一个可选模型跑不起来。不提供环境变量开关。
+vad = load_silero_vad(onnx=True)          # 兜底 + 回退路径用
+asmr_vad = None
+_vp = ""
+for _name in ("vad_asmr_encdec.onnx", "asmr_vad.onnx", "model.onnx"):
+    _cand = os.path.join("model", _name)
+    if os.path.isfile(_cand):
+        _vp = _cand
+        break
+if _vp:
+    try:
+        from asmr_vad import AsmrVad
+        asmr_vad = AsmrVad(_vp, threads=4)
+        print(f"  VAD: ASMR 专用（{os.path.basename(_vp)}）", flush=True)
+    except Exception as _e:
+        print(f"  VAD: ASMR 加载失败（{type(_e).__name__}: {_e}），"
+              f"自动回退 Silero", flush=True)
+        asmr_vad = None
+else:
+    print("  VAD: 未找到 ASMR VAD，自动回退 Silero", flush=True)
 
 # ★ 识别引擎：默认 Haas-ja（实测最准），失败自动降级。
 #   具体策略和实测数据见 asr_engine.py 顶部注释。
@@ -132,6 +161,34 @@ def merge_segments(segs, gap_sec=0.6, max_sec=10.0):
         else:
             merged.append({"start": s["start"], "end": s["end"]})
     return merged
+
+
+def split_long_segments(segs, max_sec=12.0):
+    """把过长的语音段强制切开（v1.30.3）。
+
+    ★ 为什么必须切：实测 ASMR 素材上 ASMR-VAD 会判出「连续语音」的
+      超长段 —— 最长 64.2 秒（真实对话里有换气和停顿，但没到 VAD 的
+      静音阈值），561 条里有 23 条 >12 秒。
+
+    后果有两层：
+      1. 识别引擎按段送，超长段一次性出几十个字，字幕一屏放不下
+      2. 一句字幕持续 64 秒，播放器上等于「一直不换行」
+
+    切法：段内若已有更细的静音边界（不做二次 VAD，省算力），
+    没有就按 ceil(时长/max_sec) 均分 —— 均分点落在词中间的概率不高，
+    而且比「一句 64 秒」好得多。
+    """
+    out = []
+    for a, b in segs:
+        dur = b - a
+        if dur <= max_sec:
+            out.append((a, b))
+            continue
+        n = int(dur // max_sec) + 1
+        step = dur / n
+        for k in range(n):
+            out.append((a + k * step, min(a + (k + 1) * step, b)))
+    return out
 
 
 def pad_segments(segs, pad, dur):
@@ -236,29 +293,61 @@ for idx, fp in enumerate(files, 1):
         wav16 = read_audio(fp, sampling_rate=16000)
         dur = len(wav16) / 16000.0
 
-        segs = get_speech_timestamps(
-            wav16, vad, sampling_rate=16000,
-            min_speech_duration_ms=300,
-            # ★ v1.30.2 VAD 放宽（79 条音频 × 5 组参数网格实测）：
-            #   阈值 0.5→0.35、静音切分 600→400ms，能把官方字幕里
-            #   「听得到但没圈进语音段」的漏检从 28.2% 提到 31.5%，
-            #   识别时长只 +4%。再放宽（0.3/300ms）只多救 3 个点，
-            #   却开始圈喘息/水声 —— 幻觉由置信度闸（MIN_CONF）兜底，
-            #   不值得再冒。
-            min_silence_duration_ms=400,
-            speech_pad_ms=120,
-            threshold=0.35,
-            max_speech_duration_s=10,
-        )
-        segs = merge_segments(segs)
-        seg_sec = [(s["start"] / 16000.0, s["end"] / 16000.0) for s in segs]
+        if asmr_vad is not None:
+            # ★ v1.30.3：ASMR 专用 VAD（约 500h 日文 ASMR 训练，标签含
+            #   whispered-speech）。PC 实测（3 素材各 10 分钟，同 ASR，
+            #   唯一变量是 VAD）：
+            #     CER  31.4% → 25.8%（-5.6 点）
+            #     命中率 65.8% → 70.1%（+4.3 点）
+            #   三个素材方向一致，速度基本持平（185s vs 190s）。
+            #   段数更少更整（78~84 vs 127~128），碎片更少。
+            #   模型缺失/加载失败时 asmr_vad 为 None，自动走下面 Silero 分支。
+            _sec = asmr_vad.segments(
+                wav16, threshold=0.5, min_speech=0.3,
+                min_silence=0.4, pad=0.0, normalize=True)
+            seg_sec = [(a, b) for a, b in _sec]
+            _vad_name = "ASMR-VAD"
+        else:
+            segs = get_speech_timestamps(
+                wav16, vad, sampling_rate=16000,
+                min_speech_duration_ms=300,
+                # ★ v1.30.2 VAD 放宽（79 条音频 × 5 组参数网格实测）：
+                #   阈值 0.5→0.35、静音切分 600→400ms，能把官方字幕里
+                #   「听得到但没圈进语音段」的漏检从 28.2% 提到 31.5%，
+                #   识别时长只 +4%。再放宽（0.3/300ms）只多救 3 个点，
+                #   却开始圈喘息/水声 —— 幻觉由置信度闸（MIN_CONF）兜底，
+                #   不值得再冒。
+                min_silence_duration_ms=400,
+                speech_pad_ms=120,
+                threshold=0.35,
+                max_speech_duration_s=10,
+            )
+            segs = merge_segments(segs)
+            seg_sec = [(s["start"] / 16000.0, s["end"] / 16000.0) for s in segs]
+            _vad_name = "Silero"
+
+        # ★ v1.30.3：先切超长段（>12s），再外扩。
+        #   顺序很重要：先外扩会把本来 11 秒的段推到 12+ 秒，
+        #   而且外扩后相邻段边界更近，再切容易切错。
+        _n_long = sum(1 for a, b in seg_sec if b - a > 12.0)
+        seg_sec = split_long_segments(seg_sec, MAX_SEG_SEC)
+        if _n_long:
+            print(f"  [切分] {_n_long} 条超长段已切开（上限 {MAX_SEG_SEC:.0f}s）")
         seg_sec = pad_segments(seg_sec, VAD_PAD_SEC, dur)
 
         covered = sum(b - a for a, b in seg_sec)
-        print(f"  VAD {len(seg_sec)} 段，覆盖 {covered:.1f}s "
+        print(f"  VAD[{_vad_name}] {len(seg_sec)} 段，覆盖 {covered:.1f}s "
               f"({covered / max(0.1, dur) * 100:.1f}%)", flush=True)
 
         rows = []
+        # ★ v1.30.3：段进度（借鉴安卓版设计）。
+        #   为什么需要：ASR 阶段一跑十几分钟，界面只知道"在第2步"，
+        #   用户看到进度条不动会以为卡死。这里按段打点，输出
+        #   已处理段数/总段数 + 每分钟处理几段 + 预计剩余，
+        #   同时用 @@EV@@ 让界面能读（协议见 events.py）。
+        _n_total = len([1 for a, b in seg_sec if b - a >= 0.15])
+        _t_seg0 = time.time()
+        _done = 0
         for a, b in seg_sec:
             if b - a < 0.15:
                 continue
@@ -269,6 +358,16 @@ for idx, fp in enumerate(files, 1):
                     "end": round(b, 2),
                     "text": res["text"],
                 })
+            # ★ 段进度：每 20 段或最后一段打点（每段都打会把日志刷爆）
+            _done += 1
+            if _done % 20 == 0 or _done == _n_total:
+                _el = time.time() - _t_seg0
+                _spm = _done / max(0.01, _el) * 60.0      # 每分钟处理几段
+                _left = (_n_total - _done) / max(0.001, _spm) if _spm > 0 else 0
+                print(f"    识别 {_done}/{_n_total} 段"
+                      f"（{_done / max(1, _n_total) * 100:.0f}%）"
+                      f"  {_spm:.1f} 段/分  剩约 {_left:.0f} 分", flush=True)
+                emit("segs", _done, _n_total, round(_spm, 2), int(_left))
 
         # ── 漏段补扫 ──
         holes = scan_holes(seg_sec, dur, MIN_HOLE_SEC)

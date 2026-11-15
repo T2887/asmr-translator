@@ -1244,6 +1244,16 @@ pub fn run_stage(
     // 最后一条字幕的结束时间（秒，原始音频时间轴）。
     // 第4步用它算真实进度，见 ui 侧的 recompute_progress。
     sub_end: Arc<Mutex<f64>>,
+    // ★ v1.30.3：设备测速结果（兼容模式第3步开跑前测）。
+    //   由 worker 转成 UI 事件，界面据此弹窗问用户「要不要改用纯 CPU」。
+    bench: Arc<Mutex<Option<(String, f64, f64, bool, String)>>>,
+    // ★ v1.30.3：运行时状态行（模型 tok/s · CPU 占用 · 实时频率）。
+    //   和 bench 分开：状态是持续刷新的，bench 是一次性的。
+    stat: Arc<Mutex<String>>,
+    // ★ v1.30.3：段进度（识别/翻译 已处理/总数 · 段每分 · 剩余分）。
+    //   独立通道 —— 段进度每 20 段才一条，和每 0.3 秒一条的字幕行
+    //   共用 latest 会被瞬间覆盖（实测就是这样丢的）。
+    segs: Arc<Mutex<String>>,
 ) -> StageResult {
     let (_, script, _) = stages(mode)[stage - 1];
     let marker = ready_marker(mode, stage);
@@ -1258,7 +1268,6 @@ pub fn run_stage(
     //
     //   每个阶段开跑前都设一次，保证切换模式后立刻生效。
     backend::set_lite_mode(mode == RunMode::Lite);
-
     // ★ 纯 Rust 阶段（不 spawn Python）：v1.21 起字幕整理走这里。
     //   日志行直接产出，进度/ETA 不参与（整理只要几十毫秒）。
     if let Some(kind) = script.strip_prefix("rust:") {
@@ -1290,6 +1299,9 @@ pub fn run_stage(
     let frac2 = Arc::clone(&frac);
     let eta2 = Arc::clone(&eta);
     let sub2 = Arc::clone(&sub_end);
+    let bench2 = Arc::clone(&bench);
+    let stat2 = Arc::clone(&stat);
+    let segs2 = Arc::clone(&segs);
 
     let code = backend::run_script(
         &config::python_exe(),
@@ -1302,8 +1314,11 @@ pub fn run_stage(
             //   不引入新的进度/ETA 算法 —— 事件只是同一份数据更可靠的
             //   来源，正则继续兜底。事件行不进日志、不当"当前动作"。
             if let Some(ev) = line.strip_prefix("@@EV@@ ") {
-                let mut parts = ev.splitn(4, '|');
-                if parts.next() == Some("sub") {
+                // 7 段 = kind + 最多 6 个字段。bench 有 6 个字段（advice 可能
+                // 含 '|'，放最后一段就不会被切碎），segs 只用到前 5 个。
+                let mut parts = ev.splitn(7, '|');
+                let kind = parts.next().unwrap_or("");
+                if kind == "sub" {
                     let _start = parts.next();
                     if let Some(end_s) = parts.next() {
                         if let Ok(end) = end_s.trim().parse::<f64>() {
@@ -1314,9 +1329,61 @@ pub fn run_stage(
                             }
                         }
                     }
+                    return;
                 }
-                // progress 事件预留：当前 tqdm 通道已经够用，
-                // 等事件在几个版本里验证稳定后再接。
+                if kind == "segs" {
+                    // ★ v1.30.3：段进度 segs|done|total|段每分|剩余分
+                    //   ★ 必须走【独立通道】—— 段进度每 20 段才输出一条，
+                    //   而字幕行动辄每 0.3 秒一条，共用 latest 会被瞬间覆盖，
+                    //   界面上根本看不到（实测就是这样丢的）。
+                    let done = parts.next().and_then(|s| s.trim().parse::<u32>().ok());
+                    let total = parts.next().and_then(|s| s.trim().parse::<u32>().ok());
+                    let spm = parts.next().and_then(|s| s.trim().parse::<f64>().ok());
+                    let left = parts.next().and_then(|s| s.trim().parse::<u32>().ok());
+                    if let (Some(d), Some(t)) = (done, total) {
+                        let txt = format!(
+                            "{} {d}/{t} 段（{:.0}%）· {:.1} 段/分 · 剩约 {} 分",
+                            if stage == 2 { "识别" }
+                            else if stage == 3 { "翻译" }
+                            else { "处理" },
+                            d as f64 / t.max(1) as f64 * 100.0,
+                            spm.unwrap_or(0.0),
+                            left.unwrap_or(0)
+                        );
+                        if let Ok(mut v) = segs2.lock() {
+                            *v = txt;
+                        }
+                    }
+                    return;
+                }
+                if kind == "stat" {
+                    // ★ v1.30.3：运行时状态 stat|<整行文本>
+                    //   模型 tok/s + CPU 占用 + 实时频率，由 status_probe
+                    //   采集后直接给一行成品文字，界面显示在「当前动作」下。
+                    let txt = parts.next().unwrap_or("").to_string();
+                    if !txt.is_empty() {
+                        if let Ok(mut v) = stat2.lock() {
+                            *v = txt;
+                        }
+                    }
+                    return;
+                }
+                if kind == "bench" {
+                    // ★ v1.30.3：设备测速结果 bench|prefer|cpu_ms|vk_ms|need|advice
+                    //   写进共享槽，由 worker 转成 UI 事件（弹窗询问用户）。
+                    let prefer = parts.next().unwrap_or("").to_string();
+                    let cpu_ms = parts.next().and_then(|s| s.trim().parse::<f64>().ok())
+                        .unwrap_or(0.0);
+                    let vk_ms = parts.next().and_then(|s| s.trim().parse::<f64>().ok())
+                        .unwrap_or(0.0);
+                    let need = parts.next().map(|s| s.trim() == "1").unwrap_or(false);
+                    let advice = parts.next().unwrap_or("").to_string();
+                    if let Ok(mut b) = bench2.lock() {
+                        *b = Some((prefer, cpu_ms, vk_ms, need, advice));
+                    }
+                    return;
+                }
+                // 其它事件（progress 等）暂不处理
                 return;
             }
 

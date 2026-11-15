@@ -105,6 +105,16 @@ struct App {
     /// 实测它会把白床单的片子误判成有字幕（abf-207），那种情况下直接跳过
     /// 等于把用户要处理的文件静默吃掉了。让用户自己决定更稳妥。
     pending_sub_ask: Option<Vec<(String, String)>>,
+    /// ★ v1.30.3：弹窗「刚打开」的帧不渲染，下一帧再画。
+    ///
+    /// 为什么需要：egui::Modal 在【第一次打开的那一帧】，遮罩
+    /// （backdrop_color）已经画出来了，但弹窗内容还没完成布局 ——
+    /// 实测用户会看到一整块纯黑的矩形闪一下，然后才出现弹窗正文。
+    /// 四个弹窗（恢复队列 / 硬字幕 / 测速 / CPU 警告）都有这个现象。
+    ///
+    /// 解法：置 true 表示"下一帧才开始画"，渲染时先清掉它并跳过这一帧。
+    /// 代价是不可见的一帧（16ms），换来没有黑闪。
+    dialog_warmup: bool,
     /// 用户在上一个弹窗里选了「仍然处理」。下次点开始不再重复问同一批文件。
     asked_and_continue: bool,
     /// 额外生成一份日文字幕（`<视频名>.jpn.srt`）。只有兼容模式能开 ——
@@ -176,6 +186,30 @@ struct App {
     pending_idx: usize,
     /// 是否正在显示「恢复上次的队列？」弹窗
     show_restore_dialog: bool,
+    /// ★ v1.30.3：测速发现「核显比纯 CPU 慢」时，弹窗问用户要不要切换。
+    /// Some((纯CPU毫秒, 核显毫秒, 说明文字)) = 有待确认的测速结果（弹窗开着）
+    ///
+    /// 为什么需要这个弹窗：1.8B 这种小模型在核显上反而更慢（实测本机：
+    /// 纯 CPU 1388ms/句 vs 核显 2752ms/句，慢 2 倍）。用户不知道这件事，
+    /// 只会觉得「这软件怎么这么卡」。实测比推断可靠，所以开跑前实测一次，
+    /// 用数据说服用户，并让他自己决定。
+    bench_prompt: Option<(f64, f64, String)>,
+    /// 用户选了「换成纯 CPU」/「保持核显」→ 记下来别再问。
+    force_cpu_device: bool,
+    /// ★ v1.30.3：测速弹窗的倒计时终点。
+    ///
+    ///   为什么要倒计时：弹窗一出现，翻译脚本就在原地等用户的结论
+    ///   （默认最多 20 秒，见 light_translate.py 的 _await_bench_choice）。
+    ///   用户不点的话任务就一直停着 —— 超时自动选更快的那个，
+    ///   既不卡住流程，也不让他错过「纯 CPU 更快」这个建议。
+    bench_deadline: Option<std::time::Instant>,
+    /// ★ v1.30.3：运行时状态行（模型 tok/s · CPU 占用 · 实时频率）。
+    /// 由 status_probe 采集、随 Tick 事件送来；空串表示还没有数据。
+    runtime_stat: String,
+    /// ★ v1.30.3：段进度（识别/翻译 已处理/总数 · 段每分 · 剩余分）。
+    /// 独立于 current_action —— 后者是字幕行，每 0.3 秒刷一次，
+    /// 会把每 20 段才输出一次的段进度冲掉（实测丢过）。
+    seg_progress: String,
     stage: usize,
     done_stages: usize,
     stage_frac: f64,
@@ -247,6 +281,7 @@ impl Default for App {
             prechecked: false,
             skip_note: std::collections::HashMap::new(),
             pending_sub_ask: None,
+            dialog_warmup: false,
             asked_and_continue: false,
             jpn_sub: false,
             jpn_separate: false,
@@ -287,6 +322,11 @@ impl Default for App {
             pending_queue: Vec::new(),
             pending_idx: 0,
             show_restore_dialog: false,
+            bench_prompt: None,
+            force_cpu_device: false,
+            bench_deadline: None,
+            runtime_stat: String::new(),
+            seg_progress: String::new(),
             stage: 0,
             done_stages: 0,
             stage_frac: 0.0,
@@ -730,6 +770,20 @@ impl App {
             // 还在扫：等它，别抢先开跑（否则等于没检测）
             if self.precheck_rx.is_some() {
                 self.push_log("[预检] 还在检查字幕，请稍候…");
+                // ★ v1.30.3：必须主动请求重绘。
+                //
+                //   实测症状：点「开始处理」后整个窗口黑一下。
+                //   根因不是弹窗 —— 预检在后台线程里跑 ffmpeg 抽帧
+                //   （每文件最多 16 帧、约 6~10 秒），这期间 UI 每帧只是
+                //   push_log 然后 return，【没有任何 repaint 请求】。
+                //   egui 在没有重绘请求时不重画，而本程序是
+                //   with_decorations(false) + Acrylic 的透明窗口 ——
+                //   DWM 在长时间不提交新帧时会把合成层露出黑底，
+                //   用户看到的就是「点一下，黑一下」。
+                //
+                //   修复做在 ui() 末尾的全局重绘条件里（把 precheck_rx
+                //   加了进去）；这里不能直接 request_repaint —— start()
+                //   作用域里没有 ctx（它是 ui() 的局部变量）。
                 return;
             }
             if !self.prechecked {
@@ -845,6 +899,8 @@ impl App {
                 && self.jpn_separate
                 && matches!(self.mode, RunMode::Compat),
         );
+        // ★ 测速弹窗的选择同步到后端（决定翻译脚本用不用 Vulkan）
+        backend::set_force_cpu(self.force_cpu_device);
         self.worker = Some(worker::spawn(
             jobs,
             self.mode,
@@ -1374,10 +1430,18 @@ impl App {
                     self.tqdm_ema = 0.0;
                     self.last_raw_remain = -1.0;
                 }
-                worker::Ev::Tick { frac, eta, latest } => {
+                worker::Ev::Tick { frac, eta, latest, stat, segs } => {
                     self.stage_frac = frac;
                     if !latest.is_empty() {
                         self.current_action = latest.clone();
+                    }
+                    // ★ v1.30.3：运行时状态（模型 tok/s · CPU · 频率）
+                    if !stat.is_empty() {
+                        self.runtime_stat = stat;
+                    }
+                    // ★ v1.30.3：段进度（独立通道，不会被字幕行覆盖）
+                    if !segs.is_empty() {
+                        self.seg_progress = segs;
                     }
                     // 第 2 步的日志里有本文件的语音时长（`VAD: 72 段 / 201.3s（占 67.1%）`）。
                     // 分离和识别的耗时都正比于【语音时长】而不是音频总长，
@@ -1419,6 +1483,25 @@ impl App {
                         "[完成] 第{stage}步，退出码 {code}，本步用时 {:.1} 秒",
                         secs
                     ));
+                }
+                worker::Ev::Bench { prefer, cpu_ms, vulkan_ms, need_prompt, advice } => {
+                    // ★ v1.30.3：测速结果。只在「建议切 CPU 且差距明显」时才
+                    //   弹窗打扰用户 —— 其余情况只写日志。
+                    self.push_log(format!(
+                        "[测速] 纯 CPU {:.0} ms/句 · 核显 {:.0} ms/句",
+                        cpu_ms, vulkan_ms
+                    ));
+                    if need_prompt && prefer == "cpu" && !self.force_cpu_device {
+                        self.bench_prompt = Some((cpu_ms, vulkan_ms, advice));
+                        self.bench_deadline = Some(
+                            std::time::Instant::now()
+                                + std::time::Duration::from_secs(BENCH_WAIT_SEC),
+                        );
+                    } else if need_prompt {
+                        // 不弹窗也要立刻把结论写下去 —— 脚本正等着这个文件，
+                        // 不写它就会白等满 20 秒才开始。
+                        bench_write_choice(if prefer == "cpu" { "cpu" } else { "vulkan" });
+                    }
                 }
                 worker::Ev::Preview(lines) => {
                     // 累积而不是替换：一个文件可能分几步吐字幕（兼容模式第 3 步、
@@ -1532,9 +1615,36 @@ impl App {
         // ★ egui 是即时模式：没有输入就不会重新跑 ui()，也就不会调 pump()。
         //   只要还有后台活儿（设备检测 / 流水线事件），就必须主动请求重绘，
         //   否则结果永远收不到，界面就卡在「正在检测设备…」。
-        if self.running || self.device_rx.is_some() || self.worker.is_some() {
+        //   ★ v1.30.3：precheck_rx 必须一起算进来。
+        //
+        //     实测症状：点「开始处理」后整个窗口黑一下，然后才出弹窗。
+        //     根因就在这里 —— 预检在后台线程里跑 ffmpeg 抽帧（每文件最多
+        //     16 帧、6~10 秒），这期间 running/worker 都还是空，于是
+        //     一次 repaint 都不请求；egui 即时模式不重绘，而本程序是
+        //     with_decorations(false) + Acrylic 的透明窗口 ——
+        //     DWM 在长时间没有新帧提交时露出合成层黑底。
+        //
+        //     把 precheck_rx 加进条件后，预检期间每 120ms 有一帧，
+        //     窗口始终有内容，黑闪消失。
+        if self.running
+            || self.device_rx.is_some()
+            || self.worker.is_some()
+            || self.precheck_rx.is_some()
+            // ★ v1.30.3：显存刷新也必须算进来。
+            //
+            //   实测症状：点「开始处理」后日志停在
+            //     [显存] 正在刷新当前空余显存…
+            //   就再也没有下文，任务根本起不来，界面一直显示「排队中」。
+            //
+            //   原因链：start() → 刷显存 → 返回；pump() 收到结果后置
+            //   pending_start_after_vram、再调一次 start()；可那次 start()
+            //   发现 pending 已被清掉，于是又刷一次显存 —— 而这时
+            //   running/precheck/worker 全是空，没有任何 repaint 请求，
+            //   egui 不重绘 → pump() 不再执行 → 第二个结果永远没人取
+            //   → 按钮点了没反应。
+            || self.vram_refresh_rx.is_some()
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
-
         }
     }
 }
@@ -1548,6 +1658,32 @@ impl App {
 ///
 /// 用 `ctx.input` 直接判断而不是铺 Area：Area 会挡住它下面控件的点击，
 /// 而边缘热区本身不需要参与 egui 的交互系统。
+/// 测速弹窗的倒计时秒数。
+///
+/// ★ 必须**明显短于** `light_translate.py` 的默认等待（22 秒）。
+///   两边都设 20 秒时实测是打平：脚本 20:57:00.0 超时判负，界面
+///   20:57:00.x 才写完结论文件，用户点什么都白搭。留 7 秒余量，
+///   保证「界面先决定 → 脚本后兜底」的顺序永远成立。
+const BENCH_WAIT_SEC: u64 = 15;
+
+/// 把用户（或超时）的测速结论写给翻译脚本。
+///
+/// `light_translate.py::_await_bench_choice` 每 200ms 读一次这个文件，
+/// 读到 cpu / vulkan 就继续跑；读不到就等，最多等到它自己那边的超时。
+/// 放在数据目录下，和 `_file_queue.txt` 同一个地方。
+fn bench_write_choice(v: &str) {
+    let dir = config::data_dir();
+    let p = std::path::Path::new(&dir).join("_bench_choice.txt");
+    // 只写第一次。阶段结束时流水线会重新解析一遍本阶段的输出，测速事件
+    // 因此会**重复到达一次**（实测日志里出现两条一样的 `[测速] 纯 CPU …`）；
+    // 第二次再写会把「超时兜底」覆盖成「用户选择」，日志解释就错了。
+    // 脚本每轮开始前会先删掉这个文件，所以「已存在」一定属于同一轮。
+    if p.exists() {
+        return;
+    }
+    let _ = std::fs::write(&p, v);
+}
+
 fn resize_hotspots(ctx: &egui::Context) {
     use egui::{CursorIcon, ResizeDirection};
 
@@ -3275,6 +3411,19 @@ impl eframe::App for App {
                             progress_bar(ui, self.progress, w);
                             ui.add_space(10.0);
                             ui.label(RichText::new("当前动作").size(11.0).color(INK3));
+                            // ★ v1.30.3：段进度放在最上面（比字幕行重要）——
+                            //   用户最想知道「还要多久」，而不是「刚翻完哪句」。
+                            if self.running && !self.seg_progress.is_empty() {
+                                ui.add(
+                                    Label::new(
+                                        RichText::new(&self.seg_progress)
+                                            .size(12.5)
+                                            .color(INK),
+                                    )
+                                    .truncate(),
+                                );
+                                ui.add_space(1.0);
+                            }
                             if !self.current_action.is_empty() {
                                 ui.add(
                                     Label::new(
@@ -3284,6 +3433,20 @@ impl eframe::App for App {
                                 );
                             } else if self.running {
                                 ui.label(RichText::new("启动中…").size(12.0).color(INK3));
+                            }
+                            // ★ v1.30.3：运行时状态（模型 tok/s · CPU 占用 · 频率）
+                            //   用户能据此判断「到底是卡住了还是在干活」。
+                            //   只在跑批且有数据时显示，空闲时不占地方。
+                            if self.running && !self.runtime_stat.is_empty() {
+                                ui.add_space(2.0);
+                                ui.add(
+                                    Label::new(
+                                        RichText::new(&self.runtime_stat)
+                                            .size(11.5)
+                                            .color(ACCENT_INK),
+                                    )
+                                    .truncate(),
+                                );
                             }
                         });
                     });
@@ -3336,7 +3499,15 @@ impl eframe::App for App {
         //   · 把白床单/白椅子误判成字幕（abf-207，其实没字幕）
         //   · 漏掉贴着画面最底边的字幕（SONE-961，其实有字幕）
         // 与其自作主张跳过你真正想处理的文件，不如让你看一眼。
+        //
+        // ★ v1.30.3：预热机制。egui::Modal 第一次打开的那一帧只画遮罩、
+        //   不画内容（内容还没完成布局），用户看到的是整块纯黑矩形闪一下。
+        //   实测点「开始处理」后立刻黑一下就是这个原因。
+        //   这里在首次打开时跳过一帧，第二帧才真正渲染，黑闪消失。
         if self.pending_sub_ask.is_some() {
+            if !self.dialog_warmup {
+                self.dialog_warmup = true;
+            } else {
             let items = self.pending_sub_ask.clone().unwrap_or_default();
             let mut choice_skip = false;
             let mut choice_go = false;
@@ -3458,6 +3629,11 @@ impl eframe::App for App {
                 self.push_log("[预检] 已取消，本次不处理");
                 self.pending_sub_ask = None;
             }
+            }   // ← dialog_warmup 的 else 块结束
+        }
+        // 弹窗没开时清掉预热标志，下次打开重新预热
+        if self.pending_sub_ask.is_none() {
+            self.dialog_warmup = false;
         }
 
         // ── 「发现新版本」弹窗 ──
@@ -3790,6 +3966,121 @@ impl eframe::App for App {
             }
             if do_clear {
                 self.clear_queue_all();
+            }
+        }
+
+        // ── 测速弹窗：核显比纯 CPU 慢时询问是否切换 ──
+        //
+        // 为什么值得打扰用户一次：1.8B 小模型在核显上反而更慢
+        // （实测 1388ms vs 2752ms）。用户不知道这件事，只会觉得
+        // "这软件怎么这么卡"。实测数据比推断可靠，所以开跑前测一次，
+        // 用数字说服，让他自己决定。
+        if let Some((_cpu_ms, _vk_ms, advice)) = self.bench_prompt.clone() {
+            let mut do_switch = false;
+            let mut do_keep = false;
+            // 倒计时：到点还没点就自动切到更快的纯 CPU。
+            let remain = self
+                .bench_deadline
+                .map(|d| d.saturating_duration_since(std::time::Instant::now()))
+                .unwrap_or_default();
+            let deadline_on = self.bench_deadline.is_some();
+            let remain_secs = remain.as_secs() + if remain.subsec_millis() > 0 { 1 } else { 0 };
+            if deadline_on && remain.is_zero() {
+                do_switch = true;
+            }
+            egui::Modal::new(egui::Id::new("bench_modal"))
+                .backdrop_color(Color32::from_rgba_unmultiplied(0x1f, 0x1e, 0x1d, 96))
+                .frame(
+                    Frame::new()
+                        .fill(CARD)
+                        .corner_radius(12.0)
+                        .inner_margin(Margin::same(20))
+                        .stroke(Stroke::new(1.0, CARD_LINE))
+                        .shadow(Shadow {
+                            offset: [0, 10],
+                            blur: 30,
+                            spread: 0,
+                            color: Color32::from_rgba_unmultiplied(0x1f, 0x1e, 0x1d, 40),
+                        }),
+                )
+                .show(&ctx, |ui| {
+                    ui.set_width(420.0);
+                    ui.label(
+                        RichText::new("核显比纯 CPU 更慢")
+                            .size(18.0)
+                            .color(INK)
+                            .family(FontFamily::Name("bold".into())),
+                    );
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "{advice}。"
+                        ))
+                        .size(13.5)
+                        .color(INK),
+                    );
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(
+                            "为什么：这个模型参数不多，核显每算一点都要把模型数据从内存\
+                             搬过去，搬运的开销超过了核显本身省下的时间。模型越大核显才越\
+                             占优势，这种小模型往往是纯 CPU 更快。",
+                        )
+                        .size(12.5)
+                        .color(INK2),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(
+                            "要转换成纯 CPU 推理吗？切换后可能省下不少时间，\
+                             具体取决于你的素材长度分布。",
+                        )
+                        .size(12.5)
+                        .color(INK3),
+                    );
+                    if deadline_on {
+                        ui.add_space(10.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "{remain_secs} 秒后自动切换到纯 CPU（更快）。"
+                            ))
+                            .size(12.0)
+                            .color(ACCENT_DEEP),
+                        );
+                    }
+                    ui.add_space(16.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        if pill(ui, "换成纯 CPU（更快）", ACCENT_DEEP, ACCENT_DEEP,
+                                Color32::WHITE, true).clicked()
+                        {
+                            do_switch = true;
+                        }
+                        if pill(ui, "继续用核显", CARD, CARD_LINE, INK2, true).clicked() {
+                            do_keep = true;
+                        }
+                    });
+                });
+            if do_switch {
+                // 点按钮和超时都走这里：用后缀区分，脚本的日志才不会
+                // 把「超时兜底」写成「按你的选择」。
+                bench_write_choice(if self.bench_deadline.is_some() {
+                    "cpu:auto"
+                } else {
+                    "cpu"
+                });
+                self.force_cpu_device = true;
+                backend::set_force_cpu(true);
+                self.bench_prompt = None;
+                self.bench_deadline = None;
+                self.push_log("[测速] 已切换到纯 CPU（本次立即生效）");
+            }
+            if do_keep {
+                bench_write_choice("vulkan");
+                self.force_cpu_device = true;   // 记住「别再问」
+                self.bench_prompt = None;
+                self.bench_deadline = None;
+                self.push_log("[测速] 保持核显");
             }
         }
 

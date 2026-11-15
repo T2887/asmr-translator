@@ -32,6 +32,10 @@ pub enum Ev {
         frac: f64,
         eta: f64,
         latest: String,
+        /// ★ v1.30.3：运行时状态行（模型 tok/s · CPU 占用核数 · 实时频率）
+        stat: String,
+        /// ★ v1.30.3：段进度（识别/翻译 已处理/总数 · 段每分 · 剩余分）
+        segs: String,
     },
     StageDone {
         stage: usize,
@@ -39,6 +43,17 @@ pub enum Ev {
         secs: f64,
     },
     Preview(Vec<String>),
+    /// ★ v1.30.3：设备测速结果。
+    /// (prefer, cpu_ms, vulkan_ms, need_prompt, advice)
+    ///   prefer      = "cpu" / "vulkan" / ""
+    ///   need_prompt = 是否值得弹窗问用户（只有差距明显时才建议打扰）
+    Bench {
+        prefer: String,
+        cpu_ms: f64,
+        vulkan_ms: f64,
+        need_prompt: bool,
+        advice: String,
+    },
     FileStart {
         idx: usize,
         total: usize,
@@ -147,6 +162,13 @@ fn run_all(
         let frac: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
         let eta: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
         let sub_end: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
+        // ★ v1.30.3：设备测速结果槽
+        let bench: Arc<Mutex<Option<(String, f64, f64, bool, String)>>> =
+            Arc::new(Mutex::new(None));
+        // ★ v1.30.3：运行时状态行（模型 tok/s · CPU · 频率）
+        let stat: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        // ★ v1.30.3：段进度（独立通道，避免被高频字幕行覆盖）
+        let segs: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
 
         let mut failed = false;
         for stage in 1..=n_stages {
@@ -156,6 +178,11 @@ fn run_all(
             let title = pipeline::stages(mode)[stage - 1].2;
             let _ = tx.send(Ev::StageStart(stage));
             log(&tx, format!("--- {title} ---"));
+
+            // 每阶段开跑前清空测速槽，避免上一阶段的结果误触发弹窗
+            if let Ok(mut b) = bench.lock() {
+                *b = None;
+            }
 
             let t0 = Instant::now();
             let res = run_one_stage(
@@ -167,9 +194,38 @@ fn run_all(
                 Arc::clone(&frac),
                 Arc::clone(&eta),
                 Arc::clone(&sub_end),
+                Arc::clone(&bench),
+                Arc::clone(&stat),
+                Arc::clone(&segs),
                 &tx,
             );
             let secs = t0.elapsed().as_secs_f64();
+
+            // ★ 阶段结束后检查测速结果，转成 UI 事件
+            if let Ok(b) = bench.lock() {
+                if let Some((prefer, cpu_ms, vk_ms, need, advice)) = b.clone() {
+                    let _ = tx.send(Ev::Bench {
+                        prefer,
+                        cpu_ms,
+                        vulkan_ms: vk_ms,
+                        need_prompt: need,
+                        advice,
+                    });
+                }
+            }
+            // ★ v1.30.3：段进度/状态行在阶段结束时也补发一次 ——
+            //   阶段中途 Tick 已经实时发过，这里避免最后一条丢失。
+            {
+                let sg = segs.lock().map(|s| s.clone()).unwrap_or_default();
+                let st = stat.lock().map(|s| s.clone()).unwrap_or_default();
+                let _ = tx.send(Ev::Tick {
+                    frac: frac.lock().map(|x| *x).unwrap_or(0.0),
+                    eta: 0.0,
+                    latest: String::new(),
+                    stat: st,
+                    segs: sg,
+                });
+            }
 
             let r: StageResult = match res {
                 Some(r) => r,
@@ -294,23 +350,30 @@ fn run_one_stage(
     frac: Arc<Mutex<f64>>,
     eta: Arc<Mutex<f64>>,
     sub_end: Arc<Mutex<f64>>,
+    bench: Arc<Mutex<Option<(String, f64, f64, bool, String)>>>,
+    stat: Arc<Mutex<String>>,
+    segs: Arc<Mutex<String>>,
     tx: &Sender<Ev>,
 ) -> Option<StageResult> {
     let slot: Arc<Mutex<Option<StageResult>>> = Arc::new(Mutex::new(None));
     let slot2 = Arc::clone(&slot);
 
     // 这些 Arc 主循环还要继续读（轮询进度），所以进线程前先 clone 一份
-    let (live_t, ready_t, frac_t, eta_t, sub_end_t) = (
+    let (live_t, ready_t, frac_t, eta_t, sub_end_t, bench_t, stat_t, segs_t) = (
         Arc::clone(&live),
         Arc::clone(&ready),
         Arc::clone(&frac),
         Arc::clone(&eta),
         Arc::clone(&sub_end),
+        Arc::clone(&bench),
+        Arc::clone(&stat),
+        Arc::clone(&segs),
     );
 
     let h = thread::spawn(move || {
         let out = pipeline::run_stage(
             mode, stage, token, live_t, ready_t, frac_t, eta_t, sub_end_t,
+            bench_t, stat_t, segs_t,
         );
         if let Ok(mut s) = slot2.lock() {
             *s = Some(out);
@@ -318,10 +381,28 @@ fn run_one_stage(
     });
 
     let mut last_seen = String::new();
+    // ★ v1.30.3：测速结果要【边跑边发】，不能等阶段结束 ——
+    //   翻译阶段一跑三十多分钟，等结束时才弹窗等于永远看不到。
+    //   这里在 Tick 轮询里检查 bench 槽，一有结果立刻转成事件。
+    let mut bench_sent = false;
     loop {
         let done = slot.lock().map(|s| s.is_some()).unwrap_or(true);
         if done {
             break;
+        }
+        if !bench_sent {
+            if let Ok(b) = bench.lock() {
+                if let Some((prefer, cpu_ms, vk_ms, need, advice)) = b.clone() {
+                    let _ = tx.send(Ev::Bench {
+                        prefer,
+                        cpu_ms,
+                        vulkan_ms: vk_ms,
+                        need_prompt: need,
+                        advice,
+                    });
+                    bench_sent = true;
+                }
+            }
         }
         let fv = frac.lock().map(|x| *x).unwrap_or(0.0);
         let ev = eta.lock().map(|x| *x).unwrap_or(0.0);
@@ -333,10 +414,16 @@ fn run_one_stage(
             }
             last_seen = lv.clone();
         }
+        // ★ v1.30.3：把运行时状态（模型 tok/s · CPU · 频率）随 Tick 一起送，
+        //   和进度同频刷新。空串表示"还没有状态数据"，界面保持上次显示。
+        let st = stat.lock().map(|s| s.clone()).unwrap_or_default();
+        let sg = segs.lock().map(|s| s.clone()).unwrap_or_default();
         let _ = tx.send(Ev::Tick {
             frac: fv,
             eta: ev,
             latest: lv,
+            stat: st,
+            segs: sg,
         });
         thread::sleep(Duration::from_millis(250));
     }

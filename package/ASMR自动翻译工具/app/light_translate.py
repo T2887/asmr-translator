@@ -21,6 +21,19 @@ import sys
 import time
 import urllib.request
 
+from events import emit
+
+# ★ v1.30.3：运行时状态采集（模型吞吐 / CPU 频率 / 占用核数）
+#   借鉴安卓版思路（它从 llama-server 的 /metrics 取 tok/s、
+#   从 /proc 取 CPU、从 scaling_cur_freq 取频率）。
+#   PC 上没有 /proc，用 GetProcessTimes + CallNtPowerInformation 替代。
+#   全部异常吞掉 —— 状态显示失败绝不能中断翻译。
+try:
+    from status_probe import StatusProbe, find_llama_pid
+except Exception:  # pragma: no cover
+    StatusProbe = None
+    find_llama_pid = None
+
 # ── 数据目录前缀 ──
 #
 # 0pre / 2vad / 3asr 都是【写】的。装进 Program Files 时程序目录不可写，
@@ -138,6 +151,25 @@ SYSTEM = (
     "日语：ちょっと待ってください\n中文：请稍等一下\n"
     "日语：そろそろ帰りましょうか\n中文：差不多该回去了吧"
 )
+
+# ★ v1.30.3：内建通用术语（从 25793 对官方字幕语料挖掘，跨作品一致）。
+#   与 hotwords.txt 是【叠加】关系：内置的这些保证开箱即用，
+#   用户/作品的词表（hotwords_<名字>.txt）再往上补人名地名。
+#   挖掘口径见 d_语音识别.py 的 _HOTWORDS 注释（同一个分析管线）。
+BUILTIN_TERMS = ("肉棒", "小穴", "高潮", "精液", "射精", "口交", "乳交",
+                 "摩擦", "抽插", "乳头", "耳朵", "屁股", "按摩")
+# 拟声词单列：这类词在 ASMR 里高频，且不能都被译成同一句话
+#   （v1 实测「れろれろれろ」被译成「好可爱」——音效被当成评价，
+#   这是本次重训专门治的问题，内建提示里点明要「像声音」）
+ONOMAT_HINT = (
+    "\n拟声词（ぺろ/ちゅ/れろ/咕啾类）要译成对应的中文音效词"
+    "（如 舔弄声、啾、咕啾、咻、噗嗤），不要译成「好可爱」「舒服」这类评价词；"
+    "同一个拟声词在不同句子可以有不同的中文写法，不要每句都用同一个词。"
+)
+
+
+def _builtin_prompt():
+    return ("\n术语统一用：" + "、".join(BUILTIN_TERMS) + ONOMAT_HINT)
 
 
 def load_glossary(stem):
@@ -329,6 +361,53 @@ def translate(port, text, glossary):
     raise RuntimeError(last)
 
 
+def _collapse_repeats(s, max_repeat=2):
+    """收缩连续重复的同一片段（v1.30.3）。
+
+    ★ 真实问题（用户实测指出）：一句里出现「嘿嘿~ 嘿嘿~ 嘿嘿~ …」20 多次。
+    根因在 ASR 侧：日语原文本就是 `れろれろれろ`、`うんうんうん`、
+    `おいおいおい` 这种真实重复（喘气/舔舐的声音就是这样），
+    翻译模型忠于原文，逐个音节翻成中文 → 中文里重复膨胀。
+
+    但字幕不需要把每个音节都写出来：
+      · 观众看得懂「嘿嘿~ 嘿嘿~」是连续的，写到 2~3 次就足够了
+      · 20 多次会把一行字幕撑爆，播放器上根本读不完
+
+    做法：找出长度 1~6 的「同一单元连续重复 ≥3 次」的片段，
+    收缩到 max_repeat 次（保留感叹性质，又不刷屏）。
+    注意只用【完全相同】的重复，不做模糊匹配，避免误伤正常语句。
+    """
+    if not s:
+        return s
+    out = s
+    # 从长单元往短单元找，避免「嘿嘿嘿」先被单字规则切坏
+    for unit_len in range(6, 0, -1):
+        i = 0
+        res = []
+        while i < len(out):
+            unit = out[i:i + unit_len]
+            if len(unit) < unit_len:
+                res.append(out[i:])
+                break
+            # 数这一单元连续出现多少次
+            n = 1
+            j = i + unit_len
+            while out[j:j + unit_len] == unit:
+                n += 1
+                j += unit_len
+            if n >= 3:
+                res.append(unit * max_repeat)
+                # 吃掉重复之间可能的空格/波浪号（「嘿嘿~ 嘿嘿~」）
+                i = j
+                while i < len(out) and out[i] in " ~～、,，":
+                    i += 1
+            else:
+                res.append(unit)
+                i += unit_len
+        out = "".join(res)
+    return out.strip()
+
+
 def _sanitize_zh(s):
     """切掉译文的控制串尾巴（v1.30.2）。
 
@@ -346,7 +425,7 @@ def _sanitize_zh(s):
 
 
 def _translate_once(port, text, glossary, temp=0.1):
-    system = SYSTEM
+    system = SYSTEM + _builtin_prompt()
     if glossary:
         system += "\n专有名词（必须原样保留，不要意译）：" + "、".join(glossary)
     payload = {
@@ -369,7 +448,8 @@ def _translate_once(port, text, glossary, temp=0.1):
     )
     with urllib.request.urlopen(req, timeout=120) as r:
         d = json.load(r)
-    return _sanitize_zh(d["choices"][0]["message"]["content"])
+    zh = _sanitize_zh(d["choices"][0]["message"]["content"])
+    return _collapse_repeats(zh)
 
 
 def fmt_time(t):
@@ -421,6 +501,69 @@ def tidy_rows(rows):
     return out
 
 
+# ── 测速结论与界面的握手 ────────────────────────────────────────────
+#
+# 界面弹窗问「要不要换成纯 CPU」时，脚本必须**真的停下来等** ——
+# 否则弹窗还没等人点，翻译已经用核显跑起来了，用户的选择等于没用。
+# 握手方式：界面把结论写进 {数据目录}\_bench_choice.txt（cpu / vulkan），
+# 脚本每 200ms 看一次文件；超时就自己选更快的那个。
+BENCH_CHOICE_FILE = "_bench_choice.txt"
+# 等待秒数必须**长于**界面的倒计时（main.rs 的 BENCH_WAIT_SEC = 15 秒）。
+# 两边一样长时实测会打平：脚本先判超时，界面还没把结论写下来，
+# 用户点什么都来不及生效。留 7 秒余量给「界面决定 → 脚本读取」这段链路。
+BENCH_WAIT_DEFAULT = 22.0
+
+
+def _bench_choice_path():
+    return os.path.join(os.getcwd(), BENCH_CHOICE_FILE)
+
+
+def _read_bench_wait():
+    """等待用户决定的秒数（默认 20，环境变量 ASMR_BENCH_WAIT 可改）。"""
+    try:
+        v = float((os.environ.get("ASMR_BENCH_WAIT", "") or "22").strip())
+    except ValueError:
+        v = BENCH_WAIT_DEFAULT
+    return max(0.0, min(180.0, v))
+
+
+def _reset_bench_choice():
+    """开新一轮测速前清掉上一轮的结论文件（必须在 emit 之前调）。"""
+    try:
+        os.remove(_bench_choice_path())
+    except OSError:
+        pass
+
+
+def _await_bench_choice(wait_sec):
+    """等界面把用户的选择写进 _bench_choice.txt。
+
+    返回 "cpu" / "vulkan" / ""（超时或没等）。等待期间每 5 秒在日志里
+    提示还剩多久，让用户知道软件在等他而不是卡死了。
+    """
+    path = _bench_choice_path()
+    if wait_sec <= 0:
+        return ""
+    t0 = time.time()
+    _next_note = 5.0
+    while True:
+        elapsed = time.time() - t0
+        if elapsed >= wait_sec:
+            return ""
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                v = (f.read() or "").strip().lower()
+        except OSError:
+            v = ""
+        if v.split(":")[0] in ("cpu", "vulkan"):
+            return v          # 形如 cpu / cpu:auto（超时兜底）/ vulkan
+        if elapsed >= _next_note:
+            print("[测速] 等待你的选择…还剩 %d 秒（不选就自动用更快的那个）"
+                  % int(wait_sec - elapsed), flush=True)
+            _next_note += 5.0
+        time.sleep(0.2)
+
+
 def main():
     # ★ 只取第2步（light_asr.py）产出的 <名>.json。
     #   同一个文件如果先跑过全量模式，2vad\ 里还会留着 pyannote 的
@@ -443,6 +586,10 @@ def main():
     def start_server(device, use_lora):
         cmd = [LLAMA, "--model", MODEL, "--host", "127.0.0.1", "--port", str(port),
                "--device", device, "-c", "4096", "-np", "1", "--no-webui",
+               # ★ v1.30.3：开 /metrics，界面靠它显示实时 tok/s。
+               #   安卓版就是这么做的（--metrics + Prometheus 文本解析），
+               #   用户能立刻看出「模型是不是在干活」，而不是盯着进度条猜。
+               "--metrics",
                "--log-verbosity", "0"]
         if use_lora and LORA_PATH:
             # 加载失败宁可起不来走下面的 CPU 回退，也不静默丢增强
@@ -455,6 +602,61 @@ def main():
         )
 
     dev, dev_name = pick_device()
+
+    # ★ v1.30.3：开跑前测速（纯 CPU vs Vulkan），选更快的那个。
+    #
+    #   起因（用户实测指出「感觉比之前慢」）：1.8B 这种小模型在核显上
+    #   反而更慢 —— 每算一段都要把模型从内存搬过去，搬运开销超过核显
+    #   省下的时间。实测本机（Ryzen 7 7700 + Radeon 核显）：
+    #     纯 CPU  1388 ms/句
+    #     核显    2752 ms/句   ← 慢 2 倍
+    #   用内置的三句日常日语做基准（不读用户素材），6~15 秒完成，
+    #   相对整批任务可忽略，但可能省掉一半以上时间。
+    #
+    #   ASMR_NO_BENCH=1 可跳过测速（调试/不想等的时候用）。
+    if dev != "none" and os.environ.get("ASMR_NO_BENCH", "").strip() != "1":
+        try:
+            from bench_device import bench_devices, make_prompt
+            print("[测速] 正在比较纯 CPU 与核显的速度…", flush=True)
+            _r = bench_devices(LLAMA, MODEL, LORA_PATH, None)
+            _prefer = _r.get("prefer") or ""
+            _need = bool(_r.get("need_prompt"))
+            _reset_bench_choice()
+            emit("bench", _prefer,
+                 f"{_r.get('cpu_ms') or 0:.0f}",
+                 f"{_r.get('vulkan_ms') or 0:.0f}",
+                 "1" if _need else "0",
+                 _r.get("advice", ""))
+            print(f"[测速] {_r.get('advice', '')}", flush=True)
+            # ★ 需要打扰用户时：原地点等，等他自己点，或者等到超时。
+            #   llama-server 还没启动，所以这里等不影响任何已完成的活。
+            if _need:
+                _wait = _read_bench_wait()
+                if _wait > 0:
+                    print(f"[测速] 等待界面上的选择（最多 {int(_wait)} 秒）…",
+                          flush=True)
+                _choice = _await_bench_choice(_wait)
+                _picked = _choice.split(":")[0]
+                _by_ui = bool(_choice) and not _choice.endswith(":auto")
+                if _picked == "cpu":
+                    dev, dev_name = "none", "CPU"
+                    print("[测速] " + ("已按你的选择改用纯 CPU，本次直接生效"
+                                        if _by_ui else
+                                        "等待超时，自动改用更快的纯 CPU"),
+                          flush=True)
+                elif _picked == "vulkan":
+                    print("[测速] " + ("已按你的选择继续用核显"
+                                        if _by_ui else
+                                        "等待超时，自动采用更快的核显"),
+                          flush=True)
+                elif _prefer == "cpu":
+                    dev, dev_name = "none", "CPU"
+                    print("[测速] 等待超时，自动改用更快的纯 CPU", flush=True)
+                else:
+                    print("[测速] 等待超时，自动采用更快的核显", flush=True)
+        except Exception as _e:
+            print(f"[测速] 跳过（{type(_e).__name__}: {_e}）", flush=True)
+
     use_lora = bool(LORA_PATH) and dev != "none"
     if LORA_PATH:
         print(f"[LoRA] 翻译增强适配器：{'启用（' + dev_name + '）' if use_lora else '已有但本次不启用（CPU 太慢）'}",
@@ -482,6 +684,21 @@ def main():
                 print("[失败] llama-server 启动超时")
                 sys.exit(1)
         print("llama-server 就绪", flush=True)
+
+        # ★ v1.30.3：状态采集器（模型吞吐 / GPU 或 CPU 指标）。
+        #   必须传【实际推理设备】—— 跑在独显上就显示显卡 SM 频率，
+        #   跑在核显上显示核显利用率，纯 CPU 才显示 CPU 频率。
+        #   一律显示 CPU 频率是错的：CPU 5.3GHz 满频但核显在慢慢算，
+        #   用户会被误导。
+        _probe = None
+        if StatusProbe is not None:
+            try:
+                _lpid = find_llama_pid() if find_llama_pid else None
+                _probe = StatusProbe(port, dev, _lpid)
+                print(f"[状态] 采集已启用（设备={dev} llama pid={_lpid}）",
+                      flush=True)
+            except Exception as _e:
+                print(f"[状态] 采集不可用（{type(_e).__name__}）", flush=True)
         print(
             "[字幕] 日文字幕："
             + (
@@ -507,6 +724,13 @@ def main():
 
             done = []
             failed = []
+            # ★ v1.30.3：段进度（与 light_asr 同口径，借鉴安卓版设计）。
+            #   翻译是最慢的一步（每段约 1~2 秒 × 几百段），界面只有
+            #   「第3步」时用户完全不知道还要多久。这里每 20 段打点：
+            #   已译/总数 + 每分钟几段 + 预计剩余。
+            _n_all = len([1 for r in rows if (r.get("text") or "").strip()])
+            _t_tr0 = time.time()
+            _n_done = 0
             for r in rows:
                 text = (r.get("text") or "").strip()
                 if not text:
@@ -523,6 +747,22 @@ def main():
                     continue
                 done.append({"start": r["start"], "end": r["end"], "zh": zh, "jp": text})
                 print(f"[{float(r['start']):.2f}s -> {float(r['end']):.2f}s]: {zh}", flush=True)
+                # ★ 段进度：每 20 段或最后一段
+                _n_done += 1
+                if _n_done % 20 == 0 or _n_done == _n_all:
+                    _el = time.time() - _t_tr0
+                    _spm = _n_done / max(0.01, _el) * 60.0
+                    _left = (_n_all - _n_done) / max(0.001, _spm) if _spm > 0 else 0
+                    # ★ 状态采集：模型 tok/s + CPU 占用 + 实时频率。
+                    #   与段进度同频（每 20 段），避免日志刷屏。
+                    _st = _probe.poll() if _probe else ""
+                    print(f"    翻译 {_n_done}/{_n_all} 段"
+                          f"（{_n_done / max(1, _n_all) * 100:.0f}%）"
+                          f"  {_spm:.1f} 段/分  剩约 {_left:.0f} 分"
+                          + (f"  · {_st}" if _st else ""), flush=True)
+                    emit("segs", _n_done, _n_all, round(_spm, 2), int(_left))
+                    if _st:
+                        emit("stat", _st)
 
             # 整批复试：刚才多半是 llama-server 瞬时卡住，歇 2 秒再来一轮。
             if failed:

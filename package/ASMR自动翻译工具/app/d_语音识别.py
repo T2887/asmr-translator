@@ -40,6 +40,15 @@ import sys
 import glob
 from pathlib import Path
 from srt_util import read_srt, write_srt
+# ★ v1.30.3：运行时状态采集（按设备显示 GPU 或 CPU 指标）。
+#   和兼容模式共用同一套采集器，避免两套实现漂移。
+try:
+    from status_probe import StatusProbe as _StatusProbe
+    _STATUS_OK = True
+except Exception:
+    _StatusProbe = None
+    _STATUS_OK = False
+import time
 import faster_whisper.vad
 import faster_whisper.transcribe
 from unittest.mock import patch
@@ -82,7 +91,24 @@ _INITIAL_PROMPT = "以下是日语成人向音声的中文翻译，口语化、�
 #
 #   角色词/人名这类作品级词汇应该放 hotwords_<stem>.txt，只在对应作品生效
 #   （见 _load_extra_hotwords）。全局只保留【通用的性行为术语】。
-_HOTWORDS = "肉棒,小穴,舒服,去了,高潮,舔,精液,射精,口交,乳交"
+# ★ v1.30.3：从 25793 对官方字幕语料里挖掘出的【通用术语】并入全局热词。
+#
+#   挖掘口径（学的是「要能通用」，不是堆词）：
+#     · 必须跨 ≥2 个不同作品稳定出现（各作品内 ≥2 次）→ 排除作品专属称呼
+#     · 必须是完整词形（2~4 字），排除短语/切分碎词/带方位词的
+#     · 排除语法虚词（那么/好了/不过）——它们本来就出得来，占词位有害
+#
+#   明确【不收】的：主人、哥哥、前辈、先生、哥哥大人这类角色称呼
+#   —— 同一批语料里「哥哥」在两个作品指不同的人，放进全局表会把
+#   别的作品的人名硬拽过来（v1.29 已经踩过「社长」的坑）。
+#
+#   新增词及语料证据（频次/跨作品数）：
+#     摩擦 41/2、乳头 16/2、一起高潮 19/2、耳朵 16/4、咕啾 12/2、
+#     按摩 11/3、耳朵里面 10/3、屁股 9/4、抽插 8/2
+_HOTWORDS = (
+    "肉棒,小穴,舒服,去了,高潮,舔,精液,射精,口交,乳交,"
+    "摩擦,抽插,乳头,耳朵,耳朵里面,屁股,按摩,一起高潮,咕啾"
+)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -631,7 +657,34 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
     custom_chunks = []
     sr = config["vad"]["sample_rate"]  # 16000
 
-    for _a, _b, _t in vad_subs:
+    # ★ v1.30.3：智能切块 —— 在语音间隙切分，而不是硬切 30 秒。
+    #
+    #   问题：whisper 的 30 秒解码窗口如果正好落在词中间，首尾音节会
+    #   丢失、时间轴会偏移（这是全量模式长期存在的坑）。
+    #
+    #   做法（移植自 TransWithAI ChickenRice 引擎，MIT）：
+    #   把 VAD 段先拼成"连续块"，切点落在决策窗内【最长的语音间隙】
+    #   中点；连续说话找不到间隙时才退化为硬切。
+    #
+    #   开关：ASMR_NO_SMART_SPLIT=1 可退回旧行为（便于对比排查）。
+    _spans = [(_a, _b) for _a, _b, _t in vad_subs]
+    _total = _spans[-1][1] if _spans else 0.0
+    if os.environ.get("ASMR_NO_SMART_SPLIT", "").strip() == "1":
+        _chunks_sec = _spans
+    else:
+        try:
+            from whisper_split import create_contiguous_chunks
+            _ck = create_contiguous_chunks(_spans, 30.0, _total,
+                                           split_window_factor=0.4)
+            _chunks_sec = [(c.start, c.end) for c in _ck]
+            if len(_chunks_sec) != len(_spans):
+                print(f"  [切块] {len(_spans)} 个 VAD 段 → "
+                      f"{len(_chunks_sec)} 个解码窗口（切点落在语音间隙）")
+        except Exception as _e:
+            print(f"  [切块] 智能切块不可用（{type(_e).__name__}），退回原逻辑")
+            _chunks_sec = _spans
+
+    for _a, _b in _chunks_sec:
         custom_chunks.append({
             'start': int(_a * sr),
             'end': int(_b * sr)
@@ -699,11 +752,69 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
         _diag("→ 开始遍历 segments（真正的推理从这里开始）")
         raw_rows = []
         _seg_i = 0
+        # ★ v1.30.3：运行时状态采集（GPU 或 CPU 指标 + 吞吐）。
+        #   和兼容模式同一套采集器，按【实际推理设备】选指标源：
+        #     · CUDA  → 显卡 SM 频率 / 利用率 / 显存
+        #     · CPU   → CPU 频率 + 占用核数
+        #   全量/精简模式是 whisper（不走 llama-server），所以吞吐
+        #   用【音频处理倍速】而不是 tok/s —— 那才是这里的真实指标。
+        _probe = None
+        _probe_dev = config["device"]
+        if _STATUS_OK:
+            try:
+                _probe = _StatusProbe(0, _probe_dev, os.getpid())
+                print(f"[状态] 采集已启用（设备={_probe_dev}）", flush=True)
+            except Exception as _e:
+                print(f"[状态] 采集不可用（{type(_e).__name__}）", flush=True)
+        _st0 = time.time()
+        _st_dur = max(0.1, float(len(wav16) if 'wav16' in dir() else 1))
         for segment in segments:
             _seg_i += 1
             if _seg_i % _DIAG_PROGRESS_EVERY == 1:
                 _diag(f"  推理中 第 {_seg_i} 段  t={segment.start:.1f}s  "
                       f"提交可用 {_mem_now()[1]:.1f} GB  显存 {_vram_now()}")
+            # ★ 状态行：每 10 条字幕一次
+            if _probe is not None and _seg_i % 10 == 1:
+                _st = _probe.poll()
+                _el = time.time() - _st0
+                # ★ 进度口径（踩过一次坑）：
+                #   segments 是 whisper 输出的【字幕条数】，_clips 是输入的
+                #   【解码窗口数】—— 一个窗口可能出多条字幕，两者不是一回事。
+                #   之前拿 _seg_i 去比 len(_clips)，跑出「21/17 段（124%）」。
+                #   现在按【音频时间轴】算进度：已处理到第几秒 / 总时长，
+                #   这个口径对 clip 模式和整段模式都成立。
+                _seg_txt = ""
+                try:
+                    # ★ 进度按【解码窗口】算（用户指出音频时间轴口径不对）：
+                    #   时间轴口径的毛病：音频末尾常有几十秒静音，字幕到不了
+                    #   那么远 → 进度永远卡在 90% 多、看着像死循环。
+                    #   段口径才反映真实工作量：whisper 是一个窗口一个窗口
+                    #   解的，处理完第 k 个窗口就是 k/N。
+                    #
+                    #   映射：whisper 输出的 segment.end 落在哪个 clip 区间，
+                    #   就说明已推进到那个窗口。用 bisect 二分，每个 segment
+                    #   只花 log(N)，开销可忽略。
+                    import bisect as _bis
+                    if _clips:
+                        _starts = [_ca for _ca, _cb in _clips]
+                        _idx = _bis.bisect_right(_starts, float(segment.end))
+                        _done = max(0, min(len(_clips), _idx))
+                        _tot = len(_clips)
+                        if _tot > 0:
+                            _pct = _done / _tot * 100.0
+                            _rate = _done / _el * 60.0 if _el > 0 else 0.0
+                            _left = ((_tot - _done) / _rate) if _rate > 0 else 0
+                            _seg_txt = (f"识别 {_done}/{_tot} 段"
+                                        f"（{_pct:.0f}%）"
+                                        f" · {_rate:.1f} 段/分"
+                                        f" · 剩约 {_left:.0f} 分")
+                except Exception:
+                    pass
+                _parts = [p for p in (_seg_txt, _st) if p]
+                # 吞吐：whisper 没有 tok/s，用音频处理倍速（x 实时）
+                if _el > 0 and segment.end > 0:
+                    _parts.append(f"{segment.end / _el:.1f}x 实时")
+                print(f"  [状态] {' · '.join(_parts)}", flush=True)
             text = segment.text.strip()
             if not text:
                 continue
@@ -866,6 +977,31 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
         else:
             print(f"  [时间轴] 收缩 {_shrunk}/{len(asr_rows)} 条字幕的结束时间"
                   f"（总时长 {_before:.0f}s → {_after:.0f}s）")
+
+        # ★ v1.30.3：去重复 + 时间轴修正（移植自 ChickenRice 引擎，MIT）。
+        #
+        #   whisper 有两个经典毛病：
+        #     1) 跨段重复：同一句在相邻段重复输出（尤其长静音后）
+        #     2) 时间轴重叠/倒退：播放器会闪跳
+        #   做法（与原实现一致）：只在间隔 ≤2s 且合并后 ≤20s 时，
+        #   按【文本前后缀包含】合并 —— 单纯相邻不合并，否则会把两句
+        #   正常的话粘成一句。
+        #   ASMR_NO_MERGE=1 可关闭（对比排查用）。
+        if os.environ.get("ASMR_NO_MERGE", "").strip() != "1" and asr_rows:
+            try:
+                from whisper_split import (Segment, merge_segments,
+                                           enforce_timeline)
+                _segs = [Segment(float(a), float(b), t)
+                         for a, b, t in asr_rows]
+                _n0 = len(_segs)
+                _segs = merge_segments(_segs, max_gap=2.0,
+                                       max_duration=20.0)
+                _segs = enforce_timeline(_segs)
+                if len(_segs) != _n0:
+                    print(f"  [去重] 合并重复段：{_n0} → {len(_segs)} 条")
+                asr_rows = [(s.start, s.end, s.text) for s in _segs]
+            except Exception as _e:
+                print(f"  [去重] 跳过（{type(_e).__name__}: {_e}）")
 
         # 一次性写盘（不要放在循环里逐条写）
         write_srt(asr_log_path, asr_rows)

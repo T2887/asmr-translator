@@ -85,6 +85,23 @@ pub fn set_lite_mode(on: bool) {
     LITE_MODE.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// ★ v1.30.3：强制翻译走纯 CPU（测速后用户选择切换时置位）。
+///
+/// 背景：1.8B 小模型在核显上反而更慢（实测 1388ms vs 2752ms）。
+/// 界面测速后弹窗询问，用户点「换成纯 CPU」→ 置位 → 传给
+/// light_translate.py 的 ASMR_FORCE_DEVICE=cpu，它会跳过 Vulkan
+/// 直接用 --device none。
+static FORCE_CPU: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_force_cpu(on: bool) {
+    FORCE_CPU.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn force_cpu() -> bool {
+    FORCE_CPU.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// 「额外生成日文字幕」开关（只对兼容模式有意义）。
 ///
 /// 打开后兼容模式的第 3 步（light_translate.py）会带上日文原文：
@@ -302,6 +319,16 @@ pub fn run_script(
                 "1"
             } else {
                 "0"
+            },
+        )
+        // ★ 测速后用户选择「换成纯 CPU」→ 让翻译脚本跳过 Vulkan。
+        //   每次都给值（"cpu"/""），避免上一次的选择残留到下一次运行。
+        .env(
+            "ASMR_FORCE_DEVICE",
+            if FORCE_CPU.load(std::sync::atomic::Ordering::Relaxed) {
+                "cpu"
+            } else {
+                ""
             },
         )
         // 是否写日文字幕（见 JPN_SUB 的注释）。

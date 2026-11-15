@@ -537,9 +537,40 @@ impl AppUi {
             return false;
         };
 
-        // ① 视频旁边
-        if dir.join(format!("{stem}.chs.srt")).is_file() {
-            return true;
+        // ★ v1.30.3：不止 .chs.srt —— 素材常自带别的中文/外挂字幕格式。
+        //
+        //   实测踩到：迅雷下载的素材自带 `xxx.chs.ass`（字幕组做的外挂
+        //   简体中文 ASS），而预检只查 `xxx.chs.srt` → 判为「没有字幕」，
+        //   于是白跑整条流水线（几十分钟到几小时），最后产出的 .srt
+        //   和已有的 .ass 并存，用户看到的却是「黑屏很久没结果」。
+        //
+        //   这里把「同一文件名的常见外挂字幕」都算作已有字幕：
+        //   .chs.srt/.srt/.ass/.ssa/.vtt/.lrc，以及带语言后缀的变体
+        //   （.zh.srt、.sc.ass、.cht.ass 等，字幕组命名很杂）。
+        let suffixes = [
+            ".chs.srt", ".srt", ".chs.ass", ".ass", ".ssa",
+            ".chs.vtt", ".vtt", ".lrc",
+            ".zh.srt", ".zh-cn.srt", ".sc.ass", ".tc.ass", ".cht.ass",
+            ".zh.ass", ".chs.lrc",
+        ];
+        for suf in suffixes {
+            if dir.join(format!("{stem}{suf}")).is_file() {
+                return true;
+            }
+        }
+        // 大小写不同的同名文件（Windows 不敏感，但保险起见扫一遍目录）
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            let low_stem = stem.to_lowercase();
+            for ent in rd.flatten() {
+                let name = ent.file_name().to_string_lossy().to_lowercase();
+                if name.starts_with(&low_stem) {
+                    for ext in [".srt", ".ass", ".ssa", ".vtt", ".lrc"] {
+                        if name.ends_with(ext) && ent.path().is_file() {
+                            return true;
+                        }
+                    }
+                }
+            }
         }
 
         // ② 视频目录、以及它上一级目录下的 3asr\
