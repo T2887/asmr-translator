@@ -157,6 +157,7 @@ curl -sI --max-time 30 "https://github.com/T2887/asmr-translator/releases/downlo
 11. **Light ASR/翻译脚本是「cwd 相对路径」设计**——任何测试都要 `cd` 到含 0pre/2vad 的目录再跑；别设 ASMR_DATA_DIR 指到临时目录（models 找不到）
 12. **HF 离线**：本地跑脚本带 `HF_HUB_OFFLINE=1`（huggingface.co 不可达，会卡 10060 超时）
 13. **一次未发布批次只 +1 个版本号**——多处改动攒够再升版，别按文件升
+14. **git 不读系统代理** —— 直连 github.com 经常 000/超时，而浏览器能开。用户开着代理时，proxy 通常在 `127.0.0.1:7897`（用 `echo > /dev/tcp/127.0.0.1/PORT` 逐个探；7890/10809 这些常见端口本机没有）。临时走代理：`git -c http.proxy=http://127.0.0.1:7897 -c https.proxy=http://127.0.0.1:7897 push origin main`。**别写进 git config** —— 代理一关，之后的每一条命令都会卡在连接上。
 
 ## 8. 快速自检（发布前 30 秒过一遍）
 
