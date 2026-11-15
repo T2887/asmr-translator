@@ -89,3 +89,18 @@ _proto_egui/target*/
 _smoke/
 _proto_egui/patch_*.py
 _models/
+
+# ── llama.cpp 运行库（88MB，由 b1 安装包从 D 盘打包，不入库）──
+#   旧目录名「ASMR自动翻译工具（Rust版）」的规则在文件开头，改过名之后
+#   就漏掉了；这里按现名补一条，两边都不落空。
+package/ASMR自动翻译工具/llama/
+
+# ── 实验/训练/安卓素材目录（各有几 GB，只在本地留档）──
+_androidsetup/
+_archive/
+_gitee_push/
+_haas_test/
+_lora/
+_ndk/
+_ocr/
+_sv/
