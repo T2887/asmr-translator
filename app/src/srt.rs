@@ -409,6 +409,18 @@ pub fn load_wordlist(app_dir: &Path, stem: Option<&str>) -> Vec<(String, String)
     if let Some(s) = stem {
         files.push(app_dir.join(format!("词表_{s}.txt")));
     }
+    // v1.30.4: fixes.txt 与词表同源（兼容模式的术语后处理读的就是它）。
+    // 全量/精简没有 Python 那条链，只能靠这里，两套表分开会让用户「改了没生效」。
+    files.push(app_dir.join("fixes.txt"));
+    if let Some(s) = stem {
+        files.push(app_dir.join(format!("fixes_{s}.txt")));
+    }
+    if let Some(root) = app_dir.parent() {
+        files.push(root.join("fixes.txt"));
+        if let Some(s) = stem {
+            files.push(root.join(format!("fixes_{s}.txt")));
+        }
+    }
     let mut pairs = Vec::new();
     for f in files {
         let Ok(raw) = std::fs::read(&f) else { continue };
@@ -419,7 +431,11 @@ pub fn load_wordlist(app_dir: &Path, stem: Option<&str>) -> Vec<(String, String)
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let Some((a, b)) = line.split_once("=>") else { continue };
+            let pair = match line.split_once("=>") {
+                Some(x) => Some(x),
+                None => line.split_once('='),
+            };
+            let Some((a, b)) = pair else { continue };
             let (a, b) = (a.trim(), b.trim());
             if !a.is_empty() && !b.is_empty() && a != b {
                 pairs.push((a.to_string(), b.to_string()));
@@ -842,6 +858,30 @@ Dialogue: 0,0:00:04.00,0:00:06.00,Default,,0,0,0,,{\\i1}斜体{\\i0}收尾\n",
     }
 
     // 双语字幕的两行排版不能在读文件时被合并成一行（曾经是 join(" ")）。
+    /// v1.30.4：（）必须与 （）等效生效，
+    /// 且放在安装根目录（app 的上一级）也能被读到 —— 全量/精简模式的用户
+    /// 只会看到根目录那一个文件。
+    #[test]
+    fn fixes_file_applies_like_wordlist() {
+        let root = std::env::temp_dir().join("asmr_fixes_test");
+        let app = root.join("app");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(root.join("fixes.txt"), "卑处=秘书
+约炮=约会
+").unwrap();
+        std::fs::write(app.join("词表.txt"), "肉棒 => 肉棒(保留)
+").unwrap();
+
+        let words = load_wordlist(&app, None);
+        assert!(words.iter().any(|(a, b)| a == "卑处" && b == "秘书"), "fixes.txt 未生效: {words:?}");
+        assert!(words.iter().any(|(a, b)| a == "约炮" && b == "约会"));
+        assert_eq!(apply_words("卑处与约炮", &words), "秘书与约会");
+        // 词表.txt 仍然生效，两种语法共存
+        assert_eq!(apply_words("肉棒", &words), "肉棒(保留)");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn read_srt_keeps_inner_newline() {
         let dir = std::env::temp_dir().join("asmr_srt_bilingual_test");

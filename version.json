@@ -1,8 +1,8 @@
 {
- "version": "1.30.3",
- "url": "https://github.com/T2887/asmr-translator/releases/download/v1.30.3/ASMR-Translator-Setup_v1.30.3.exe",
- "page": "https://github.com/T2887/asmr-translator/releases/tag/v1.30.3",
- "notes": "兼容模式换了新的语音分段方式，一小时以上的音频也能按人声停顿切准，大段漏翻少了。\n翻译加入了本领域微调，日常对话和拟声词的译文更贴近原意。\n兼容模式启动时会自动比较纯 CPU 与核显的速度；核显反而更慢时会弹窗询问，15 秒不选就自动选快的那个。\n界面右下角实时显示当前设备状态（显卡频率/占用，或 CPU 核数），进度按语音段计算，不会再卡在 90% 多；单句最长 12 秒，重复的拟声词自动收敛。\n修掉了点「开始处理」后窗口先黑一下的问题。本次安装包约 130 MB，比上一版大，是因为装进了语音分段模型，体积不代表运行占用。",
+ "version": "1.30.4",
+ "url": "https://github.com/T2887/asmr-translator/releases/download/v1.30.4/ASMR-Translator-Setup_v1.30.4.exe",
+ "page": "https://github.com/T2887/asmr-translator/releases/tag/v1.30.4",
+ "notes": "修好了「同一句话重复几十遍」的问题：译文里出现整句刷屏时会自动识别并重译，4~10 字的短句循环也能抓住，正常台词不会被误改。\n新增术语/纠错表（fixes.txt）：把常见的错译写法填成「错误写法=正确写法」，全量、精简、兼容三个模式都会自动替换。\n兼容模式的翻译改用与领域微调匹配的格式，译文更顺、拟声词更贴近原意。\n识别阶段按机器核心数自动分配，慢机器保持原来的速度，快机器用时更短。\n本次安装包约 130 MB，与上一版相当。",
  "runtime_patch": {
   "version": "1.30.0",
   "url": "https://github.com/T2887/asmr-translator/releases/download/v1.30.0/ASMR-RuntimePatch_v1.30.0.exe",

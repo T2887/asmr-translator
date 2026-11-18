@@ -247,7 +247,7 @@ class HaasRecognizer(_TransducerBase):
 
     name = "Haas-ja-v1.0"
 
-    def __init__(self, num_threads=4):
+    def __init__(self, num_threads=4, hotwords=None, hotword_score=1.5):
         import sherpa_onnx
 
         # ★ 版本白名单校验 —— 见文件顶部 SHERPA_OK_VERSIONS 的说明。
@@ -262,7 +262,7 @@ class HaasRecognizer(_TransducerBase):
                 f"Haas-ja 依赖其 TDT 内部实现，版本不符可能静默出错"
             )
 
-        self._rec = sherpa_onnx.OfflineRecognizer.from_transducer(
+        kw = dict(
             encoder=os.path.join(HAAS_DIR, "encoder.quantized.onnx"),
             decoder=os.path.join(HAAS_DIR, "decoder.onnx"),
             joiner=os.path.join(HAAS_DIR, "joiner.onnx"),
@@ -272,6 +272,51 @@ class HaasRecognizer(_TransducerBase):
             # FastConformer 用 128 维 log-mel，不是 whisper 的 80
             feature_dim=128,
         )
+
+        # ★ v1.30.4：ASR 热词（人名/作品专有词）。
+        #
+        # 为什么不用 bpe.model：Haas 的 tokens.txt 是「逐字」词表
+        #   （256 个 <0xNN> 字节 + 2816 个假名/汉字/词片），
+        #   sherpa-onnx 的 modeling_unit="cjkchar" 直接把热词的每个字
+        #   查进 tokens.txt，**不需要 sentencepiece 的 bpe.model**。
+        #   实测（2026-11-18）：热词文件能加载、识别结果正常；
+        #   词表外的字（罕见汉字、emoji）会被 sherpa 跳过并打一行警告，
+        #   **不会让整个识别失败** —— 所以用户词表写错了也不炸。
+        #
+        # 代价：热词强制 modified_beam_search，120 秒音频实测
+        #   greedy 13.4 s → beam 15.1~16.0 s（+12~19%）。
+        #   所以只在用户真的提供了热词时才开。
+        self.hotwords = list(hotwords or [])
+        self._hw_path = ""
+        if self.hotwords:
+            import tempfile
+            fd, self._hw_path = tempfile.mkstemp(prefix="asmr_hw_", suffix=".txt")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                for w in self.hotwords:
+                    w = (w or "").strip()
+                    if w:
+                        f.write(w + "\n")
+            kw.update(
+                hotwords_file=self._hw_path,
+                hotwords_score=hotword_score,
+                modeling_unit="cjkchar",
+                decoding_method="modified_beam_search",
+                max_active_paths=4,
+            )
+
+        elif os.environ.get("ASMR_ASR_BEAM", "").strip() in ("1", "on", "true", "yes"):
+            # 没有热词也能手动开 beam search（`ASMR_ASR_BEAM=1`）：
+            # 给 A/B 用 —— 换解码方式时唯一该变的变量。
+            # 实测（2026-11-18，`Hhd800.Com@Fft-036` 前 600 秒 / 63 条日文字幕）：
+            #   召回率 greedy 66.7% → beam 66.7%（**没有提升**），
+            #   识别耗时 144.2 s → 160.3 s（+11%），切句数 90 → 84。
+            # 结论：beam 不划算，默认仍用 greedy；这个开关只留给以后的 A/B。
+            kw.update(
+                decoding_method="modified_beam_search",
+                max_active_paths=4,
+            )
+
+        self._rec = sherpa_onnx.OfflineRecognizer.from_transducer(**kw)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -330,7 +375,7 @@ def _work_dir():
 # 对外入口
 # ─────────────────────────────────────────────────────────────
 
-def _try_engine(kind, num_threads):
+def _try_engine(kind, num_threads, hotwords=None):
     """尝试加载一个引擎。成功返回 (engine, None)，失败返回 (None, 原因)。"""
     if kind == "zipformer":
         if not zipformer_ready():
@@ -346,7 +391,7 @@ def _try_engine(kind, num_threads):
                        if not os.path.isfile(os.path.join(HAAS_DIR, f))]
             return None, f"模型文件缺失 {', '.join(missing)}（目录 {HAAS_DIR}）"
         try:
-            return HaasRecognizer(num_threads=num_threads), None
+            return HaasRecognizer(num_threads=num_threads, hotwords=hotwords), None
         except Exception as e:
             return None, f"{type(e).__name__}: {e}"
 
@@ -359,7 +404,7 @@ def _try_engine(kind, num_threads):
     return None, f"未知引擎 {kind!r}"
 
 
-def load_engine(num_threads=4):
+def load_engine(num_threads=4, hotwords=None):
     """加载识别引擎，带多级降级。
 
     返回 (engine, note)：
@@ -371,7 +416,7 @@ def load_engine(num_threads=4):
     """
     # 指定了具体引擎 → 只试它，不降级
     if ENGINE_ENV in MANUAL_ENGINES:
-        eng, err = _try_engine(ENGINE_ENV, num_threads)
+        eng, err = _try_engine(ENGINE_ENV, num_threads, hotwords)
         if eng is not None:
             return eng, f"{eng.name} 就绪（sherpa-onnx {getattr(eng, 'engine_version', '—')}）"
         raise RuntimeError(
@@ -382,7 +427,7 @@ def load_engine(num_threads=4):
     # auto：按顺序试
     tried = []
     for kind in AUTO_ORDER:
-        eng, err = _try_engine(kind, num_threads)
+        eng, err = _try_engine(kind, num_threads, hotwords)
         if eng is not None:
             if tried:
                 print(f"[识别] 降级到 {eng.name}（前面失败的：{'；'.join(tried)}）",

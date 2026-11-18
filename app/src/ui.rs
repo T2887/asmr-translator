@@ -72,7 +72,7 @@ pub enum Msg {
     /// 用户从资源管理器拖了东西进来
     Dropped(DroppedData),
     /// 设备检测完成，payload 是给界面直接显示的文本
-    DeviceDetected(String, bool, f64, f64, bool, String, String, f64),
+    DeviceDetected(pipeline::DeviceInfo),
     /// 切换运行模式
     SetModeFull,
     SetModeLite,
@@ -94,6 +94,13 @@ pub enum Msg {
     AgreeCpu,
     /// 用户不同意，退出程序
     RefuseCpu,
+    /// ★ v1.30.4：测速弹窗 —— 用户选择「用纯 CPU 翻译」。
+    ///
+    /// 结论要写进 `{工作目录}\_bench_choice.txt`（脚本正在那儿等），
+    /// 同时把 FORCE_CPU 置上，之后几次运行都不再试核显。
+    BenchCpu,
+    /// ★ v1.30.4：测速弹窗 —— 用户选择「继续用核显（Vulkan）」。
+    BenchVulkan,
     /// 把内存里的完整日志导出成文件。
     ///
     /// 界面上的日志区只有固定几个槽位（Reactor 的 children 是元组，
@@ -330,6 +337,37 @@ pub struct AppUi {
     /// 十几 GB 的视频（要一分多钟），用户点了停止不该只能干等。
     /// 取消之后 copy 循环会立刻中断并删掉写了一半的文件。
     prepare_task: Option<ComponentTask>,
+    /// ★ v1.30.4：设备测速结论（pipeline 的 bench 通道）。
+    ///
+    /// pipeline 从脚本输出的 `bench|prefer|cpu_ms|vk_ms|need|advice` 行解析出
+    /// 结果写进这里；Tick 读到之后弹窗问「换纯 CPU 还是继续用核显」。
+    /// 为什么必须问用户而不是直接按 prefer 跑：实测这台机器核显比 CPU 慢
+    /// 2.4 倍（CPU 721 ms/句 vs 核显 1732 ms/句），但换一台机器结论可能相反
+    /// —— 猜错就是整批任务慢一倍。
+    live_bench: std::sync::Arc<std::sync::Mutex<Option<(String, f64, f64, bool, String)>>>,
+    /// ★ v1.30.4：运行时状态行（stat 通道）。
+    /// 内容形如「模型 42 tok/s · CPU 63% · 3.8 GHz」，由 status_probe 采集。
+    live_stat: std::sync::Arc<std::sync::Mutex<String>>,
+    /// ★ v1.30.4：段进度（segs 通道）。
+    /// 内容形如「识别 120/286 段 · 18.4 段/分 · 剩余约 9 分」。
+    /// 单独一条通道：它每 20 段才一条，压进 live_line 会被字幕行瞬间覆盖。
+    live_segs: std::sync::Arc<std::sync::Mutex<String>>,
+    /// 上面两条通道的界面副本（Tick 刷新，view 直接读）。
+    stat_line: String,
+    segs_line: String,
+    /// 正在问用户「要不要换成纯 CPU」的那次测速结论：(prefer, cpu_ms, vk_ms, advice)。
+    ///
+    /// 和 show_cpu_warning 一样用状态驱动 view 里的自绘模态层，
+    /// 不做命令式弹窗 —— ContentDialog 是 view 的一部分。
+    bench_prompt: Option<(String, f64, f64, String)>,
+    /// 弹窗的截止时刻。到点就按测速建议走。
+    ///
+    /// 脚本那边等 22 秒（light_translate.py 的 BENCH_WAIT_DEFAULT），
+    /// 界面倒计时给 15 秒，留 7 秒余量给「界面写文件 → 脚本读到」这段链路。
+    /// 两边等一样长时实测评过平：脚本先判超时，用户点什么都已经晚了。
+    bench_deadline: Option<std::time::Instant>,
+    /// 倒计时剩余秒数（Tick 每秒刷新）。
+    bench_left: u64,
 }
 
 impl AppUi {
@@ -1266,6 +1304,31 @@ impl AppUi {
 
     /// 起一个阶段。
     ///
+    /// 测速弹窗的等待秒数。
+    ///
+    /// 必须**短于**脚本那边的 22 秒（`light_translate.py` 的
+    /// `BENCH_WAIT_DEFAULT`），留 7 秒给「界面写文件 → 脚本每 200ms 轮询读到」。
+    /// 两边等一样长时实测评过平：脚本先判超时，用户点什么都来不及生效。
+    const BENCH_WAIT_SEC: u64 = 15;
+
+    /// 把「用哪台设备翻译」的结论写给翻译脚本。
+    ///
+    /// 协议见 `light_translate.py`：脚本每 200ms 读一次
+    /// `{工作目录}\_bench_choice.txt`，内容是 `cpu` / `vulkan`，
+    /// 带 `:auto` 后缀表示「界面超时自动选的」（脚本据此把提示语写成
+    /// "等待超时，自动…" 而不是 "已按你的选择"）。
+    ///
+    /// 注意路径是**脚本的 cwd**（`config::work_dir()`），不是数据目录 ——
+    /// 脚本用的是 `os.getcwd()`；写错地方等于什么都没写。
+    fn write_bench_choice(choice: &str) {
+        let path = std::path::Path::new(config::work_dir()).join("_bench_choice.txt");
+        if let Err(e) = std::fs::write(&path, choice) {
+            // 写不进去的后果只是「脚本等 22 秒后按自己的测速结果走」，
+            // 不致命，但用户点了没生效必须留痕。
+            eprintln!("[测速] 写 {} 失败：{e}", path.display());
+        }
+    }
+
     /// 把 `live_line` 克隆一份交给后台线程：脚本每输出一行，那里就更新一次。
     /// 界面靠 Msg::Tick（每秒）去读，于是进度卡片上能实时看到
     /// "正在加载模型…"、"提取中: xxx.flac" 这类内容，
@@ -1277,8 +1340,19 @@ impl AppUi {
         let eta = std::sync::Arc::clone(&self.live_remain);
         let sub_end = std::sync::Arc::clone(&self.live_sub_end);
         let mode = self.mode;
+        // ★ v1.30.4：三个遥测通道接到界面上（此前是三次性空通道，见 git 历史）。
+        //   bench  → Tick 里转成「换 CPU / 继续用核显」弹窗（见 bench_prompt）
+        //   stat   → 进度卡那一行的「42 tok/s · CPU 63%」
+        //   segs   → 进度卡那一行的「识别 120/286 段 · 剩余约 9 分」
+        //   三者各走独立通道：段进度每 20 段一条、状态行每 0.3 秒一条，
+        //   挤进同一条 latest 会互相覆盖（实测段进度整段消失）。
+        let bench = std::sync::Arc::clone(&self.live_bench);
+        let stat = std::sync::Arc::clone(&self.live_stat);
+        let segs = std::sync::Arc::clone(&self.live_segs);
         context.spawn_background(move |token| {
-            let r: StageResult = pipeline::run_stage(mode, stage, token, live, ready, frac, eta, sub_end);
+            let r: StageResult = pipeline::run_stage(
+                mode, stage, token, live, ready, frac, eta, sub_end, bench, stat, segs,
+            );
             Msg::StageDone(r.stage, r.code, r.lines)
         });
     }
@@ -1784,18 +1858,7 @@ impl Component for AppUi {
         // 后台问一次 CUDA。torch 首次导入要 2~3 秒，不能卡在界面线程里，
         // 所以走 spawn_background，回来时发 Msg::DeviceDetected。
         context.spawn_background(|_token| {
-            let (text, is_gpu, vram, free_gb, has_vulkan, cuda_name, vulkan_name, gpu_cap) =
-                pipeline::detect_device();
-            Msg::DeviceDetected(
-                text,
-                is_gpu,
-                vram,
-                free_gb,
-                has_vulkan,
-                cuda_name,
-                vulkan_name,
-                gpu_cap,
-            )
+            Msg::DeviceDetected(pipeline::detect_device())
         });
 
         // 窗口居中的逻辑【不在这里】。
@@ -1901,6 +1964,14 @@ impl Component for AppUi {
             live_line: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
             live_frac: std::sync::Arc::new(std::sync::Mutex::new(0.0)),
             live_remain: std::sync::Arc::new(std::sync::Mutex::new(-1.0)),
+            live_bench: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            live_stat: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+            live_segs: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+            stat_line: String::new(),
+            segs_line: String::new(),
+            bench_prompt: None,
+            bench_deadline: None,
+            bench_left: 0,
             tqdm_remain: 0.0,
             tqdm_ema: 0.0,
             last_raw_remain: -1.0,
@@ -2352,16 +2423,26 @@ impl Component for AppUi {
                 });
             }
 
-            Msg::DeviceDetected(
-                text,
-                is_gpu,
-                vram_gb,
-                free_gb,
-                has_vulkan,
-                cuda_name,
-                vulkan_name,
-                gpu_cap,
-            ) => {
+            Msg::DeviceDetected(dev) => {
+                // 解构保持原有的局部变量名，下面的判定逻辑就不用动。
+                let pipeline::DeviceInfo {
+                    text,
+                    is_gpu,
+                    vram_gb,
+                    free_gb,
+                    has_vulkan,
+                    cuda_name,
+                    vulkan_name,
+                    cap: gpu_cap,
+                    vendor,
+                    vram_kind,
+                    arch,
+                } = dev;
+                // ★ A 卡只走兼容模式：分离能上 GPU，但识别层的 CTranslate2
+                //   在 Windows 只有 CUDA 轮子，全量模式会卡在识别上。
+                //   共享内存（核显）同理，不算显存。
+                let amd = vendor == "amd";
+                let shared_mem = vram_kind == "shared";
                 self.device_status = text;
                 self.cuda_name = cuda_name.clone();
                 self.vulkan_name = vulkan_name;
@@ -2383,10 +2464,31 @@ impl Component for AppUi {
                 let vram_unknown = vram_gb <= 0.0;
                 // 标称 6/8 GB 卡的 CUDA 可管理容量可能因预留略小于整档；
                 // 总容量各给约 4% 容差，实际启动仍由空余显存门槛兜底。
-                self.mode_full_ok =
-                    !arch_old && is_gpu && (vram_unknown || vram_gb * 1024.0 >= 7885.0);
-                self.mode_lite_ok =
-                    !arch_old && is_gpu && (vram_unknown || vram_gb * 1024.0 >= 5888.0);
+                self.mode_full_ok = !amd
+                    && !shared_mem
+                    && !arch_old
+                    && is_gpu
+                    && (vram_unknown || vram_gb * 1024.0 >= 7885.0);
+                self.mode_lite_ok = !amd
+                    && !shared_mem
+                    && !arch_old
+                    && is_gpu
+                    && (vram_unknown || vram_gb * 1024.0 >= 5888.0);
+                if amd {
+                    self.push_log(format!(
+                        "[显卡] 检测到 AMD 显卡 {cuda_name}（{arch}），已锁定为兼容模式"
+                    ));
+                    self.push_log(
+                        "[显卡] 原因：识别层的 CTranslate2 在 Windows 只有 CUDA 轮子，A 卡跑全量模式会卡在识别上",
+                    );
+                    self.push_log(
+                        "[显卡] 兼容模式的翻译层走 Vulkan，A 卡本来就吃得到，这一步不会浪费性能",
+                    );
+                } else if shared_mem {
+                    self.push_log(format!(
+                        "[显卡] {cuda_name} 报的是共享内存而不是独立显存，已锁定为兼容模式"
+                    ));
+                }
                 if arch_old {
                     self.push_log(format!(
                         "[显卡] 检测到 {cuda_name}（计算能力 {gpu_cap:.1}），低于 7.5"
@@ -2485,6 +2587,33 @@ impl Component for AppUi {
             Msg::RefuseCpu => {
                 // 用户不接受 CPU 模式 → 直接退出
                 std::process::exit(0);
+            }
+
+            Msg::BenchCpu => {
+                Self::write_bench_choice("cpu");
+                // 下次运行也别再试核显了 —— 用户已经明确表过态。
+                backend::set_force_cpu(true);
+                let tail = self.bench_prompt.take().map(|(_, c, v, _)| (c, v));
+                self.bench_deadline = None;
+                match tail {
+                    Some((cpu_ms, vk_ms)) => self.push_log(format!(
+                        "[测速] 按你的选择改用纯 CPU（CPU {cpu_ms:.0} ms/句 vs 核显 {vk_ms:.0} ms/句）"
+                    )),
+                    None => self.push_log("[测速] 按你的选择改用纯 CPU"),
+                }
+            }
+
+            Msg::BenchVulkan => {
+                Self::write_bench_choice("vulkan");
+                backend::set_force_cpu(false);
+                let tail = self.bench_prompt.take().map(|(_, c, v, _)| (c, v));
+                self.bench_deadline = None;
+                match tail {
+                    Some((cpu_ms, vk_ms)) => self.push_log(format!(
+                        "[测速] 按你的选择继续用核显（CPU {cpu_ms:.0} ms/句 vs 核显 {vk_ms:.0} ms/句）"
+                    )),
+                    None => self.push_log("[测速] 按你的选择继续用核显"),
+                }
             }
 
             Msg::BrowseOutputDir => {
@@ -2671,6 +2800,63 @@ impl Component for AppUi {
             }
 
             Msg::Tick => {
+                // ★ v1.30.4：读三个遥测通道（bench / stat / segs）。
+                //
+                //   stat、segs 是「持续刷新」的，直接覆盖显示；
+                //   bench 是「一次性」的，读到就从槽里取走 —— 否则每秒都重新弹一遍。
+                if let Ok(v) = self.live_stat.lock() {
+                    if *v != self.stat_line {
+                        self.stat_line = v.clone();
+                    }
+                }
+                if let Ok(v) = self.live_segs.lock() {
+                    if *v != self.segs_line {
+                        self.segs_line = v.clone();
+                    }
+                }
+                if self.bench_prompt.is_none() {
+                    let got = self.live_bench.lock().ok().and_then(|mut b| b.take());
+                    if let Some((prefer, cpu_ms, vk_ms, need, advice)) = got {
+                        if need {
+                            self.bench_prompt = Some((prefer, cpu_ms, vk_ms, advice));
+                            self.bench_deadline = Some(
+                                std::time::Instant::now()
+                                    + std::time::Duration::from_secs(Self::BENCH_WAIT_SEC),
+                            );
+                            self.bench_left = Self::BENCH_WAIT_SEC;
+                        } else {
+                            // 不需要打扰用户：脚本已经按更快的那个跑起来了。
+                            self.push_log(format!("[测速] {advice}"));
+                        }
+                    }
+                }
+                if let Some(dl) = self.bench_deadline {
+                    let left = dl
+                        .saturating_duration_since(std::time::Instant::now())
+                        .as_secs_f64();
+                    self.bench_left = left.ceil() as u64;
+                    if left <= 0.0 {
+                        // 超时：按测速建议走，带 :auto 后缀告诉脚本「这是自动选的」
+                        if let Some((prefer, cpu_ms, vk_ms, _)) = self.bench_prompt.take() {
+                            let pick = if prefer.is_empty() {
+                                "cpu".to_string()
+                            } else {
+                                prefer.clone()
+                            };
+                            Self::write_bench_choice(&format!("{pick}:auto"));
+                            backend::set_force_cpu(pick == "cpu");
+                            self.bench_deadline = None;
+                            self.push_log(format!(
+                                "[测速] {} 秒内没有选择，按测速结果自动用{}（CPU {:.0} ms/句 vs 核显 {:.0} ms/句）",
+                                Self::BENCH_WAIT_SEC,
+                                if pick == "cpu" { "纯 CPU" } else { "核显" },
+                                cpu_ms,
+                                vk_ms
+                            ));
+                        }
+                    }
+                }
+
                 // 启动后第一次心跳：对话框已经挂载完毕，这时候再打开才不会被
                 // reactor 的"首帧 is_open"逻辑吞掉。见 pending_restore_prompt 的注释。
                 if self.pending_restore_prompt {
@@ -3535,6 +3721,29 @@ impl Component for AppUi {
             }
         };
 
+        // ★ v1.30.4：把「队列位置 / 加载提示 / 段进度 / 运行状态」合成一行。
+        //
+        //   为什么不各占一行：这张卡只剩一行的高度了，多一行会把卡片底边
+        //   顶破（实测 860 逻辑高下最后一个 TextBlock 被裁）。
+        //   顺序按「此刻最需要看的」排：正在处理谁 → 是否在加载 →
+        //   做到第几段 → 硬件在干什么。
+        let tail_txt = {
+            let mut parts: Vec<String> = Vec::new();
+            if !queue_txt.is_empty() {
+                parts.push(queue_txt.clone());
+            }
+            if !hint_txt.is_empty() {
+                parts.push(hint_txt.to_string());
+            }
+            if !self.segs_line.is_empty() {
+                parts.push(self.segs_line.clone());
+            }
+            if !self.stat_line.is_empty() {
+                parts.push(self.stat_line.clone());
+            }
+            parts.join("  ·  ")
+        };
+
         // 两列排：5 个字段竖着放不进 720 高的窗口（底部会被裁）
         let progress_card = card(
             "进度",
@@ -3594,14 +3803,12 @@ impl Component for AppUi {
                 //   进度卡这已经是最后一行的高度了，两行会把卡片底边顶破
                 //   （实测窗口 860 逻辑高下，多一行就裁掉最后一个 TextBlock）。
                 TextBlock::new()
-                    .text(if hint_txt.is_empty() {
-                        queue_txt.clone()
-                    } else {
-                        format!("{queue_txt}  ·  {hint_txt}")
-                    })
+                    .text(tail_txt.clone())
                     .font_size(12.0)
                     .foreground(INK3)
-                    .text_wrapping(TextWrapping::Wrap),
+                    .text_wrapping(TextWrapping::Wrap)
+                    .max_lines(2)
+                    .text_trimming(TextTrimming::CharacterEllipsis),
             )),
         3, 1, 1, 1,
         );
@@ -4011,8 +4218,10 @@ impl Component for AppUi {
         // ★ 为什么【不提供】"下载 ROCm / DirectML" 这类选项
         //
         //   调研结论（2026-10）：
-        //     · ROCm —— Windows 上没有可用产物。PyTorch 的 ROCm 轮子只有
-        //       Linux，onnxruntime-rocm 不存在，CTranslate2 也没有 ROCm 后端。
+        //     · ROCm —— 2026-11 复查：PyTorch 已经有 Windows 轮子
+        //       （rocm.nightlies.amd.com，必须装 -all 变体），分离层能上 A 卡；
+        //       但 onnxruntime-rocm 仍不存在，CTranslate2 也没有 ROCm 后端，
+        //       识别层还是只能用 CPU —— 所以 A 卡一律引导到兼容模式。
         //     · DirectML —— 曾经是那条路，但 torch-directml 的元数据里
         //       硬绑 Requires-Dist: torch==2.4.1，而我们是 torch 2.11.0+cu128。
         //       降级会让 sm_120（RTX 50 系）支持全部失效。
@@ -4027,6 +4236,66 @@ impl Component for AppUi {
         } else {
             "显卡信息检测失败".to_string()
         };
+
+        // ── 翻译设备测速弹窗（v1.30.4）──
+        //
+        //   Python 侧测完「纯 CPU vs 核显」各多少 ms/句之后会真的停下来等一个
+        //   结论，最长等 22 秒（`light_translate.py` 的 BENCH_WAIT_DEFAULT）。
+        //   这里给 15 秒倒计时，留 7 秒余量把选择写进 `_bench_choice.txt`。
+        //   到点不动就按测速建议走 —— 不选也是一种选择，不能把整批任务挂在这儿。
+        let bench_modal = self
+            .bench_prompt
+            .as_ref()
+            .map(|(prefer, cpu_ms, vk_ms, advice)| {
+                let cpu_win = prefer == "cpu";
+                let head = if cpu_win {
+                    format!("测出来：纯 CPU 更快（{cpu_ms:.0} ms/句 vs 核显 {vk_ms:.0} ms/句）")
+                } else {
+                    format!("测出来：核显更快（{vk_ms:.0} ms/句 vs 纯 CPU {cpu_ms:.0} ms/句）")
+                };
+                modal_overlay(
+                    "翻译用哪台设备？",
+                    StackPanel::new().spacing(7.0).children((
+                        TextBlock::new().text(head).font_size(14.0).foreground(WARN),
+                        TextBlock::new()
+                            .text(if advice.is_empty() {
+                                "1.8B 这种小模型在核显上未必更快：每算一段都要把权重搬过 PCIe。"
+                                    .to_string()
+                            } else {
+                                advice.clone()
+                            })
+                            .font_size(13.0)
+                            .foreground(INK2),
+                        TextBlock::new()
+                            .text(format!("{} 秒内不选，就按测速结果自动走。", self.bench_left))
+                            .font_size(12.5)
+                            .foreground(INK3),
+                    )),
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(10.0)
+                        .children((
+                            pill_button(
+                                &format!("用纯 CPU（{cpu_ms:.0} ms/句）"),
+                                cpu_win,
+                                ACCENT_DEEP,
+                                ACCENT_DEEP,
+                                Color::rgb(0xff, 0xff, 0xff),
+                                true,
+                                context.message(Msg::BenchCpu),
+                            ),
+                            pill_button(
+                                &format!("继续用核显（{vk_ms:.0} ms/句）"),
+                                !cpu_win,
+                                CARD,
+                                CARD_LINE,
+                                ACCENT_INK,
+                                true,
+                                context.message(Msg::BenchVulkan),
+                            ),
+                        )),
+                )
+            });
 
         let cpu_modal = modal_overlay(
             "没有可用的 GPU 加速",
@@ -4096,6 +4365,11 @@ impl Component for AppUi {
         }
         if self.show_cpu_warning {
             stack.push(KeyedView::new("cpu_modal", cpu_modal));
+        }
+        // 测速弹窗。叠在最后 = 压在最上层：它有时间压力（15 秒倒计时），
+        // 必须比其它弹窗先看到。
+        if let Some(v) = bench_modal {
+            stack.push(KeyedView::new("bench_modal", v));
         }
 
         let root = Grid::new()

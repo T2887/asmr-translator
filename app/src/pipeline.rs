@@ -258,55 +258,158 @@ pub fn detect_vulkan_devices() -> Vec<String> {
 ///   · CUDA 但显存 < 6 GB        → 兼容模式
 ///   · 没有 CUDA 但有 Vulkan     → 兼容模式（走 llama.cpp）
 ///   · 什么都没有                → 兼容模式（纯 CPU）
-pub fn detect_device() -> (String, bool, f64, f64, bool, String, String, f64) {
+/// 一次显卡探测的全部结论。
+///
+/// 为什么用结构体而不是继续堆元组：v1.30.4 起多带「厂商 / 显存来源 /
+/// gfx 架构」三样东西，八元组已经到头，再加只会让调用点更难读。
+#[derive(Debug, Clone, Default)]
+pub struct DeviceInfo {
+    /// 设备状态栏直接显示的文本
+    pub text: String,
+    /// 能不能走 GPU 流水线（当前含义：CUDA 可用）
+    pub is_gpu: bool,
+    /// 总显存 GB。0.0 = 读不出来 / 没有独立显存
+    pub vram_gb: f64,
+    /// 剩余显存 GB
+    pub free_gb: f64,
+    /// 有没有 Vulkan 设备（兼容模式用）
+    pub has_vulkan: bool,
+    /// CUDA / ROCm 侧的卡名
+    pub cuda_name: String,
+    /// Vulkan 设备名（副标题用）
+    pub vulkan_name: String,
+    /// 计算能力 SM（N 卡）；A 卡恒为 0.0
+    pub cap: f64,
+    /// 厂商：nvidia / amd / unknown（空串 = 老探针没报）
+    pub vendor: String,
+    /// 显存来源：dedicated（独立）/ shared（核显共享内存）/ unknown
+    pub vram_kind: String,
+    /// AMD 的 gfx 架构名（如 gfx1036）；N 卡为空
+    pub arch: String,
+}
+
+impl DeviceInfo {
+    /// 全量 / 精简这两条流水线【都】要求 NVIDIA。
+    ///
+    /// 识别层的 faster-whisper 走 CTranslate2，Windows 官方轮子只有 CUDA，
+    /// 想要 HIP 得自己编译。所以 A 卡即使装了 ROCm 版 torch、分离能上 GPU，
+    /// 识别仍然只能落回 CPU —— 「分离飞快 + 识别龟速」，整体反而更慢。
+    pub fn nvidia_like(&self) -> bool {
+        self.is_gpu && (self.vendor.is_empty() || self.vendor == "nvidia")
+    }
+}
+
+/// 探测显卡：跑一小段 Python 去问 torch（「有没有 CUDA」只有装在脚本用的
+/// 那个环境里才问得准），同时枚举 Vulkan 设备。
+///
+/// 注意这是【阻塞】的：torch 首次导入要 2~3 秒，调用方必须放后台线程。
+///
+/// 模式判定（v1.20 起）：
+///   · CUDA 且显存 ≥ 8.1 GB      → 全量模式（float16）
+///   · CUDA 且显存 6~8.1 GB      → 精简模式（int8，仍是全量流水线）
+///   · CUDA 但显存 < 6 GB        → 兼容模式
+///   · 没有 CUDA 但有 Vulkan     → 兼容模式（走 llama.cpp）
+///   · 什么都没有                → 兼容模式（纯 CPU）
+///
+/// v1.30.4 修正（A 卡）：
+///   · AMD 核显（APU）的 total_memory 报的是【共享内存】，本机实测
+///     AMD Radeon(TM) Graphics 报 23.86 GB。当显存用的话，8 GB 门槛会被
+///     误放行，用户一开全量模式就崩 —— 现在 A 卡只认注册表里的独立显存，
+///     拿不到就记成 shared，并且由界面锁定兼容模式。
+///   · A 卡的计算能力（SM）没有意义，一律报 0.0，不参与「老卡」判断。
+///   · 剩余显存只对 N 卡问 nvidia-smi（WDDM 下 torch 的 mem_get_info
+///     会把已占用算成可用，实测差 7 倍）。
+pub fn detect_device() -> DeviceInfo {
     // 这段 Python 的缩进是语法的一部分，改的时候注意别动前面的空格。
     // 最外层不能有缩进。
     let code = r#"
 import torch
+
+
+def _dedicated_gb():
+    # 注册表里记的是【独立显存】（64 位值）。核显（APU）通常没有这一项，
+    # 或者只有一个很小的 BIOS 分配值。
+    try:
+        import winreg
+        path = r'SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0000'
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path)
+        try:
+            val, _ = winreg.QueryValueEx(key, 'HardwareInformation.qwMemorySize')
+            return float(val) / (1024 ** 3)
+        finally:
+            winreg.CloseKey(key)
+    except Exception:
+        return 0.0
+
+
 try:
     available = torch.cuda.is_available()
     name = torch.cuda.get_device_name(0) if available else ''
-    if available:
-        try:
-            gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-        except Exception:
-            gb = 0.0
-        # 剩余显存：用来区分「这台机器本来就没有 Vulkan」和「显存被别的程序占满了」。
-        # 总显存再大，也可能一时被占光 —— 那是两个完全不同的问题，文案不能混。
-        #
-        # ★ 优先问 nvidia-smi，不用 torch.cuda.mem_get_info：
-        #   WDDM 下 torch 报的是「CUDA 层还没分配出去的量」，把系统/别的进程
-        #   已经占用但没走 CUDA 分配器的显存也算成「可用」。实测同一时刻
-        #   nvidia-smi 只剩 997 MiB、torch 报 7.2 GB —— 差 7 倍，拿它判断
-        #   「够不够」等于没判断。
-        free_gb = 0.0
-        try:
-            import subprocess as _sp
-            _o = _sp.run(
-                ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=5)
-            free_gb = float(_o.stdout.strip().splitlines()[0]) / 1024.0
-        except Exception:
-            try:
-                _fb, _ = torch.cuda.mem_get_info(0)
-                free_gb = _fb / (1024 ** 3)
-            except Exception:
-                free_gb = 0.0
-        # 计算能力（SM）：NVIDIA 从 cuDNN 9.10 起不再为 SM < 7.5 的架构提供
-        # kernel，本程序自带的 torch 2.11+cu128 只编译了 sm_75/80/86/90/100/120。
-        # GTX 10 系（6.1）、Maxwell（5.x）、Volta（7.0）的用户一上 GPU 就抛
-        #   RuntimeError: cuDNN version 91900 is not compatible with
-        #                 devices with SM < 7.5.
-        # 这里把 SM 一起报给界面，界面据此把模式锁到兼容模式并说明原因。
-        try:
-            _cc = torch.cuda.get_device_capability(0)
-            cap = _cc[0] + _cc[1] / 10.0
-        except Exception:
-            cap = 0.0
-        print('GPU:' + name + '|' + ('%.1f' % gb) + '|' + ('%.1f' % free_gb)
-              + '|' + ('%.1f' % cap))
-    else:
+    if not available:
         print('CPU')
+    else:
+        ver_cuda = getattr(torch.version, 'cuda', None) or ''
+        ver_hip = getattr(torch.version, 'hip', None) or ''
+        vendor = 'nvidia' if ver_cuda else ('amd' if ver_hip else 'unknown')
+        gb = 0.0
+        kind = 'unknown'
+        arch = ''
+        try:
+            props = torch.cuda.get_device_properties(0)
+        except Exception:
+            props = None
+        if props is not None:
+            try:
+                gb = props.total_memory / (1024 ** 3)
+                kind = 'dedicated'
+            except Exception:
+                gb = 0.0
+            if vendor == 'amd':
+                arch = str(getattr(props, 'gcnArchName', '') or '')
+        if vendor == 'amd':
+            # ★ 本次修的 bug 就在这里。
+            #   APU 的 total_memory 是"共享内存"（本机 23.86 GB），当显存用
+            #   会让"≥8 GB 开全量模式"的门槛误放行。A 卡只认独立显存。
+            ded = _dedicated_gb()
+            looks_apu = ('Radeon(TM) Graphics' in name) or ('Radeon Graphics' in name)
+            if 'RX ' not in name and ('Vega' in name or looks_apu or 'Graphics' in name):
+                looks_apu = True
+            if ded > 0.25 and not looks_apu:
+                gb, kind = ded, 'dedicated'
+            else:
+                gb, kind = 0.0, 'shared'
+        free_gb = 0.0
+        cap = 0.0
+        if vendor == 'nvidia':
+            try:
+                import subprocess as _sp
+                _o = _sp.run(
+                    ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=5)
+                free_gb = float(_o.stdout.strip().splitlines()[0]) / 1024.0
+            except Exception:
+                try:
+                    _fb, _ = torch.cuda.mem_get_info(0)
+                    free_gb = _fb / (1024 ** 3)
+                except Exception:
+                    free_gb = 0.0
+            # 计算能力（SM）：NVIDIA 从 cuDNN 9.10 起不再为 SM < 7.5 的架构
+            # 提供 kernel，本程序自带的 torch 只编译了 sm_75 及以上。
+            # 这里把 SM 一起报给界面，界面据此把模式锁到兼容模式并说明原因。
+            try:
+                _cc = torch.cuda.get_device_capability(0)
+                cap = _cc[0] + _cc[1] / 10.0
+            except Exception:
+                cap = 0.0
+        print('GPU:' + '|'.join([
+            name,
+            '%.1f' % gb,
+            '%.1f' % free_gb,
+            '%.1f' % cap,
+            vendor,
+            kind,
+            arch,
+        ]))
 except Exception:
     print('ERROR')
 "#;
@@ -314,78 +417,29 @@ except Exception:
     // Vulkan 设备枚举不依赖 torch，先做（llama-server 不在就返回空）。
     let vulkan = detect_vulkan_devices();
     let has_vulkan = !vulkan.is_empty();
+    let vulkan_name = vulkan.join(" / ");
 
     match backend::run_python_inline(&config::python_exe(), code) {
-        Ok(s) if s.starts_with("GPU:") => {
-            // 格式：<名字>|<总显存GB>|<剩余显存GB>|<计算能力 SM>
-            // 老版本只报前三段，SM 缺失时按 0.0（未知）处理，等价于「不判老卡」。
-            let rest = s[4..].trim();
-            let parts: Vec<&str> = rest.split('|').collect();
-            let name = parts.first().map(|v| v.trim()).unwrap_or("");
-            let num = |i: usize| -> f64 {
-                parts
-                    .get(i)
-                    .and_then(|v| v.trim().parse::<f64>().ok())
-                    .unwrap_or(0.0)
-            };
-            let vram = num(1);
-            let free_gb = num(2);
-            // 计算能力：7.5 = Turing。低于它是 Pascal / Maxwell / Volta，
-            // 自带 torch（cu128 + cuDNN 9.19）在这些卡上会直接抛异常。
-            let cap = num(3);
-            let arch_old = cap > 0.0 && cap < 7.5;
-            // 阈值和 settings.py 的 _NEED_F16_MIB（8289 MiB）保持一致：
-            // float16 峰值 4265 + 基线 3000 + 预留 1024 = 8289 MiB ≈ 8.1 GB
-            let lite = vram > 0.0 && vram < 8.1;
-            // 标称 6 GB 卡的 CUDA 可管理容量可能略低于整 6 GiB；与 egui /
-            // settings.py 一致，按 5.75 GiB（5888 MiB）作为精简模式最低资格。
-            let text = if arch_old {
-                // 老卡能跑，但只能在 CPU 上跑；兼容模式就是纯 CPU 设计，
-                // 比「全量模式 + CPU」快得多，所以直接引导过去。
-                format!("显卡太老（{name}），请用兼容模式")
-            } else if vram > 0.0 && vram * 1024.0 < 5888.0 {
-                "兼容模式".to_string()
-            } else if name.is_empty() {
-                "GPU（已启用 CUDA）".to_string()
-            } else if lite {
-                format!("GPU：{name}（{vram:.1} GB 显存 · 精简模式）")
-            } else {
-                format!("GPU：{name}（已启用 CUDA）")
-            };
-            let vulkan_name = vulkan.join(" / ");
-            (
-                text,
-                true,
-                vram,
-                free_gb,
-                has_vulkan,
-                name.to_string(),
-                vulkan_name,
-                cap,
-            )
-        }
+        Ok(s) if s.starts_with("GPU:") => parse_gpu_line(&s, has_vulkan, vulkan_name),
         // 没有 CUDA：不再说「CPU 慢 50 倍」，而是走兼容模式。
         Ok(s) if s == "CPU" => {
             // 设备状态栏只写「兼容模式」四个字（用户明确要求）。
-            //   原来写的是「兼容模式（Vulkan：NVIDIA GeForce RTX 5070）」
-            //   这种带型号的长句 —— 型号在副标题里，状态栏只需说明
-            //   "现在用的是哪个模式"。
-            let text = "兼容模式".to_string();
-            // 兼容模式副标题要写「<显卡/核显型号> Vulkan 加速中」，
-            // 型号从显示适配器枚举里拿；纯 CPU 就留空，副标题不显示这段。
-            let vulkan_name = vulkan.join(" / ");
-            (text, false, 0.0, 0.0, has_vulkan, String::new(), vulkan_name, 0.0)
+            // 型号在副标题里，状态栏只需说明"现在用的是哪个模式"。
+            DeviceInfo {
+                text: "兼容模式".to_string(),
+                is_gpu: false,
+                has_vulkan,
+                vulkan_name,
+                ..Default::default()
+            }
         }
-        Ok(other) => (
-            format!("未知（检测失败：{other}）"),
-            false,
-            0.0,
-            0.0,
+        Ok(other) => DeviceInfo {
+            text: format!("未知（检测失败：{other}）"),
+            is_gpu: false,
             has_vulkan,
-            String::new(),
-            vulkan.join(" / "),
-            0.0,
-        ),
+            vulkan_name,
+            ..Default::default()
+        },
         Err(e) => {
             // 常见情况：解释器路径不对、torch 没装。
             // 截断一下，别让一整条 traceback 把状态栏撑爆。
@@ -393,17 +447,165 @@ except Exception:
             if msg.chars().count() > 80 {
                 msg = msg.chars().take(80).collect::<String>() + "…";
             }
-            (
-                format!("未知（{msg}）"),
-                false,
-                0.0,
-                0.0,
+            DeviceInfo {
+                text: format!("未知（{msg}）"),
+                is_gpu: false,
                 has_vulkan,
-                String::new(),
-                vulkan.join(" / "),
-                0.0,
-            )
+                vulkan_name,
+                ..Default::default()
+            }
         }
+    }
+}
+
+/// 解析探针打印的 `GPU:` 行。
+///
+/// 格式：`GPU:<名字>|<总显存GB>|<剩余显存GB>|<SM>|<厂商>|<显存来源>|<gfx架构>`
+/// 后三段是 v1.30.4 加的；老格式（只有前四段）按「未知」处理，
+/// 行为与改动前完全一致。
+///
+/// 单独抽出来是为了能写单元测试 —— 这段判定决定了「用户会不会被塞进
+/// 全量模式然后崩」，靠肉眼 review 不够。
+pub(crate) fn parse_gpu_line(s: &str, has_vulkan: bool, vulkan_name: String) -> DeviceInfo {
+    let rest = s[4..].trim();
+    let parts: Vec<&str> = rest.split('|').collect();
+    let name = parts.first().map(|v| v.trim()).unwrap_or("");
+    let num = |i: usize| -> f64 {
+        parts
+            .get(i)
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+    let at = |i: usize| -> String {
+        parts
+            .get(i)
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default()
+    };
+    let vram = num(1);
+    let free_gb = num(2);
+    // 计算能力：7.5 = Turing。低于它是 Pascal / Maxwell / Volta，
+    // 自带 torch（cu128 + cuDNN 9.19）在这些卡上会直接抛异常。
+    let cap = num(3);
+    let vendor = at(4).to_lowercase();
+    let vram_kind = at(5).to_lowercase();
+    let arch = at(6);
+    let arch_old = cap > 0.0 && cap < 7.5;
+    let amd = vendor == "amd";
+    let shared = vram_kind == "shared";
+    // 阈值和 settings.py 的 _NEED_F16_MIB（8289 MiB）保持一致：
+    // float16 峰值 4265 + 基线 3000 + 预留 1024 = 8289 MiB ≈ 8.1 GB
+    let lite = vram > 0.0 && vram < 8.1;
+    let text = if amd || shared {
+        // A 卡只走兼容模式（原因见 DeviceInfo::nvidia_like）；
+        // 共享内存（核显）不算显存，同样没有资格开全量/精简。
+        "兼容模式".to_string()
+    } else if arch_old {
+        // 老卡能跑，但只能在 CPU 上跑；兼容模式就是纯 CPU 设计，
+        // 比「全量模式 + CPU」快得多，所以直接引导过去。
+        format!("显卡太老（{name}），请用兼容模式")
+    } else if vram > 0.0 && vram * 1024.0 < 5888.0 {
+        "兼容模式".to_string()
+    } else if name.is_empty() {
+        "GPU（已启用 CUDA）".to_string()
+    } else if lite {
+        format!("GPU：{name}（{vram:.1} GB 显存 · 精简模式）")
+    } else {
+        format!("GPU：{name}（已启用 CUDA）")
+    };
+    DeviceInfo {
+        text,
+        is_gpu: true,
+        vram_gb: vram,
+        free_gb,
+        has_vulkan,
+        cuda_name: name.to_string(),
+        vulkan_name,
+        cap,
+        vendor,
+        vram_kind,
+        arch,
+    }
+}
+
+#[cfg(test)]
+mod device_tests {
+    use super::*;
+
+    #[test]
+    fn nvidia_big_card_stays_full_mode() {
+        // 本机实测输出
+        let d = parse_gpu_line(
+            "GPU:NVIDIA GeForce RTX 5070|11.9|5.3|12.0|nvidia|dedicated|",
+            false,
+            String::new(),
+        );
+        assert!(d.is_gpu);
+        assert!(d.nvidia_like());
+        assert_eq!(d.vendor, "nvidia");
+        assert_eq!(d.vram_kind, "dedicated");
+        assert!((d.vram_gb - 11.9).abs() < 1e-9);
+        assert!(d.text.contains("已启用 CUDA"));
+    }
+
+    #[test]
+    fn amd_apu_shared_memory_is_not_vram() {
+        // ★ 本次修的 bug：核显的共享内存曾被当成 23.86 GB 显存，
+        //   8 GB 门槛误放行 → 全量模式一跑就崩。
+        let d = parse_gpu_line(
+            "GPU:AMD Radeon(TM) Graphics|0.0|0.0|0.0|amd|shared|gfx1036",
+            true,
+            "AMD Radeon(TM) Graphics".to_string(),
+        );
+        assert!(!d.nvidia_like());
+        assert_eq!(d.vram_gb, 0.0);
+        assert_eq!(d.vendor, "amd");
+        assert_eq!(d.vram_kind, "shared");
+        assert_eq!(d.arch, "gfx1036");
+        assert_eq!(d.text, "兼容模式");
+        assert!(d.has_vulkan);
+    }
+
+    #[test]
+    fn amd_dedicated_card_also_compat() {
+        // A 卡独显（RX 9070 之类）分离能上 GPU，但识别层的 CTranslate2
+        // 在 Windows 只有 CUDA 轮子，所以仍然只给兼容模式。
+        let d = parse_gpu_line(
+            "GPU:AMD Radeon RX 9070 XT|15.9|15.1|0.0|amd|dedicated|gfx1201",
+            true,
+            String::new(),
+        );
+        assert!(!d.nvidia_like());
+        assert_eq!(d.text, "兼容模式");
+    }
+
+    #[test]
+    fn old_format_without_vendor_still_works() {
+        // 老探针只打印四段：不能因为少了厂商字段就判成 A 卡。
+        let d = parse_gpu_line("GPU:NVIDIA GeForce RTX 3060|11.9|9.8|8.6", false, String::new());
+        assert_eq!(d.vendor, "");
+        assert_eq!(d.vram_kind, "");
+        assert!(d.nvidia_like());
+        assert!(d.text.contains("已启用 CUDA"));
+    }
+
+    #[test]
+    fn old_low_memory_card_falls_back_to_compat() {
+        let d = parse_gpu_line("GPU:NVIDIA GeForce GTX 1650|3.9|3.0|7.5", false, String::new());
+        assert_eq!(d.text, "兼容模式");
+    }
+
+    #[test]
+    fn old_arch_card_is_blocked() {
+        let d = parse_gpu_line("GPU:NVIDIA GeForce GTX 1080|7.9|7.0|6.1", false, String::new());
+        assert!(d.text.contains("显卡太老"));
+    }
+
+    #[test]
+    fn shared_memory_from_unknown_vendor_is_not_vram() {
+        // 没报厂商但报了「共享」时同样挡掉。
+        let d = parse_gpu_line("GPU:Intel(R) UHD Graphics|16.0|15.0|0.0||shared|", false, String::new());
+        assert_eq!(d.text, "兼容模式");
     }
 }
 

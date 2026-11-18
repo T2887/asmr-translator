@@ -29,6 +29,24 @@ import sys
 import tempfile
 import time
 
+# ★ 识别/VAD 的 CPU 线程数（v1.30.4 起可调，默认 4 = 旧行为）。
+#   实测（H:\_probe_asr\bench_cuda.py，Haas-ja encoder，8.6s 一段）：
+#     1/2/4/8/16 线程 = 4122/1994/1260/872/2082 ms
+#   → 4→8 线程白拿 1.45x，比走 CUDA EP（892 ms，1.29x）还快。
+#   原因：这个 int8 模型 70% 的时间是 ConvInteger 卷积，而 CUDA EP 没有
+#   int8 卷积 kernel（255 个 ConvInteger 全部回退 CPU），GPU 只能加速
+#   22% 的 MatMulNBits，还要付 PCIe 拷贝成本。
+#   默认按核数给：4 核及以下给 4（再高会互相抢核，16 线程实测反而更慢），
+#   8 核机器给 4，16 核给 8。上层也可以直接用环境变量覆盖，
+#   例如 ASMR_ASR_THREADS=8。
+_ASR_THREADS = min(8, max(4, (os.cpu_count() or 4) // 2))
+try:
+    _env_thr = int(os.environ.get("ASMR_ASR_THREADS", "") or 0)
+    if _env_thr > 0:
+        _ASR_THREADS = max(1, min(16, _env_thr))
+except Exception:
+    pass
+
 # ★ 绕过 torch 的一个重复注册 bug：
 #   某些环境里 torchcodec 解码音频时会重新执行 torch._dynamo.package，
 #   而 package.py 在模块级调 CacheArtifactFactory.register，
@@ -118,8 +136,8 @@ for _name in ("vad_asmr_encdec.onnx", "asmr_vad.onnx", "model.onnx"):
 if _vp:
     try:
         from asmr_vad import AsmrVad
-        asmr_vad = AsmrVad(_vp, threads=4)
-        print(f"  VAD: ASMR 专用（{os.path.basename(_vp)}）", flush=True)
+        asmr_vad = AsmrVad(_vp, threads=_ASR_THREADS)
+        print(f"  VAD: ASMR 专用（{os.path.basename(_vp)}，{_ASR_THREADS} 线程）", flush=True)
     except Exception as _e:
         print(f"  VAD: ASMR 加载失败（{type(_e).__name__}: {_e}），"
               f"自动回退 Silero", flush=True)
@@ -127,9 +145,49 @@ if _vp:
 else:
     print("  VAD: 未找到 ASMR VAD，自动回退 Silero", flush=True)
 
+# ★ v1.30.4：ASR 热词。
+#
+#   和翻译层共用同一批词表文件（`hotwords.txt` + `hotwords_<音频名>.txt`，
+#   逗号分隔、# 注释），但喂给识别器的形态不同：这里是「一行一个词」。
+#   一次任务里多个作品会合并成一份词表（识别器只建一次，按文件重建要 2 秒）。
+#
+#   为什么要单开这个开关：热词会把解码从 greedy 换成 modified_beam_search，
+#   120 秒音频实测 13.4 s → 15.1~16.0 s（+12~19%）。所以只在词表里
+#   真有词（用户主动填了人名）时才开；`ASMR_ASR_HOTWORDS=off` 可强制关闭。
+def _load_hotwords(stems):
+    """从词表文件里收集热词（去重、保序）。"""
+    if os.environ.get("ASMR_ASR_HOTWORDS", "").lower() in ("off", "0", "no"):
+        return []
+    names = ["hotwords.txt"] + [f"hotwords_{s}.txt" for s in stems]
+    terms = []
+    for name in names:
+        p = os.path.join(".", name)
+        if not os.path.isfile(p):
+            continue
+        try:
+            with open(p, encoding="utf-8-sig") as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if not ln or ln.startswith("#"):
+                        continue
+                    for w in ln.replace("，", ",").split(","):
+                        w = w.strip()
+                        if w and w not in terms:
+                            terms.append(w)
+        except OSError:
+            pass
+    return terms
+
+
+_stems = [os.path.splitext(os.path.basename(f))[0] for f in files]
+_hw = _load_hotwords(_stems)
+if _hw:
+    print(f"  热词: {len(_hw)} 个（{'、'.join(_hw[:6])}"
+          f"{'…' if len(_hw) > 6 else ''}）— 解码改用 beam search", flush=True)
+
 # ★ 识别引擎：默认 Haas-ja（实测最准），失败自动降级。
 #   具体策略和实测数据见 asr_engine.py 顶部注释。
-asr, _engine_note = load_engine(num_threads=4)
+asr, _engine_note = load_engine(num_threads=_ASR_THREADS, hotwords=_hw)
 _HAS_EX = hasattr(asr, "transcribe_ex")
 print(f"模型加载完成（{time.time() - t0:.1f}s）— {_engine_note}", flush=True)
 if not _HAS_EX:

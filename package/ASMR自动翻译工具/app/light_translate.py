@@ -23,6 +23,10 @@ import urllib.request
 
 from events import emit
 
+# ★ v1.30.4：术语后处理（fixes.txt / fixes_<名>.txt）。
+#   prompt 是软约束，几百段里总会冒出几种写法；这一层做确定性替换。
+from terms_fix import apply_fixes, load_fixes
+
 # ★ v1.30.3：运行时状态采集（模型吞吐 / CPU 频率 / 占用核数）
 #   借鉴安卓版思路（它从 llama-server 的 /metrics 取 tok/s、
 #   从 /proc 取 CPU、从 scaling_cur_freq 取频率）。
@@ -340,72 +344,157 @@ def wait_health(port, timeout=120, proc=None):
     return False
 
 
-def translate(port, text, glossary):
+def translate(port, text, glossary, bump=0.0):
     """翻译一句。★ v1.28.5：内部重试 3 次，绝不返回空。
 
     以前这里只请求一次：超时 / 返回空串就一路抛到上层，上层直接
     `continue` 丢掉 —— 用户看到的就是「有些话根本没翻译、整条不见了」。
     现在改成 3 次重试（间隔递增），仍然失败就抛异常，由上层汇总报错，
     不再悄悄留下一句日文或干脆删掉。
+
+    ★ v1.30.4：新增「循环退化」重试（用户反馈「偶尔一两句不断重复」）。
+    检到 _is_runaway 就换更高温度重来；3 次都退化，就取最短的那次
+    再做收尾压缩（宁可短，也不要把同一句刷屏交给用户）。bump 用于
+    上层发现「与上一句完全相同」时强制换温度。
     """
     last = "未知错误"
+    best = ""
     for attempt in range(3):
         try:
-            zh = _translate_once(port, text, glossary, temp=0.1 if attempt == 0 else 0.3)
-            if zh:
-                return zh
-            last = "模型返回空"
+            temp = min(0.9, 0.1 + bump + 0.2 * attempt)
+            raw = _translate_once(port, text, glossary, temp=temp)
+            if raw:
+                # ★ 必须在【压缩前】判退化：压缩会把 300 字的刷屏压成 2 句，
+                #   之后就看不出来了（v1.30.4）。
+                if not _is_runaway(raw, text):
+                    return _collapse_repeats(raw)
+                last = "译文循环退化"
+                if not best or len(raw) < len(best):
+                    best = raw
         except Exception as e:
             last = f"{type(e).__name__}: {e}"
         time.sleep(0.4 * (attempt + 1))
+    if best:
+        print(f"  [退化] 3 次都重复，取最短一次并压缩：{best[:30]}…", flush=True)
+        return _collapse_repeats(best, max_repeat=1)
     raise RuntimeError(last)
 
 
+_PUNCT = " ~～、,，？?！!…。"
+
+
 def _collapse_repeats(s, max_repeat=2):
-    """收缩连续重复的同一片段（v1.30.3）。
+    """收缩连续重复的同一片段（v1.30.3 引入，v1.30.4 加强）。
 
-    ★ 真实问题（用户实测指出）：一句里出现「嘿嘿~ 嘿嘿~ 嘿嘿~ …」20 多次。
-    根因在 ASR 侧：日语原文本就是 `れろれろれろ`、`うんうんうん`、
-    `おいおいおい` 这种真实重复（喘气/舔舐的声音就是这样），
-    翻译模型忠于原文，逐个音节翻成中文 → 中文里重复膨胀。
+    ★ 真实问题（用户实测指出）：一句里出现「嘿嘿~ 嘿嘿~ 嘿嘿~ …」20 多次，
+      以及「会一直在一起吗？会一直在一起吗？会一直在一起吗？」整句刷屏。
+    根因有两层：ASR 侧日语原文本就重复（喘气/舔舐），翻译模型忠于原文
+    逐个音节翻成中文 → 中文里重复膨胀；另有小模型的循环退化。
 
-    但字幕不需要把每个音节都写出来：
-      · 观众看得懂「嘿嘿~ 嘿嘿~」是连续的，写到 2~3 次就足够了
-      · 20 多次会把一行字幕撑爆，播放器上根本读不完
+    字幕不需要把每个音节都写出来：写到 2 次就够，20 多次会把一行撑爆。
 
-    做法：找出长度 1~6 的「同一单元连续重复 ≥3 次」的片段，
-    收缩到 max_repeat 次（保留感叹性质，又不刷屏）。
-    注意只用【完全相同】的重复，不做模糊匹配，避免误伤正常语句。
+    v1.30.4 的两处修正：
+      ① 单元上限 6 → 10：整句重复常常是 7~10 字的完整句子。
+      ② 数重复时忽略尾部标点（「别说那种话啦，」×2 + 「别说那种话啦」）
+         —— 旧逻辑要求一字不差，最后一条没有逗号就数不到 3 次，
+         于是整句原样留着。现在按「去掉尾部标点后相同」来数。
+    只认完全相同的核心串，不做模糊匹配，避免误伤正常语句。
     """
     if not s:
         return s
+
+    def core(x):
+        return x.rstrip(_PUNCT)
+
     out = s
-    # 从长单元往短单元找，避免「嘿嘿嘿」先被单字规则切坏
-    for unit_len in range(6, 0, -1):
+    for unit_len in range(10, 0, -1):
         i = 0
         res = []
-        while i < len(out):
-            unit = out[i:i + unit_len]
-            if len(unit) < unit_len:
+        n_out = len(out)
+        while i < n_out:
+            if i + unit_len > n_out:
                 res.append(out[i:])
                 break
-            # 数这一单元连续出现多少次
-            n = 1
+            unit = out[i:i + unit_len]
+            cu = core(unit)
+            if not cu:
+                res.append(unit)
+                i += unit_len
+                continue
+            k = 1
             j = i + unit_len
-            while out[j:j + unit_len] == unit:
-                n += 1
-                j += unit_len
-            if n >= 3:
-                res.append(unit * max_repeat)
-                # 吃掉重复之间可能的空格/波浪号（「嘿嘿~ 嘿嘿~」）
+            while j < n_out:
+                if core(out[j:j + unit_len]) == cu:
+                    k += 1
+                    j += unit_len
+                else:
+                    break
+            if k >= 3:
+                sep = unit[len(cu):]
+                if sep:
+                    res.append(sep.join([cu] * max_repeat) + sep)
+                else:
+                    res.append(cu * max_repeat)
                 i = j
-                while i < len(out) and out[i] in " ~～、,，":
-                    i += 1
             else:
                 res.append(unit)
                 i += unit_len
         out = "".join(res)
-    return out.strip()
+    return out.strip().rstrip("，、, ~～")
+
+
+def _max_run(x, min_unit=4):
+    """最长连续重复：(次数 k, 单元长度 u)。只看 ≥min_unit 字的单元，忽略尾部标点。"""
+    n = len(x)
+    best_k, best_u = 1, 0
+    for u in range(min_unit, n // 2 + 1):
+        i = 0
+        while i + 2 * u <= n:
+            blk = x[i:i + u].rstrip(" ~～、,，？?！!…。")
+            k = 1
+            while (i + (k + 1) * u <= n
+                   and x[i + k * u:i + (k + 1) * u].rstrip(" ~～、,，？!…。") == blk):
+                k += 1
+            if k >= 2 and k > best_k:
+                best_k, best_u = k, u
+            i += k * u if k >= 2 else 1
+    return best_k, best_u
+
+
+def _is_runaway(zh, src=""):
+    """判断译文是否「循环退化」——即刷屏式重复（v1.30.4-p2）。
+
+    ★ A/B 实测教训（两次，共 324 条真实输出）：
+      ① 第一版「只要重复就算退化」把 9/12 条**忠实翻译**误判了 —— 原文本来
+         就是「だめ、だめ…」14 遍，中文照译「不行，不行…」是对的。
+         而且 --repeat-penalty 1.1 前后都是 9/12，说明惩罚参数只能治真循环，
+         治不了「原文就重复」→ 判据必须【相对原文】。
+      ② 第二版用「译文/原文 ≥ N 倍」当闸口，但**原文一长比例就上不去**：
+         实测用户截图那种「嘛..真的是的..真的是的..×28」（4 字单元）在
+         原文 90 字时比例只有 1.96，两道闸都放行 → 漏判。
+      ③ 现在改成**先看原文有没有重复**，不再靠比例赌：
+         · 原文自己连刷 ≥3 次（だめ×12、ずっと一緒×3）→ 译文重复是忠实的，不判；
+         · 原文不重复、译文却把某个 ≥4 字片段连刷 ≥3 次且占全句 ≥55% → 判退化。
+      离线验证：312 条真实模型输出里只命中 1 条（「やめて×12 → 停×33」，
+      确实该判），300 条 1027 真实台词 0 误判；9 条合成用例 9/9 判对。
+      注意：即使不判退化，_collapse_repeats 也会把连续 ≥3 次压成 2 次，是最后兜底。
+    """
+    s = (zh or "").strip()
+    n = len(s)
+    if n < 12:
+        return False
+    sl = len((src or "").strip())
+    # ① 长度失控（译文 > 原文 6 倍；日译中正常 0.5~1.2 倍）
+    if sl >= 4 and n / sl >= 6.0:
+        return True
+    # ② 原文自己就在重复 → 译文的重复是忠实的，交给 _collapse_repeats 收敛
+    if src and _max_run(src.strip())[0] >= 3:
+        return False
+    # ③ 原文不重复，译文却连刷 ≥3 次且占全句一半以上
+    k, u = _max_run(s)
+    if k >= 3 and k * u >= max(12, int(n * 0.55)):
+        return True
+    return False
 
 
 def _sanitize_zh(s):
@@ -424,10 +513,52 @@ def _sanitize_zh(s):
     return s[:cut].strip()
 
 
+# ── v1.30.4：挂 LoRA 时必须用训练时的模板 ──
+#
+# 训练脚本 `_lora/train_lora.py` 里是手写 hy 模板：
+#   BOS + SYSTEM + <|hy_place▁holder▁no▁3｜> + <|hy_User｜> + 日文 + <|hy_Assistant｜>
+# 而 llama-server 的 /v1/chat/completions 会套它自己那份 chat 模板——两者
+# 对不上时，挂 LoRA 的模型会吐 `<|<|<|…` 占位符刷屏（实测每句 320 token、
+# 10.8 秒，全是垃圾）。改成直接发 /completion 原始 prompt 就正常了：
+# 每句 0.24~0.68 秒、24 tok/s，与不挂 LoRA 持平。
+_HY_BOS = "<|hy_begin▁of▁sentence｜>"
+_HY_SYS_END = "<|hy_place▁holder▁no▁3｜>"
+_HY_TURN_END = "<|hy_place▁holder▁no▁2｜>"
+_HY_USER = "<|hy_User｜>"
+_HY_ASSIST = "<|hy_Assistant｜>"
+
+
+def _raw_completion(port, system, text, temp):
+    """按训练时的 hy 模板发原始 prompt（不带 chat 模板）。"""
+    prompt = f"{_HY_BOS}{system}{_HY_SYS_END}{_HY_USER}{text}{_HY_ASSIST}"
+    payload = {
+        "prompt": prompt,
+        "temperature": temp,
+        # ★ v1.28.5：128 对长句会被硬截断（译文半截但不为空，更隐蔽）
+        "n_predict": 320,
+        "stop": [_HY_TURN_END, "<|hy_", "＜｜"],
+        "stream": False,
+        # ★ 同一条 system 前缀会被 llama.cpp 缓存，实测省掉一半时间
+        #   （4.46 s → 2.19 s / 5 句）
+        "cache_prompt": True,
+    }
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/completion",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=120) as r:
+        d = json.load(r)
+    return d.get("content", "")
+
+
 def _translate_once(port, text, glossary, temp=0.1):
     system = SYSTEM + _builtin_prompt()
     if glossary:
         system += "\n专有名词（必须原样保留，不要意译）：" + "、".join(glossary)
+    if LORA_PATH:
+        # 挂 LoRA：走手写 hy 模板（否则输出退化，见上面的说明）
+        return _sanitize_zh(_raw_completion(port, system, text, temp))
     payload = {
         "messages": [
             {"role": "system", "content": system},
@@ -448,8 +579,7 @@ def _translate_once(port, text, glossary, temp=0.1):
     )
     with urllib.request.urlopen(req, timeout=120) as r:
         d = json.load(r)
-    zh = _sanitize_zh(d["choices"][0]["message"]["content"])
-    return _collapse_repeats(zh)
+    return _sanitize_zh(d["choices"][0]["message"]["content"])
 
 
 def fmt_time(t):
@@ -590,6 +720,13 @@ def main():
                #   安卓版就是这么做的（--metrics + Prometheus 文本解析），
                #   用户能立刻看出「模型是不是在干活」，而不是盯着进度条猜。
                "--metrics",
+               # ★ v1.30.4：防「整句翻译不断重复」（用户反馈）。
+               #   1.8B 小模型在 temperature 0.1 + 无惩罚时，遇到
+               #   长句／重复语气词会陷入循环：同一句刷 5~10 遍，
+               #   max_tokens 320 足够它刷完。服务端加温和惩罚是根治
+               #   方向（1.1 很轻，不会改掉「嘿嘿~ 嘿嘿~」这种正常重复）。
+               "--repeat-penalty", "1.1",
+               "--repeat-last-n", "256",
                "--log-verbosity", "0"]
         if use_lora and LORA_PATH:
             # 加载失败宁可起不来走下面的 CPU 回退，也不静默丢增强
@@ -657,9 +794,9 @@ def main():
         except Exception as _e:
             print(f"[测速] 跳过（{type(_e).__name__}: {_e}）", flush=True)
 
-    use_lora = bool(LORA_PATH) and dev != "none"
+    use_lora = bool(LORA_PATH)
     if LORA_PATH:
-        print(f"[LoRA] 翻译增强适配器：{'启用（' + dev_name + '）' if use_lora else '已有但本次不启用（CPU 太慢）'}",
+        print(f"[LoRA] 翻译增强适配器：{'启用（' + dev_name + '）' if use_lora else '本次不启用（ASMR_TRANSLATE_LORA=off）'}",
               flush=True)
     print(f"[设备] 翻译使用：{dev_name}（{dev}）", flush=True)
     print(f"启动内置 llama.cpp（端口 {port}）...", flush=True)
@@ -678,7 +815,11 @@ def main():
                 except Exception:
                     pass
             dev, dev_name = "none", "CPU"
-            use_lora = False   # CPU 回退不挂 LoRA（慢 2.4 倍）
+            # ★ v1.30.4：CPU 也挂 LoRA。2026-11-18 实测（llama-server
+            #   --device none + 手写 hy 模板 + cache_prompt）：挂与不挂
+            #   都是 ~24 tok/s，每句 0.24~0.68 s，没有额外代价。
+            #   旧注释「慢 2.4 倍」是把 Vulkan / CPU 的设备测速混进来了。
+            use_lora = bool(LORA_PATH)
             proc = start_server("none", False)
             if not wait_health(port, proc=proc):
                 print("[失败] llama-server 启动超时")
@@ -720,6 +861,8 @@ def main():
             stem = os.path.splitext(os.path.basename(fp))[0]
             rows = json.load(open(fp, encoding="utf-8"))
             glossary = load_glossary(stem)
+            # ★ v1.30.4：错译 → 标准译 的替换表（可缺省，缺省时什么都不改）
+            fixes = load_fixes(stem)
             print(f"\n翻译: {os.path.basename(fp)}（{len(rows)} 段）", flush=True)
 
             done = []
@@ -731,6 +874,7 @@ def main():
             _n_all = len([1 for r in rows if (r.get("text") or "").strip()])
             _t_tr0 = time.time()
             _n_done = 0
+            _prev_zh, _prev_src = "", ""
             for r in rows:
                 text = (r.get("text") or "").strip()
                 if not text:
@@ -745,7 +889,19 @@ def main():
                     failed.append({"start": r["start"], "end": r["end"], "jp": text, "err": str(e)})
                     print(f"  [失败] {type(e).__name__}: {e}", flush=True)
                     continue
+                # ★ v1.30.4：与上一句一字不差、但日文原文不同 → 多半是
+                #   循环退化的产物。换更高温度重译一次；仍然相同就保留
+                #   （有些段落原文确实该译成同一句）。
+                if len(zh) >= 10 and zh == _prev_zh and text != _prev_src:
+                    try:
+                        zh2 = translate(port, text, glossary, bump=0.6)
+                        if zh2 and zh2 != _prev_zh:
+                            print(f"  [去重] 与上一句相同，换温度重译 → {zh2[:30]}", flush=True)
+                            zh = zh2
+                    except Exception:
+                        pass
                 done.append({"start": r["start"], "end": r["end"], "zh": zh, "jp": text})
+                _prev_zh, _prev_src = zh, text
                 print(f"[{float(r['start']):.2f}s -> {float(r['end']):.2f}s]: {zh}", flush=True)
                 # ★ 段进度：每 20 段或最后一段
                 _n_done += 1
@@ -788,6 +944,10 @@ def main():
             lines = []
             for i, r in enumerate(tidy, 1):
                 zh = _one_line(r["zh"])
+                # ★ v1.30.4：术语后处理放在最后一步（压缩/去重之后），
+                #   替换表里的写法是「用户看到的标准写法」，不该被前面的
+                #   去重逻辑再动一遍。
+                zh = apply_fixes(zh, fixes)
                 if JPN_INLINE:
                     # 一条字幕两行：日文原文在上、中文在下。两条都用 \n 分隔，
                     # 中间不能再有空行（空行会切断 SRT 块）。
