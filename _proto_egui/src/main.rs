@@ -140,7 +140,9 @@ struct App {
     // ── 真实后端接线 ──
     worker: Option<worker::Worker>,
     #[allow(clippy::type_complexity)]
-    device_rx: Option<std::sync::mpsc::Receiver<(String, bool, f64, f64, bool, String, String, f64)>>,
+    // ★ v1.30.5：pipeline::detect_device 改成返回 DeviceInfo（多了 vendor/vram_kind/arch，
+    //   用来识别 A 卡和核显的共享显存）。这里跟着换成结构体，否则 egui 版直接编译不过。
+    device_rx: Option<std::sync::mpsc::Receiver<pipeline::DeviceInfo>>,
     device_text: String,
     full_ok: bool,
     lite_ok: bool,
@@ -1287,8 +1289,28 @@ impl App {
                     self.device_text = "设备检测失败（可直接用兼容模式）".into();
                     self.push_log("[设备] 检测线程结束但没有回值");
                 }
-                Some(Ok((text, is_gpu, vram, free, vulkan, cuda_name, vk_name, cap))) => {
+                Some(Ok(info)) => {
                 self.device_rx = None;
+                let (text, is_gpu, vram, free, vulkan, cuda_name, vk_name, cap) = (
+                    info.text.clone(), info.is_gpu, info.vram_gb, info.free_gb,
+                    info.has_vulkan, info.cuda_name.clone(), info.vulkan_name.clone(), info.cap,
+                );
+                // ★ A 卡 / 核显共享显存：两者都不能进全量/精简（那是 CUDA 专属）。
+                //   A 卡走 ROCm 才有分离，识别层 CTranslate2 在 Windows 无 HIP 轮子；
+                //   核显的 total_memory 是共享内存（实测 23.9 GB），按它放行必然 OOM。
+                let amd = info.vendor == "amd";
+                let shared_mem = info.vram_kind == "shared";
+                if amd {
+                    self.push_log(format!(
+                        "[显卡] 检测到 AMD 显卡 {}（{}），已锁定为兼容模式（分离/识别在 Windows 上没有可用的 GPU 加速）",
+                        info.cuda_name, info.arch
+                    ));
+                } else if shared_mem {
+                    self.push_log(format!(
+                        "[显卡] 检测到核显 {}（共享显存），已锁定为兼容模式",
+                        info.cuda_name
+                    ));
+                }
                 self.device_text = text.clone();
                 // 阈值与 Python settings.py 共用同一口径：标称 6/8 GB 卡各给约 4%
                 // 容差，避免驱动/固件预留后显示 6.0/8.0 GB 却被后台误判。当前空余
@@ -1329,10 +1351,14 @@ impl App {
                 // 总显存判断硬件资格；当前空余显存判断此刻是否安全启动。
                 // 全量约 4 GB 峰值 + 1 GB 余量，精简约 2 GB + 1 GB 余量。
                 self.full_ok = !arch_old
+                    && !amd
+                    && !shared_mem
                     && is_gpu
                     && (vram <= 0.0 || vram_mib >= FULL_TOTAL_MIN_MIB)
                     && (free_unknown || free >= 5.0);
                 self.lite_ok = !arch_old
+                    && !amd
+                    && !shared_mem
                     && is_gpu
                     && (vram <= 0.0 || vram_mib >= LITE_TOTAL_MIN_MIB)
                     && (free_unknown || free >= 3.0);
@@ -1358,7 +1384,7 @@ impl App {
                 // 当前模式不安全：优先降到仍可运行的精简模式，否则兼容模式。
                 // 老卡（arch_old）全量/精简都不可用，直接锁兼容模式，且不再拿
                 // 「空余显存」解释原因（那样会误导用户去关程序腾显存）。
-                if arch_old {
+                if arch_old || amd || shared_mem {
                     self.mode = RunMode::Compat;
                 } else if self.mode == RunMode::Full && !self.full_ok {
                     if self.lite_ok {

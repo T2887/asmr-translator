@@ -17,6 +17,24 @@
 - 改了 `env\`（装包/升级依赖）、模型权重（BS-RoFormer / whisper / Haas-ja / Hy-MT2 主模型）→ 重打 b2 + 同步网盘 + 改 `version.json` 的 `runtime` 提示
 - LoRA 类小模型刻意放 b1 不放 b2：老用户升级一次就能吃到（iss 里两边都有通配时记得在 b2 加 `Excludes`，防重复打包）
 
+## 0. ★ 发布只编 `_proto_egui`（v1.30.5 血的教训）
+
+仓库里有两套界面：
+
+| 目录 | 界面 | 产物 | 状态 |
+|---|---|---|---|
+| `_proto_egui/` | egui（eframe） | `asmr_proto_egui.exe`，约 6.7 MB | **正式发布版** |
+| `app/` | WinUI3（windows-reactor） | `asmr_translator.exe`，约 5.5 MB | 早期版本，**已废弃** |
+
+`app/` 那个版本依赖 Windows App Runtime（`Microsoft.WindowsAppRuntime.Bootstrap.dll`），
+Win10 用户装完会弹「You must install Windows App Runtime (2.4.0, x64)」。
+v1.30.4 我误用 `app/` 构建，导致两个用户报这个问题；v1.30.5 换回 `_proto_egui` 修复。
+
+- `app/src/` 里的 `backend.rs` / `config.rs` / `pipeline.rs` / `srt.rs` / `softsub.rs`
+  被 `_proto_egui/src/main.rs` 用 `#[path]` 共享 —— **改这几个文件后必须也编一遍
+  `_proto_egui`**，否则它可能编译不过（`detect_device` 返回 `DeviceInfo` 那次就踩了）。
+- `app/src/ui.rs` 只属于废弃的 WinUI3 版，改它对发布版没有任何影响。
+
 ## 1. 版本号三处同步（漏一处就是事故）
 
 | 位置 | 字段 |
