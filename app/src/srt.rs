@@ -403,8 +403,28 @@ pub fn write_ass(path: &Path, cues: &[Cue]) -> Result<(), String> {
     })
 }
 
-/// 读全局词表 + 按作品词表（app\词表.txt 和 app\词表_<stem>.txt）。
-pub fn load_wordlist(app_dir: &Path, stem: Option<&str>) -> Vec<(String, String)> {
+/// 一条词表规则。
+///
+/// ★ v1.30.6：与 Python 侧 `app/terms_fix.py` 对齐，支持三种写法：
+///   `错=对`                 无条件（译后）
+///   `错=对|条件词`          仅当文本里出现「条件词」时替换
+///   `错=对|!条件词`         仅当文本里**不**出现「条件词」时替换
+///   `pre:日A=日B`           译前替换 —— 全量/精简没有日文文本层，**跳过**
+///
+/// 为什么必须跳过 `pre:` 行：旧解析器只认 `=`，会把字面的
+/// 「pre:ぺろぺろ」当成左边去匹配（永远匹配不上，静默失效），
+/// 而 `A=B|条件` 会把右侧整串「B|条件」当替换结果，真出现 A 时
+/// 输出「B|条件」这种垃圾。这两个 bug 都会「不崩但悄悄坏掉」。
+#[derive(Debug, Clone)]
+pub struct WordRule {
+    pub bad: String,
+    pub good: String,
+    /// Some((条件词, 是否取反))；None 表示无条件
+    pub cond: Option<(String, bool)>,
+}
+
+/// 读全部词表规则（条件规则排在前面 —— 条件更具体，必须先落地）。
+pub fn load_rules(app_dir: &Path, stem: Option<&str>) -> Vec<WordRule> {
     let mut files: Vec<PathBuf> = vec![app_dir.join("词表.txt")];
     if let Some(s) = stem {
         files.push(app_dir.join(format!("词表_{s}.txt")));
@@ -421,7 +441,7 @@ pub fn load_wordlist(app_dir: &Path, stem: Option<&str>) -> Vec<(String, String)
             files.push(root.join(format!("fixes_{s}.txt")));
         }
     }
-    let mut pairs = Vec::new();
+    let mut rules: Vec<WordRule> = Vec::new();
     for f in files {
         let Ok(raw) = std::fs::read(&f) else { continue };
         let text = String::from_utf8_lossy(&raw);
@@ -436,15 +456,88 @@ pub fn load_wordlist(app_dir: &Path, stem: Option<&str>) -> Vec<(String, String)
                 None => line.split_once('='),
             };
             let Some((a, b)) = pair else { continue };
+            let (mut a, mut b) = (a.trim(), b.trim());
+            // 译前规则：全量/精简这条链没有日文文本，跳过（不是错误，只是不适用）
+            if let Some(rest) = a.strip_prefix("pre:").or_else(|| a.strip_prefix("Pre:")) {
+                let _ = rest;
+                continue;
+            }
+            // 条件：右侧 `译文|条件词`（`!` 取反）
+            let mut cond: Option<(String, bool)> = None;
+            if let Some((left, c)) = b.split_once('|') {
+                let c = c.trim();
+                if !c.is_empty() {
+                    let (kw, neg) = match c.strip_prefix('!') {
+                        Some(rest) => (rest.trim().to_string(), true),
+                        None => (c.to_string(), false),
+                    };
+                    if !kw.is_empty() {
+                        cond = Some((kw, neg));
+                        b = left.trim();
+                    }
+                }
+            }
+            let _ = (&mut a, &mut b);
             let (a, b) = (a.trim(), b.trim());
-            if !a.is_empty() && !b.is_empty() && a != b {
-                pairs.push((a.to_string(), b.to_string()));
+            if a.is_empty() || b.is_empty() || a == b {
+                continue;
+            }
+            rules.push(WordRule {
+                bad: a.to_string(),
+                good: b.to_string(),
+                cond,
+            });
+        }
+    }
+    // 条件规则优先（更具体），同类内长词优先
+    rules.sort_by(|x, y| {
+        let (xc, yc) = (x.cond.is_none(), y.cond.is_none());
+        xc.cmp(&yc)   // false(有条件) < true(无条件) → 条件排前面
+            .then(y.bad.chars().count().cmp(&x.bad.chars().count()))
+    });
+    rules
+}
+
+/// 读全局词表 + 按作品词表（只剩无条件规则，给老调用方用）。
+pub fn load_wordlist(app_dir: &Path, stem: Option<&str>) -> Vec<(String, String)> {
+    load_rules(app_dir, stem)
+        .into_iter()
+        .filter(|r| r.cond.is_none())
+        .map(|r| (r.bad, r.good))
+        .collect()
+}
+
+/// 替换 bad→good，但跳过 protect 内部（保护更长的专名不被切开）。
+fn replace_outside(text: &str, bad: &str, good: &str, protect: &str) -> String {
+    if protect.is_empty() || !text.contains(protect) {
+        return text.replace(bad, good);
+    }
+    text.split(protect)
+        .map(|seg| seg.replace(bad, good))
+        .collect::<Vec<_>>()
+        .join(protect)
+}
+
+/// 按规则表替换（条件规则已在 load_rules 里排到前面）。
+pub fn apply_rules(text: &str, rules: &[WordRule]) -> String {
+    let mut out = text.to_string();
+    for r in rules {
+        match &r.cond {
+            Some((kw, neg)) => {
+                let hit = out.contains(kw.as_str());
+                if (hit && !*neg) || (!hit && *neg) {
+                    let protect = if *neg { "" } else { kw.as_str() };
+                    out = replace_outside(&out, &r.bad, &r.good, protect);
+                }
+            }
+            None => {
+                if out.contains(r.bad.as_str()) {
+                    out = out.replace(r.bad.as_str(), r.good.as_str());
+                }
             }
         }
     }
-    // 长词优先
-    pairs.sort_by(|x, y| y.0.chars().count().cmp(&x.0.chars().count()));
-    pairs
+    out
 }
 
 pub fn apply_words(text: &str, words: &[(String, String)]) -> String {
@@ -463,13 +556,13 @@ pub fn apply_words(text: &str, words: &[(String, String)]) -> String {
 /// 「日文原文一行 + 中文一行」：**词表只能作用在最后一行（译文）上**。
 /// 词表是按中文写的（`卑处 => 秘书`），套到日文原文行上会把原文改坏，
 /// 而原文正是这份双语字幕存在的意义。
-pub fn tidy_text(text: &str, words: &[(String, String)]) -> String {
+pub fn tidy_text(text: &str, rules: &[WordRule]) -> String {
     match text.rsplit_once('\n') {
-        None => collapse_repeats(&apply_words(text, words)),
+        None => collapse_repeats(&apply_rules(text, rules)),
         Some((head, last)) => format!(
             "{}\n{}",
             head,
-            collapse_repeats(&apply_words(last, words))
+            collapse_repeats(&apply_rules(last, rules))
         ),
     }
 }
@@ -542,7 +635,7 @@ pub fn collapse_repeats(text: &str) -> String {
 
 /// 字幕整理：时长上限 + 不压到下一句 + 最少 0.4 秒 + 词表替换 + 折叠重复。
 /// 返回 (整理后的 cues, 被收缩的条数)。与 e_字幕整理.py 的规则一致。
-pub fn tidy(cues: &[Cue], words: &[(String, String)]) -> (Vec<Cue>, usize) {
+pub fn tidy(cues: &[Cue], rules: &[WordRule]) -> (Vec<Cue>, usize) {
     let mut out = Vec::with_capacity(cues.len());
     let mut shrunk = 0usize;
     for (i, c) in cues.iter().enumerate() {
@@ -574,7 +667,7 @@ pub fn tidy(cues: &[Cue], words: &[(String, String)]) -> (Vec<Cue>, usize) {
         out.push(Cue {
             start: a,
             end: b,
-            text: tidy_text(&c.text, words),
+            text: tidy_text(&c.text, rules),
         });
     }
     (out, shrunk)
@@ -600,6 +693,9 @@ pub fn tidy_dir(srt_dir: &Path, app_dir: &Path) -> Vec<String> {
     }
 
     let mut total_shrunk = 0usize;
+    let mut total_kana = 0usize;
+    let mut total_empty = 0usize;
+    let mut total_burst = 0usize;
     let mut total = 0usize;
     for p in &paths {
         let name = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
@@ -615,10 +711,10 @@ pub fn tidy_dir(srt_dir: &Path, app_dir: &Path) -> Vec<String> {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
         let base = stem.split("_(").next().unwrap_or(&stem);
-        let words = load_wordlist(app_dir, Some(base));
+        let rules = load_rules(app_dir, Some(base));
         match read_srt(p) {
             Ok(cues) if !cues.is_empty() => {
-                let (out, shrunk) = tidy(&cues, &words);
+                let (out, shrunk) = tidy(&cues, &rules);
                 if write_srt(p, &out).is_err() {
                     logs.push(format!("[整理] 写回失败：{name}"));
                     continue;
@@ -627,14 +723,81 @@ pub fn tidy_dir(srt_dir: &Path, app_dir: &Path) -> Vec<String> {
                 total_shrunk += shrunk;
                 let max_before = cues.iter().map(|c| c.end - c.start).fold(0.0, f64::max);
                 let max_after = out.iter().map(|c| c.end - c.start).fold(0.0, f64::max);
+                // ★ v1.30.6：统计「译文里还留着日文」的条数。
+                //   whisper（全量/精简）偶尔整句原样吐日文，非空、时间轴正常，
+                //   以前完全查不出来 —— 用户拿到的是「一多半中文夹几句日文」的字幕。
+                //   这里只告警不改内容：删掉会让字幕断档，改字没有依据。
+                let kana = out
+                    .iter()
+                    .filter(|c| {
+                        c.text
+                            .chars()
+                            .any(|ch| ('\u{3040}'..='\u{30ff}').contains(&ch))
+                    })
+                    .count();
+                // ★ v1.30.6：另两类「whisper 没能正常出中文」的症状，全量/精简模式同样查得出来。
+                //   · empty：整条译文剥掉标点后不到 2 个字 —— 多半是 whisper 吐了空或者只剩一个语气词，
+                //     用户看到的是「字幕在走、屏幕上什么都没有」。
+                //   · burst：每秒字数多得离谱（> 12 字/秒且总量 > 20 字）—— 典型是一次幻觉吐出整段，
+                //     时间轴根本装不下，字幕会一闪而过。
+                //   仍然是只告警不改内容。
+                //   ★ 必须量**原始** cues 的时长：`tidy` 会把过长的字幕拉长（最长上限），
+                //     拉长之后 60 字配 6 秒就不算异常了，测出来是假阴性。
+                let (empty_n, burst_n) = out.iter().fold((0usize, 0usize), |(e, b), c| {
+                    let orig = cues
+                        .iter()
+                        .find(|o| (o.start - c.start).abs() < 0.01)
+                        .unwrap_or(c);
+                    let n = c
+                        .text
+                        .chars()
+                        .filter(|ch| !ch.is_whitespace() && !"，。！？、…—~～「」『』()（）".contains(*ch))
+                        .count();
+                    let dur = (orig.end - orig.start).max(0.1);
+                    (
+                        e + usize::from(n < 2),
+                        b + usize::from(n > 20 && (n as f64) / dur > 12.0),
+                    )
+                });
+                let mut marks = String::new();
+                if kana > 0 {
+                    marks.push_str(&format!("，**{kana} 条译文残留日文**"));
+                }
+                if empty_n > 0 {
+                    marks.push_str(&format!("，**{empty_n} 条译文几乎是空的**"));
+                }
+                if burst_n > 0 {
+                    marks.push_str(&format!("，**{burst_n} 条字幕字数超出时长**"));
+                }
                 logs.push(format!(
-                    "[整理] {name}：{} 条，收缩 {shrunk} 条，最长 {max_before:.1}s → {max_after:.1}s",
-                    cues.len()
+                    "[整理] {name}：{} 条，收缩 {shrunk} 条，最长 {max_before:.1}s → {max_after:.1}s{marks}",
+                    cues.len(),
                 ));
+                total_kana += kana;
+                total_empty += empty_n;
+                total_burst += burst_n;
             }
             Ok(_) => logs.push(format!("[整理] 跳过（空字幕）：{name}")),
             Err(e) => logs.push(format!("[整理] {e}")),
         }
+    }
+    if total_kana > 0 {
+        logs.push(format!(
+            "[整理] 注意：{total_kana} 条译文里还留着日文（多半是 whisper 没翻出来），"
+        ));
+        logs.push("[整理] 建议检查这几处，或换兼容模式重跑这一步。".to_string());
+    }
+    if total_empty > 0 {
+        logs.push(format!(
+            "[整理] 注意：{total_empty} 条译文几乎是空的（字幕在走但没有内容），"
+        ));
+        logs.push("[整理] 多半是 whisper 在这一段没识别出来，可换兼容模式重跑这一步。".to_string());
+    }
+    if total_burst > 0 {
+        logs.push(format!(
+            "[整理] 注意：{total_burst} 条字幕的字数远超它的时长（会一闪而过），"
+        ));
+        logs.push("[整理] 这是 whisper 一次性吐出整段的典型症状，建议换兼容模式重跑这一步。".to_string());
     }
     logs.push(format!(
         "[整理] 完成：{} 个文件 / {total} 条，收缩 {total_shrunk} 条",
@@ -798,11 +961,62 @@ Dialogue: 0,0:00:04.00,0:00:06.00,Default,,0,0,0,,{\\i1}斜体{\\i0}收尾\n",
         assert!(out[0].end <= 0.0 + 2.00 * 2.0 + 8.0 + 0.001);
     }
 
+    /// 测试用：造一条无条件规则
+    fn r(a: &str, b: &str) -> WordRule {
+        WordRule { bad: a.to_string(), good: b.to_string(), cond: None }
+    }
+
+    #[test]
+    fn load_rules_skips_pre_and_parses_cond() {
+        // 真实用户的 fixes.txt 会同时出现 pre: / 条件 / 普通三种写法。
+        // 旧解析器会把「pre:ぺろぺろ」当左值（静默失效），
+        // 把「奶|乳头」整串当右值（输出垃圾）—— 这里钉住正确行为。
+        let dir = std::env::temp_dir().join("asmr_test_rules_v1306");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(
+            dir.join("fixes.txt"),
+            "pre:ぺろぺろ=れろれろ
+渚沙=凪咲
+乳=奶|乳头
+",
+        )
+        .unwrap();
+        let rules = load_rules(&dir, None);
+        assert!(
+            !rules.iter().any(|r| r.bad.contains("pre:")),
+            "pre: 行必须被跳过"
+        );
+        assert!(rules
+            .iter()
+            .any(|r| r.bad == "渚沙" && r.good == "凪咲" && r.cond.is_none()));
+        assert!(rules.iter().any(|r| r.bad == "乳"
+            && r.good == "奶"
+            && r.cond
+                .as_ref()
+                .map(|c| c.0 == "乳头" && !c.1)
+                .unwrap_or(false)));
+        // 条件规则排在最前（先于无条件规则落地）
+        assert_eq!(rules[0].bad, "乳");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cond_rule_protects_keyword() {
+        // 乳=奶|乳头：只有当「乳头」出现时才替换「乳」，且不把「乳头」切成「奶头」
+        let rules = vec![WordRule {
+            bad: "乳".to_string(),
+            good: "奶".to_string(),
+            cond: Some(("乳头".to_string(), false)),
+        }];
+        assert_eq!(apply_rules("乳头和乳", &rules), "乳头和奶");
+        assert_eq!(apply_rules("只有乳", &rules), "只有乳");
+    }
+
     #[test]
     fn wordlist_applies() {
         let (out, _) = tidy(
             &[Cue { start: 0.0, end: 1.0, text: "卑处".into() }],
-            &[("卑处".to_string(), "秘书".to_string())],
+            &[r("卑处", "秘书")],
         );
         assert_eq!(out[0].text, "秘书");
     }
@@ -842,6 +1056,38 @@ Dialogue: 0,0:00:04.00,0:00:06.00,Default,,0,0,0,,{\\i1}斜体{\\i0}收尾\n",
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// v1.30.6：全量/精简模式新增的两类告警 —— 空译文、字数超出时长。
+    #[test]
+    fn tidy_dir_warns_empty_and_burst() {
+        let dir = std::env::temp_dir().join("asmr_srt_warn_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 一条正常 + 一条只剩标点（空）+ 一条 2 秒吐出 60 个不同字（爆量）。
+        // 注意不能用「啊啊啊…」—— 同字重复会被 tidy 的折叠逻辑吃掉，测不到爆量。
+        let long = "这是一段被幻觉一次性吐出来的台词内容非常长根本放不进两秒".repeat(2);
+        let body = format!(
+            "1\n00:00:01,000 --> 00:00:04,000\n正常的一句话\n\n\
+             2\n00:00:05,000 --> 00:00:08,000\n……\n\n\
+             3\n00:00:09,000 --> 00:00:11,000\n{long}\n"
+        );
+        let p = dir.join("测试.srt");
+        std::fs::write(&p, body).unwrap();
+
+        let logs = tidy_dir(&dir, &dir);
+
+        assert!(
+            logs.iter().any(|l| l.contains("几乎是空的")),
+            "应报告空译文：{logs:?}"
+        );
+        assert!(
+            logs.iter().any(|l| l.contains("字数远超它的时长")),
+            "应报告字数超出时长：{logs:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // 行内双语（兼容模式勾了「生成日文字幕」但没勾「日文单独成文件」）：
     // 一条字幕两行，日文原文在上、中文在下。
     //   词表是中文错译修正表，只能动最后一行（译文）；
@@ -853,7 +1099,7 @@ Dialogue: 0,0:00:04.00,0:00:06.00,Default,,0,0,0,,{\\i1}斜体{\\i0}收尾\n",
             end: 2.0,
             text: "卑处です\n我是卑处".into(),
         }];
-        let (out, _) = tidy(&cues, &[("卑处".to_string(), "秘书".to_string())]);
+        let (out, _) = tidy(&cues, &[r("卑处", "秘书")]);
         assert_eq!(out[0].text, "卑处です\n我是秘书");
     }
 
@@ -959,17 +1205,14 @@ Dialogue: 0,0:00:04.00,0:00:06.00,Default,,0,0,0,,{\\i1}斜体{\\i0}收尾\n",
 
     #[test]
     fn longer_words_first() {
-        let words = vec![
-            ("你好".to_string(), "A".to_string()),
-            ("你好吗".to_string(), "B".to_string()),
-        ];
+        let words = vec![r("你好", "A"), r("你好吗", "B")];
         let (out, _) = tidy(
             &[Cue { start: 0.0, end: 2.0, text: "你好吗".into() }],
             &words,
         );
         // 词表来自 load_wordlist 时已按长度降序；这里手动排序模拟
         let mut sorted = words.clone();
-        sorted.sort_by(|x, y| y.0.chars().count().cmp(&x.0.chars().count()));
+        sorted.sort_by(|x, y| y.bad.chars().count().cmp(&x.bad.chars().count()));
         let (out2, _) = tidy(
             &[Cue { start: 0.0, end: 2.0, text: "你好吗".into() }],
             &sorted,

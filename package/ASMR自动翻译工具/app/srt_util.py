@@ -12,6 +12,7 @@
 """
 
 import io
+import os
 import re
 
 # SRT 时间轴：00:00:01,234 --> 00:00:05,678
@@ -48,6 +49,17 @@ def write_srt(path, rows):
     写文件用 UTF-8 无 BOM、换行统一成 \\n，
     避免 Windows 上出现 \\r\\n 导致某些播放器显示异常。
     """
+    # ★ v1.30.8：目录不存在就建。
+    #   Rust 侧调 Python 时会先建好 0pre/1audio/2vad/3asr，但【命令行直跑】
+    #   （比如换机器排查、批量补字幕）时 3asr 往往不存在，实测会抛
+    #   `FileNotFoundError: ...\3asr\xxx.srt` —— 而且是**整批识别跑完**
+    #   才在最后写盘时崩，白跑一遍。
+    _d = os.path.dirname(path)
+    if _d and not os.path.isdir(_d):
+        try:
+            os.makedirs(_d, exist_ok=True)
+        except OSError:
+            pass
     with io.open(path, "w", encoding="utf-8", newline="\n") as f:
         for i, (a, b, text) in enumerate(rows, 1):
             t = (text or "").strip()

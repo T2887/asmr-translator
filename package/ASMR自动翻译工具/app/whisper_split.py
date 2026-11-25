@@ -152,6 +152,85 @@ def enforce_timeline(segments):
     return out
 
 
+# ★ v1.30.8：单条字幕内部的重复刷屏折叠。
+#
+#   实测（巧可 RJ277717 第 6 条，2026-11-25）whisper 会吐：
+#     00:01:51,000 --> 00:02:21,000
+#     小穴 高潮 高潮 高潮 高潮 ...（54 次「高潮」，30 秒）
+#   这是 novad 模式独有的病灶：关掉 VAD 后没有「这窗有人声」的约束，
+#   长静音里模型用同一个词填满整窗。
+#
+#   为什么不能简单折叠所有重复：ASMR 里「喜欢 喜欢 喜欢」「老师 老师」
+#   是**真实台词**（人工字幕也这么写），折叠会毁掉表演。实测 5 素材
+#   207 条字幕里只有 2.9% 含重复，其中大半是真实语气。
+#
+#   所以判据要严：
+#     ① 重复单元 2~12 字符（覆盖「高潮」「不要停」「好舒服」这类）
+#     ② 重复 **≥5 次**才动手（「喜欢×5」保留）
+#     ③ 且重复占该条**正文 50% 以上**（排比句里夹一次不算）
+#   满足时折成 `单元…（×N）`，保留前两次让人看出是重复。
+_REP_UNIT = None
+
+
+def collapse_repeats(text, min_repeat=5, min_share=0.5):
+    """折叠单条字幕里的极端重复。返回 (新文本, 是否改动)。"""
+    import re as _re
+    if not text or len(text) < 20:
+        return text, False
+    core = _re.sub(r"[\s、。，．！？!?…♡♥♪~〜「」『』（）()]", "", text)
+    if len(core) < 20:
+        return text, False
+
+    best = None                              # (单元, 次数, 覆盖长度)
+    for unit_len in range(2, 13):
+        i = 0
+        n = len(core)
+        while i + unit_len * 2 <= n:
+            u = core[i:i + unit_len]
+            k = 1
+            while core[i + k * unit_len:(i + (k + 1) * unit_len)] == u:
+                k += 1
+            if k >= min_repeat and k * unit_len >= len(core) * min_share:
+                if best is None or k * unit_len > best[2]:
+                    best = (u, k, k * unit_len)
+                i += k * unit_len
+            else:
+                i += 1
+    if not best:
+        return text, False
+
+    u, k, cov = best
+    # 保留前两次 + 计数标注，比整段删掉更诚实（用户能看出这段是重复）
+    kept = text
+    # 用文本里的原始形态替换（core 去过标点，不能直接拿它做替换）
+    pat = _re.compile(r"(?:%s[\s、。，．！？!?…♡♥♪~〜]*){%d,}"
+                      % (_re.escape(u), k))
+    m = pat.search(kept)
+    if not m:
+        # 标点把它切碎了，退化成「只保留前两遍」
+        idx = kept.find(u)
+        if idx < 0:
+            return text, False
+        tail = kept[idx + len(u) * 2:]
+        if len(tail.strip(" 、。，．！？!?…♡♥♪~〜")) > 0:
+            return text, False
+        return kept[:idx + len(u) * 2] + f"…（×{k}）", True
+    new = kept[:m.start()] + f"{u}…（×{k}）" + kept[m.end():]
+    return new, True
+
+
+def collapse_rows(rows, min_repeat=5):
+    """对 [(start, end, text)] 整批折叠，返回 (rows, 改动条数)。"""
+    out, n = [], 0
+    for a, b, t in rows:
+        nt, hit = collapse_repeats(t, min_repeat=min_repeat)
+        if hit:
+            n += 1
+            print(f"  [折叠重复] {a:.1f}-{b:.1f}  {t[:36]} → {nt[:36]}")
+        out.append((a, b, nt))
+    return out, n
+
+
 if __name__ == "__main__":
     # 自检：构造三种典型情况
     spans = [(0, 5), (7, 20), (22, 34), (36, 60), (61, 90)]

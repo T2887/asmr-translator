@@ -481,6 +481,18 @@ def _cap_row_end(start, end, text, vad_subs):
 
 
 audio_tasks = []
+# ★ v1.30.7：模块级也要读一次 ASMR_FULL_NOVAD。
+#
+#   关掉 VAD 之后 2vad/*.srt 不再是必需产物（那一步本来只是给 whisper
+#   注入 clip 时间轴）。不读这个变量的话，ASMR_FULL_NOVAD=1 会死在
+#   「跳过：找不到 VAD 字幕文件」——整批什么都不做，退出码还是 0。
+# ★ v1.30.8：**改为默认开启**。实测（5 素材 440 条字幕，人工 vtt 为标尺）：
+#   关掉 VAD 后人工字幕覆盖率 71.0% → 87.0%、漏译 0.85 分钟 → 0.07 分钟、
+#   相似度 <0.4 的段 58% → 32%。代价是 2.3% 的段有时间漂移、少量拟声段多出字，
+#   净收益远大于代价（详见 docs/ASMR语料v9v10报告.md 与 _bili_ocr 的实测脚本）。
+#   ASMR_FULL_NOVAD=0 可回到旧的 VAD 分段行为。
+_NOVAD_ENV = os.environ.get("ASMR_FULL_NOVAD", "1").strip().lower()
+_NOVAD_MODULE = _NOVAD_ENV not in ("0", "off", "no", "false")
 for file_str in files:
     file_path = Path(file_str)
     raw_stem = file_path.stem
@@ -498,7 +510,7 @@ for file_str in files:
     # ASR 输出仍用完整名字（下游 finalize 靠它找视频）
     asr_log_path = os.path.join(config["path"]["asr"], f"{raw_stem}.srt")
 
-    if not os.path.exists(vad_log_path):
+    if not _NOVAD_MODULE and not os.path.exists(vad_log_path):
         print(f"跳过：找不到 VAD 字幕文件 {vad_log_path}")
         continue
     audio_tasks.append((str(file_path), vad_log_path, asr_log_path))
@@ -710,6 +722,29 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
     for _ca, _cb in _clips:
         _clip_flat.extend([round(_ca, 3), round(_cb, 3)])
     _use_clip = bool(_clip_flat)
+
+    # ★ v1.30.7 试验：ASMR_FULL_NOVAD=1 时完全不用 VAD/分段，整段交给 whisper。
+    #
+    #   为什么试这个：拿 5 个带人工中文字幕的素材，以人工时间轴为标尺实测
+    #   （whisper-large-v2-translate-zh + 生产同参数）：
+    #     切分方式              人工覆盖   有效占比 漏译      真空段   最长段
+    #     Silero VAD（旧默认）   71.0%     68.6%    0.85min  0.00min  226s
+    #     不切（本开关）          87.0%     79.5%    0.07min  0.59min   30s
+    #     ASMR VAD（现生产）      70.4%     79.0%    0.47min  0.20min   12s
+    #   即 ASMR VAD 调的是「选得准」，不是「选得全」；不切反而覆盖最高、
+    #   漏译最少，段长也没有失控（最长 30s，_hard_cap_20s 会再切）。
+    #   「真空段」逐条看过，是人工字幕省略掉的喘息/拟声（`嗅嗅`、
+    #   `嘶噜嘶噜`、`啊 咿 哈`），不是幻觉。
+    #   默认关闭，留作 A/B 开关；验证充分后改默认。
+    if _NOVAD_MODULE:
+        _clips = []
+        _clip_flat = []
+        _use_clip = False
+        _NOVAD = True
+        print(f"  [分段] 不分段（默认行为），整段交给 whisper；ASMR_FULL_NOVAD=0 可回到 VAD", flush=True)
+    else:
+        _NOVAD = False
+
     if _clips:
         print(f"  [分段] {len(vad_subs)} 个 VAD 段 → {len(_clips)} 个解码窗口"
               f"（最长 {max(b - a for a, b in _clips):.1f}s）")
@@ -731,8 +766,16 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
             # 用环境变量 ASMR_BEAM 临时试更小的值（2 / 1），默认仍是 5。
             beam_size=int(os.environ.get("ASMR_BEAM", "5")),
             # ★ v1.28.8：clip_timestamps 优先；为空时退回 vad_filter。
-            clip_timestamps=_clip_flat if _clip_flat else None,
-            vad_filter=True,  # clip_timestamps 生效时会被忽略，保留作兜底
+            # ★ v1.30.7：ASMR_FULL_NOVAD=1 时 _clip_flat 被清空且 vad_filter
+            #   必须同时关掉 —— 否则会退回 Silero VAD（比现状更差）。
+            # ★ v1.30.7（踩坑）：这里必须传空字符串，不能传 None。
+            #   faster-whisper 1.2.1 的 seek_points 计算写成
+            #     [round(ts*...) for ts in options.clip_timestamps]
+            #   None 会直接抛 TypeError: 'NoneType' object is not iterable。
+            #   传 "" 会走 isinstance(str) 分支切成 []，再补成 [(0, 全部)]，
+            #   正好等于「整段交给 whisper」——就是 novad 想要的效果。
+            clip_timestamps=_clip_flat if _clip_flat else "",
+            vad_filter=(not _NOVAD),  # 给了 clip 时会被忽略，保留作兜底
             # ★ v1.17.1：关闭跨段上下文（原来是 True）。
             #
             #   拿 R4222 官方中文字幕（8 轨，529 句）逐轨对比实测：
@@ -916,6 +959,24 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
                         continue
                     _b = min(_b, _win[1] + 0.6)
 
+            # ★ v1.30.7：initial_prompt 泄漏过滤（只对全量/精简模式有意义）。
+            #
+            #   关掉 VAD 之后 whisper 少了「这一窗里确实有人声」的约束，
+            #   偶尔会把 initial_prompt 的原文当成音频内容吐出来。实测
+            #   v1 素材（強制發情催眠）第 0 段就是：
+            #     0.00-1.00 日语化 句子短促化语用肉棒 舒服 去了 保留
+            #   那是 _INITIAL_PROMPT 里的词被重排了。
+            #
+            #   判据：prompt 独有的说法（口语化/句子短促/保留语气词/
+            #   以下是日语成人向）出现任一，且同时含 肉棒/小穴/术语——
+            #   正常译文里这几个词不会这样凑在一起（实测 8 条冒烟里
+            #   正常台词命中 0 次，泄漏段命中 1 次）。
+            _LEAK_KEYS = ("口语化", "句子短促", "保留语气词", "以下是日语成人向")
+            _leak_hit = sum(1 for w in _LEAK_KEYS if w in text)
+            if _leak_hit >= 1 and ("肉棒" in text or "小穴" in text or "术语" in text):
+                print(f"  [prompt泄漏] {_a:.2f}->{_b:.2f} 丢弃：{text[:40]}", flush=True)
+                continue
+
             raw_rows.append((_a, _b, text))
             print(f"[{_a:.2f}s -> {_b:.2f}s]: {text}")
             # 结构化事件：和上面那行【同一份数据】，只是给 Rust 侧一个
@@ -1002,6 +1063,26 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
                 asr_rows = [(s.start, s.end, s.text) for s in _segs]
             except Exception as _e:
                 print(f"  [去重] 跳过（{type(_e).__name__}: {_e}）")
+
+        # ★ v1.30.8：单条字幕内部的重复刷屏折叠。
+        #
+        #   `merge_segments` 只管「相邻段是不是同一句」，管不了单条内部的
+        #   极限重复。实测巧可 RJ277717 第 6 条：
+        #     00:01:51,000 --> 00:02:21,000
+        #     小穴 高潮 高潮 高潮 …（54 次，30 秒）
+        #   这是 novad 模式独有的：没有 VAD 约束时，长静音窗会被同一个词填满。
+        #
+        #   判据严格（见 whisper_split.collapse_repeats）：重复 ≥5 次、
+        #   且占正文 50% 以上才折 —— ASMR 里「喜欢×5」「老师×4」是真实台词。
+        #   ASMR_NO_COLLAPSE=1 可关闭。
+        if os.environ.get("ASMR_NO_COLLAPSE", "").strip() != "1" and asr_rows:
+            try:
+                from whisper_split import collapse_rows
+                asr_rows, _nrep = collapse_rows(asr_rows)
+                if _nrep:
+                    print(f"  [折叠重复] 处理 {_nrep} 条内部刷屏")
+            except Exception as _e:
+                print(f"  [折叠重复] 跳过（{type(_e).__name__}: {_e}）")
 
         # 一次性写盘（不要放在循环里逐条写）
         write_srt(asr_log_path, asr_rows)

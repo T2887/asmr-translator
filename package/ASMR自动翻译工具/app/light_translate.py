@@ -25,7 +25,7 @@ from events import emit
 
 # ★ v1.30.4：术语后处理（fixes.txt / fixes_<名>.txt）。
 #   prompt 是软约束，几百段里总会冒出几种写法；这一层做确定性替换。
-from terms_fix import apply_fixes, load_fixes
+from terms_fix import apply_fixes, apply_pre, load_fixes
 
 # ★ v1.30.3：运行时状态采集（模型吞吐 / CPU 频率 / 占用核数）
 #   借鉴安卓版思路（它从 llama-server 的 /metrics 取 tok/s、
@@ -177,7 +177,16 @@ def _builtin_prompt():
 
 
 def load_glossary(stem):
+    """读术语表，返回 [{"src","dst","info"}, ...]。
+
+    ★ v1.30.6（借鉴 GalTransl 的 GPT 字典 / Sakura 的术语表格式）：
+      一行三列用 **TAB** 分隔：`日文<TAB>中文<TAB>解释(可省)`
+      解释里写角色设定（`name, girl, teacher`），模型才会选对「她/老师」。
+      老格式（一行几个词、逗号分隔、无译文）仍然支持 —— 那种按
+      「专有名词必须原样保留」处理。
+    """
     terms = []
+    seen = set()
     for name in (f"hotwords_{stem}.txt", "hotwords.txt"):
         p = os.path.join(".", name)
         if not os.path.isfile(p):
@@ -185,16 +194,58 @@ def load_glossary(stem):
         try:
             with open(p, encoding="utf-8-sig") as f:
                 for ln in f:
-                    ln = ln.strip()
-                    if not ln or ln.startswith("#"):
+                    ln = ln.rstrip("\r\n")
+                    if not ln.strip() or ln.lstrip().startswith("#"):
                         continue
-                    for w in ln.replace("，", ",").split(","):
-                        w = w.strip()
-                        if w and w not in terms:
-                            terms.append(w)
+                    if "\t" in ln:
+                        cols = [c.strip() for c in ln.split("\t")]
+                        src = cols[0]
+                        dst = cols[1] if len(cols) > 1 else ""
+                        info = cols[2] if len(cols) > 2 else ""
+                        if src and src not in seen:
+                            seen.add(src)
+                            terms.append({"src": src, "dst": dst, "info": info})
+                    else:
+                        for w in ln.replace("，", ",").split(","):
+                            w = w.strip()
+                            if w and w not in seen:
+                                seen.add(w)
+                                terms.append({"src": w, "dst": "", "info": ""})
         except OSError:
             pass
     return terms
+
+
+def _glossary_prompt(text, terms):
+    """只把**当前这句日文里出现的**术语拼进 prompt（按句注入）。
+
+    ★ 全局注入的问题：几百个词每次都塞，既吃 token 又干扰模型
+      （无关的人名会诱发「擅自补主语」）。实测按句过滤后 prompt 短很多，
+      而命中的词反而更受重视。
+    """
+    if not terms:
+        return ""
+    hit = []
+    for t in terms:
+        src = t.get("src") or ""
+        if src and src in text:
+            hit.append(t)
+    if not hit:
+        return ""
+    pairs, plain = [], []
+    for t in hit:
+        src, dst, info = t["src"], t.get("dst") or "", t.get("info") or ""
+        if dst:
+            pairs.append(f"{src}->{dst}" + (f" #{info}" if info else ""))
+        else:
+            plain.append(src)
+    out = ""
+    if pairs:
+        out += ("\n术语表（按对应关系翻译，保持译名一致）：\n"
+                + "\n".join(pairs))
+    if plain:
+        out += ("\n专有名词（必须原样保留，不要意译）：" + "、".join(plain))
+    return out
 
 
 def free_port():
@@ -344,7 +395,7 @@ def wait_health(port, timeout=120, proc=None):
     return False
 
 
-def translate(port, text, glossary, bump=0.0):
+def translate(port, text, glossary, bump=0.0, ctx=None, pre_map=None):
     """翻译一句。★ v1.28.5：内部重试 3 次，绝不返回空。
 
     以前这里只请求一次：超时 / 返回空串就一路抛到上层，上层直接
@@ -359,11 +410,24 @@ def translate(port, text, glossary, bump=0.0):
     """
     last = "未知错误"
     best = ""
+    # ★ v1.30.6（借鉴 GalTransl 译前字典）：送进模型前先把日文里的
+    #   口齿不清/多写法统一掉；字幕里保留的仍是日文原文。
+    send = apply_pre(text, pre_map) if pre_map else text
     for attempt in range(3):
         try:
             temp = min(0.9, 0.1 + bump + 0.2 * attempt)
-            raw = _translate_once(port, text, glossary, temp=temp)
+            raw = _translate_once(port, send, glossary, temp=temp, ctx=ctx)
             if raw:
+                # ★ v1.30.6 质量自检：
+                #   kana = 原样吐回日文、empty = 空译文 —— 这两种必须重试，
+                #   否则用户会看到一句日文或一段空白字幕。
+                #   long（比原文长 2.2 倍）只当参考，不作废：中文偶尔确实
+                #   比日文长（「ちょっと」→「稍微等一下嘛」），判死会误伤。
+                bad = [i for i in _quality_issues(raw, text) if i in ("kana", "empty")]
+                if bad:
+                    last = "质量自检未过：" + ",".join(bad)
+                    time.sleep(0.3)
+                    continue
                 # ★ 必须在【压缩前】判退化：压缩会把 300 字的刷屏压成 2 句，
                 #   之后就看不出来了（v1.30.4）。
                 if not _is_runaway(raw, text):
@@ -527,10 +591,54 @@ _HY_TURN_END = "<|hy_place▁holder▁no▁2｜>"
 _HY_USER = "<|hy_User｜>"
 _HY_ASSIST = "<|hy_Assistant｜>"
 
+# ★ v1.30.6（借鉴 GalTransl multiTurn / Sakura 上下文）：把前 N 句的
+#   「日文 → 中文」当成对话历史一起喂进去，模型才知道「他/她」指谁、
+#   省略的主语是什么。设 ASMR_TRANSLATE_CTX=0 可关闭。
+# ★ 默认 0（关闭）：2026-11-21 实测，注入上文会让 system 每句都变，
+#   llama.cpp 的前缀缓存全废 → 翻译从 80.9 段/分掉到 25.3 段/分（3.2 倍慢），
+#   而 sim 只差 -0.0075（噪声级）。人称确实有修正（「我也没有拒绝权」→
+#   「你也没有拒绝权」），但代价太大。想要可以设 ASMR_TRANSLATE_CTX=8 打开。
+_CTX_N = int(os.environ.get("ASMR_TRANSLATE_CTX", "0") or 0)
+# 上下文注入方式：
+#   "hint"（默认）= 把上一句「日文 → 中文」写进 system，仍是单轮 —— 实测
+#           多轮对话格式会让这个 1.8B + LoRA 严重跑偏（40 句 A/B：
+#           sim 0.4653→0.4040，per-句 11 好 25 差，还慢 2.5 倍）。
+#           原因是 LoRA 只在单轮格式上训过，没见过多轮历史。
+#   "turns" = 拼成多轮对话（GalTransl 的做法），本模型不适用，留作实验。
+_CTX_STYLE = os.environ.get("ASMR_TRANSLATE_CTX_STYLE", "hint").strip().lower()
 
-def _raw_completion(port, system, text, temp):
-    """按训练时的 hy 模板发原始 prompt（不带 chat 模板）。"""
-    prompt = f"{_HY_BOS}{system}{_HY_SYS_END}{_HY_USER}{text}{_HY_ASSIST}"
+# ★ v1.30.6（借鉴 GalTransl 自动化找错）：译文质量自检。
+#   1) 残留日文：译文里还有平假名/片假名 = 这句根本没翻
+#      （实测 Hy-MT2 偶尔原样吐回日文，且非空，旧逻辑查不出来）
+#   2) 超长：中文一般比日文短，译文比原文长 2.2 倍以上多半是
+#      模型开始自我解释 / 把生词注释也吐出来了
+_KANA = re.compile(r"[\u3040-\u309f\u30a0-\u30ff]")
+
+
+def _quality_issues(zh, ja):
+    """返回问题代码列表；空列表表示通过。"""
+    out = []
+    core = (zh or "").strip(_PUNCT + " \t")
+    if not core:
+        out.append("empty")
+    if _KANA.search(zh or ""):
+        out.append("kana")
+    if ja and core and len(core) > max(12, len(ja) * 2.2):
+        out.append("long")
+    return out
+
+
+def _raw_completion(port, system, text, temp, ctx=None):
+    """按训练时的 hy 模板发原始 prompt（不带 chat 模板）。
+
+    ★ v1.30.6：ctx 是前 N 句的 (日文, 中文) 列表，按训练时的多轮格式
+    拼在 system 之后 —— 这就是「上下文翻译」，让它知道前文在说什么。
+    """
+    parts = [f"{_HY_BOS}{system}{_HY_SYS_END}"]
+    for cja, czh in ((ctx or ()) if _CTX_STYLE == "turns" else ()):
+        parts.append(f"{_HY_USER}{cja}{_HY_ASSIST}{czh}{_HY_TURN_END}")
+    parts.append(f"{_HY_USER}{text}{_HY_ASSIST}")
+    prompt = "".join(parts)
     payload = {
         "prompt": prompt,
         "temperature": temp,
@@ -552,13 +660,19 @@ def _raw_completion(port, system, text, temp):
     return d.get("content", "")
 
 
-def _translate_once(port, text, glossary, temp=0.1):
+def _translate_once(port, text, glossary, temp=0.1, ctx=None):
     system = SYSTEM + _builtin_prompt()
-    if glossary:
-        system += "\n专有名词（必须原样保留，不要意译）：" + "、".join(glossary)
+    # ★ v1.30.6：术语按句注入（只注入这句话里出现的词）
+    system += _glossary_prompt(text, glossary)
+    # ★ v1.30.6：上下文参考（默认只给上一句，单轮格式，实测比多轮稳）
+    if ctx and _CTX_STYLE != "turns":
+        ja0, zh0 = ctx[-1]
+        if ja0 and zh0:
+            system += ("\n上一句（仅供理解上下文，不要重复它的内容）："
+                       + ja0[:60] + " → " + zh0[:60])
     if LORA_PATH:
         # 挂 LoRA：走手写 hy 模板（否则输出退化，见上面的说明）
-        return _sanitize_zh(_raw_completion(port, system, text, temp))
+        return _sanitize_zh(_raw_completion(port, system, text, temp, ctx=ctx))
     payload = {
         "messages": [
             {"role": "system", "content": system},
@@ -593,6 +707,47 @@ def fmt_time(t):
 # 双重兜底：旧版 light_asr 生成的 JSON 里可能已有 SenseVoice 事件/情绪
 # emoji；模型也可能原样照抄。最终 `.chs.srt` / `.jpn.srt` 一律不保留。
 _SENSEVOICE_MARKS = str.maketrans("", "", "🎼👏😀😭🤧😷😊😔😡😰🤢😮❓")
+
+
+def _keep_marks(jp, zh):
+    """按原文补回译文丢掉的情绪符号（…♡♪♥）。
+
+    为什么需要（v1.30.6 实测，145,423 条 ASMR 语料统计）：
+      · 76.8% 的参考译文含省略号「…」（111,661 次），是 ASMR 最主要的停顿标记
+      · 句尾最高频的不是「吧/了」，而是「♡」（13,310 次，超过「吧」12,408）
+      · 但模型**完全学不会**这两个符号：120 条 val 上参考含 ♡ 14%、♪ 11%，
+        模型输出 0~1%；省略号靠 prompt 硬要求能到 20%，但参考只 11% —— 加多了。
+    所以不让模型学，改成后处理按原文补：原文有几个就补几个，不新增。
+
+    规则：
+      · 「…」按原文计数补到句尾（原文 2 个、译文 1 个，补 1 个）
+      · 「♡」「♪」「♥」原文有、译文没有 → 补到句尾
+      · 只在句尾补，不往句子中间插（避免破坏语序）
+    """
+    if not jp or not zh:
+        return zh
+
+    # ── 省略号：原文计数（兼容「…」「...」「‥」）──────────────
+    n_jp = jp.count("…") + jp.count("...") + jp.count("•••")
+    if n_jp <= 0 and ("‥" in jp or "・・" in jp):
+        n_jp = jp.count("‥") + jp.count("・・")
+    n_zh = zh.count("…")
+    if n_jp > n_zh:
+        # 去掉句尾已有的标点再补（「好的。」+「…」→「好的…」）
+        base = zh.rstrip()
+        while base and base[-1] in "。．.!！?？、,，":
+            base = base[:-1]
+        zh = base + "…" * (n_jp - n_zh)
+
+    # ── 爱心/音符：原文有、译文没有才补（不重复）────────────
+    tail = zh.rstrip()
+    for ch in ("♡", "♥", "♪"):
+        if ch in jp and ch not in zh:
+            # 句尾是句号之类就先剥掉
+            while tail and tail[-1] in "。．.!！?？、,，":
+                tail = tail[:-1]
+            tail = tail + ch
+    return tail if tail != zh.rstrip() else zh
 
 
 def _one_line(s):
@@ -720,13 +875,20 @@ def main():
                #   安卓版就是这么做的（--metrics + Prometheus 文本解析），
                #   用户能立刻看出「模型是不是在干活」，而不是盯着进度条猜。
                "--metrics",
-               # ★ v1.30.4：防「整句翻译不断重复」（用户反馈）。
-               #   1.8B 小模型在 temperature 0.1 + 无惩罚时，遇到
-               #   长句／重复语气词会陷入循环：同一句刷 5~10 遍，
-               #   max_tokens 320 足够它刷完。服务端加温和惩罚是根治
-               #   方向（1.1 很轻，不会改掉「嘿嘿~ 嘿嘿~」这种正常重复）。
-               "--repeat-penalty", "1.1",
-               "--repeat-last-n", "256",
+               # ★ v1.30.6：反重复从 repeat-penalty 换成 DRY（实测 repeat-penalty 无效）。
+               #
+               #   依据（2026-11-23 在评测机上用同一模型、6 条退化用例实测）：
+               #     repeat-penalty 1.1  短句×12 → 214 字（反而更长）、长原文×20 → 240 字（没动）
+               #     DRY 0.8              同 6 条全部压到 16~35 字，正常句输出一字未变
+               #   原因：repeat-penalty 惩罚「token 出现过」，模型刷屏时在变花样
+               #   （停下 → 停下吧 → 停下呀），每次都是新组合，抓不住；
+               #   DRY 惩罚 n-gram 序列，检测到「停下，停下」这种重复才压。
+               #   质量影响（120 条 val 实测）：f1 完全相同，sim 差 0.0015（噪声级）。
+               #   allowed-length 2：允许「嘿嘿」「嗯嗯」这种两字内的正常重复。
+               "--dry-multiplier", "0.8",
+               "--dry-base", "1.75",
+               "--dry-allowed-length", "2",
+               "--dry-penalty-last-n", "64",
                "--log-verbosity", "0"]
         if use_lora and LORA_PATH:
             # 加载失败宁可起不来走下面的 CPU 回退，也不静默丢增强
@@ -875,6 +1037,8 @@ def main():
             _t_tr0 = time.time()
             _n_done = 0
             _prev_zh, _prev_src = "", ""
+            # ★ v1.30.6：上下文窗口（前 N 句的 ja/zh 对）
+            _ctx = []
             for r in rows:
                 text = (r.get("text") or "").strip()
                 if not text:
@@ -884,7 +1048,7 @@ def main():
                 #   仍然失败的会在末尾明确列出并让本步退出码非 0，
                 #   用户能一眼看出「这次不全」，而不是拿到一份混着日文的字幕。
                 try:
-                    zh = translate(port, text, glossary)
+                    zh = translate(port, text, glossary, ctx=_ctx, pre_map=fixes)
                 except Exception as e:
                     failed.append({"start": r["start"], "end": r["end"], "jp": text, "err": str(e)})
                     print(f"  [失败] {type(e).__name__}: {e}", flush=True)
@@ -894,14 +1058,19 @@ def main():
                 #   （有些段落原文确实该译成同一句）。
                 if len(zh) >= 10 and zh == _prev_zh and text != _prev_src:
                     try:
-                        zh2 = translate(port, text, glossary, bump=0.6)
+                        zh2 = translate(port, text, glossary, bump=0.6, ctx=_ctx, pre_map=fixes)
                         if zh2 and zh2 != _prev_zh:
                             print(f"  [去重] 与上一句相同，换温度重译 → {zh2[:30]}", flush=True)
                             zh = zh2
                     except Exception:
                         pass
-                done.append({"start": r["start"], "end": r["end"], "zh": zh, "jp": text})
+                done.append({"start": r["start"], "end": r["end"],
+                             "zh": _keep_marks(text, zh), "jp": text})
                 _prev_zh, _prev_src = zh, text
+                if _CTX_N > 0:
+                    _ctx.append((text, zh))
+                    if len(_ctx) > _CTX_N:
+                        _ctx.pop(0)
                 print(f"[{float(r['start']):.2f}s -> {float(r['end']):.2f}s]: {zh}", flush=True)
                 # ★ 段进度：每 20 段或最后一段
                 _n_done += 1

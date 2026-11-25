@@ -1,8 +1,8 @@
 {
- "version": "1.30.5",
- "url": "https://github.com/T2887/asmr-translator/releases/download/v1.30.5/ASMR-Translator-Setup_v1.30.5.exe",
- "page": "https://github.com/T2887/asmr-translator/releases/tag/v1.30.5",
- "notes": "修复 v1.30.4 装完提示「You must install Windows App Runtime」的问题：上一版误把旧的 WinUI 界面打进了安装包，本版换回正式界面，不需要再装任何运行时。\n如果上一版已经能正常打开，也建议升级到本版，界面和功能才是正式版。\n上一版的其它改动都保留：整句重复刷屏会自动识别并重译、新增 fixes.txt 术语/纠错表（三个模式通用）、兼容模式翻译格式与领域微调匹配、识别按核心数自动分配。\n本次安装包约 130 MB，与上一版相当。",
+ "version": "1.30.6",
+ "url": "https://github.com/T2887/asmr-translator/releases/download/v1.30.6/ASMR-Translator-Setup_v1.30.6.exe",
+ "page": "https://github.com/T2887/asmr-translator/releases/tag/v1.30.6",
+ "notes": "全量模式（快速模式）大幅重做，这是本版最实质的改动：\n过去它在识别阶段先用 VAD 切段，而 ASMR 里的喘息、耳语、气声会被 VAD 判成「没在说话」整段丢掉，实测人工字幕只覆盖到 71%、平均每条素材漏译近 1 分钟。本版改成不预切段、整段交给模型，覆盖率升到 87%、漏译降到 7 秒，相似度低于 0.4 的段落从 58% 降到 32%。\n代价是极少数段落的时间轴会略微漂移，以及纯音效段偶尔多出几个拟声字——净收益远大于代价。\n想恢复旧行为：设置环境变量 ASMR_FULL_NOVAD=0。\n\n另外三项：\n· 重复刷屏折叠：单条字幕里同一个词刷 5 次以上且占正文一半以上时，折成「高潮…（×29）」，不再整段刷屏（实测最长单条 112 字 → 15 字）。正常的「喜欢×5」「老师×4」不会被动。\n· 符号保留：原文有几个省略号、有没有爱心，译文缺的就补到句尾——模型自己学不会这些符号，但 ASMR 字幕里它们是语气的一部分。\n· 采样换 DRY：原来的重复惩罚参数对这种刷屏完全无效（实测反而更糟），换成 DRY 后同一句正常台词的输出逐字不变，刷屏则被压掉一个数量级。\n\n本次安装包约 130 MB，与上一版相当。",
  "runtime_patch": {
   "version": "1.30.0",
   "url": "https://github.com/T2887/asmr-translator/releases/download/v1.30.0/ASMR-RuntimePatch_v1.30.0.exe",
