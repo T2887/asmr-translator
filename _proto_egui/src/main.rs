@@ -1365,25 +1365,48 @@ impl App {
             return;
         }
 
-        // 日文原文只有兼容模式有（`light_asr.py` 写进 2vad\<stem>.json）。
+        // 在 2vad 里找一个「前缀是 stem、后缀是 suffix」的文件。
+        //
+        // 为什么要扫而不是直接拼路径：第 4 步处理的是**分离后的人声 wav**，
+        // 它写出来的中间文件叫
+        //   Track-01【…】_(Vocals)_model_bs_roformer_ep_317_sdr_12.lowconf.json
+        // 而这里拿到的是原始素材名 `Track-01【…】`。直接拼 `<stem>.lowconf.json`
+        // 永远不存在，低置信标记就一个都显示不出来（用户反馈 m23980
+        // 「你所谓的标黄的在哪」）。前缀 + 后缀两头卡住，中间那段随便它是什么。
+        let find_in_2vad = |stem: &str, suffix: &str| -> Option<std::path::PathBuf> {
+            let dir = std::path::Path::new(&self.work_dir).join("2vad");
+            let exact = dir.join(format!("{stem}{suffix}"));
+            if exact.is_file() {
+                return Some(exact);
+            }
+            let rd = std::fs::read_dir(&dir).ok()?;
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with(stem) && name.ends_with(suffix) {
+                    let p = e.path();
+                    if p.is_file() {
+                        return Some(p);
+                    }
+                }
+            }
+            None
+        };
+
+        // 日文原文只有兼容模式有（`light_asr.py` 写进 2vad）。
         // 全量/精简走 whisper translate，日文在模型内部就没了。
         let vad = if matches!(self.mode, pipeline::RunMode::Compat) {
-            let p = std::path::Path::new(&self.work_dir)
-                .join("2vad")
-                .join(format!("{stem}.json"));
-            if p.is_file() { Some(p) } else { None }
+            find_in_2vad(&stem, ".json").filter(|p| {
+                // 别把 .lowconf.json / .vad.json 当成日文原文
+                let n = p.file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
+                !n.contains(".lowconf.") && !n.contains(".vad.")
+            })
         } else {
             None
         };
 
-        // 低置信标记（v1.40.1）：第 4 步写出的 2vad\<stem>.lowconf.json。
+        // 低置信标记（v1.40.1）：第 4 步写出的 2vad\<stem>…lowconf.json。
         // 不存在也正常（旧版本跑出来的字幕、或全部判定为高置信）。
-        let lowconf = {
-            let p = std::path::Path::new(&self.work_dir)
-                .join("2vad")
-                .join(format!("{stem}.lowconf.json"));
-            if p.is_file() { Some(p) } else { None }
-        };
+        let lowconf = find_in_2vad(&stem, ".lowconf.json");
 
         match proofread::load(&srt, vad.as_deref(), &src, lowconf.as_deref()) {
             Ok(l) => {
