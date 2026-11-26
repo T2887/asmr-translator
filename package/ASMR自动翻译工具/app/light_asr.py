@@ -28,7 +28,37 @@ import os
 import sys
 import tempfile
 import time
+import tempfile
 
+# ★ v1.30.9：兼容模式第 2 步（语音转写）也要上报运行时状态。
+#
+#   用户反馈「兼容模式没有显示所用设备的情况」——查下来 `emit("segs")`
+#   这一行有，但从来没发过 `emit("stat")`；而且段进度的打点是
+#   `_done % 20 == 0`，22 段的素材要到第 20 段才有第一条，前面十几分钟
+#   界面一片空白，看着像卡死。
+#
+#   设备判定：能跑通 nvidia-smi 就是独显（cuda），否则按核显（vulkan）
+#   处理——StatusProbe 的 vulkan 分支会显示「核显 占用 + CPU 频率」，
+#   正好对应兼容模式在 AMD/Intel 机器上的实际负载。
+#   ★ v1.30.7：这里必须传 "cpu"，不能跟着 settings 的 device 走。
+#
+#   用户实测（5070 + AMD 核显）：选兼容模式时「进度」卡片显示
+#   「GPU 2775/3090 MHz · 显存 3.5/11.9 GB」—— 那是 nvidia-smi 读的
+#   RTX 5070，而兼容模式的 ASR 压根没在 5070 上跑。
+#
+#   原因：本步骤的识别引擎是 sherpa-onnx（asr_engine.py 里没有任何
+#   provider 配置，默认就是 CPUExecutionProvider），Haas-ja 靠
+#   num_threads 在 CPU 上跑。settings 里的 "device" 是给 torch 用的
+#   （默认值就是 "cuda" if torch.cuda.is_available()），跟这里无关。
+#
+#   所以状态行显示 CPU 占用 / 频率才是真实的；翻译阶段（llama-server）
+#   是另一支进程，它自己有 Vulkan 负载，那部分在 main 的 device_rx 里。
+_ST2 = None
+try:
+    from status_probe import StatusProbe as _SP2
+    _ST2 = _SP2(0, "cpu", os.getpid())
+except Exception:
+    _ST2 = None
 # ★ 识别/VAD 的 CPU 线程数（v1.30.4 起可调，默认 4 = 旧行为）。
 #   实测（H:\_probe_asr\bench_cuda.py，Haas-ja encoder，8.6s 一段）：
 #     1/2/4/8/16 线程 = 4122/1994/1260/872/2082 ms
@@ -405,6 +435,7 @@ for idx, fp in enumerate(files, 1):
         #   同时用 @@EV@@ 让界面能读（协议见 events.py）。
         _n_total = len([1 for a, b in seg_sec if b - a >= 0.15])
         _t_seg0 = time.time()
+        _t_last_emit = 0.0
         _done = 0
         for a, b in seg_sec:
             if b - a < 0.15:
@@ -416,16 +447,30 @@ for idx, fp in enumerate(files, 1):
                     "end": round(b, 2),
                     "text": res["text"],
                 })
-            # ★ 段进度：每 20 段或最后一段打点（每段都打会把日志刷爆）
+            # ★ 段进度：每 5 段或每 3 秒打点（每段都打会把日志刷爆）。
+            #
+            #   v1.30.9 把间隔从 20 段改成 5 段：ASMR 素材常见 20~30 段，
+            #   20 段的间隔意味着前半程界面完全没有反馈（用户实测截图里
+            #   「第2步 语音转写 0 分 17 秒」整行是空的）。
             _done += 1
-            if _done % 20 == 0 or _done == _n_total:
-                _el = time.time() - _t_seg0
+            _now2 = time.time()
+            if (_done % 5 == 0 or _done == _n_total
+                    or _now2 - _t_last_emit > 3.0):
+                _t_last_emit = _now2
+                _el = _now2 - _t_seg0
                 _spm = _done / max(0.01, _el) * 60.0      # 每分钟处理几段
                 _left = (_n_total - _done) / max(0.001, _spm) if _spm > 0 else 0
                 print(f"    识别 {_done}/{_n_total} 段"
                       f"（{_done / max(1, _n_total) * 100:.0f}%）"
                       f"  {_spm:.1f} 段/分  剩约 {_left:.0f} 分", flush=True)
                 emit("segs", _done, _n_total, round(_spm, 2), int(_left))
+                if _ST2 is not None:
+                    try:
+                        _s2 = _ST2.poll()
+                        if _s2:
+                            emit("stat", _s2)
+                    except Exception:
+                        pass
 
         # ── 漏段补扫 ──
         holes = scan_holes(seg_sec, dur, MIN_HOLE_SEC)

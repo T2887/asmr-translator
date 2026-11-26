@@ -1460,6 +1460,22 @@ pub fn run_stage(
     let (_, script, _) = stages(mode)[stage - 1];
     let marker = ready_marker(mode, stage);
 
+    // ★ v1.30.7：进入新的一步就清空段进度。
+    //
+    //   为什么必须清：`segs` 是跨 stage 共享的 Arc<Mutex<String>>。
+    //   第 2 步（语音转写）跑完时最后一条是 tqdm 的 `100%|...| 1/1`，
+    //   被 tqdm 解析块写成「分析 1/1 项（100%）」；紧接着第 3 步开跑，
+    //   而第 3 步开跑前先要测速（`[测速] 正在比较纯 CPU 与核显的速度…`），
+    //   测速期间没有任何 tqdm/segs 输出 —— 于是界面上「当前动作」一直
+    //   挂着第 2 步的「分析 1/1 项（100%）」，总进度条也停在 33%
+    //   不动，用户以为卡死（实测反馈 m20980）。
+    //
+    //   清成空串而不是 "处理中"：界面只在非空时画那一行，
+    //   宁可这一两秒没有数字，也不要显示一个假的 100%。
+    if let Ok(mut v) = segs.lock() {
+        v.clear();
+    }
+
     // ★ 把界面选的运行模式传给 Python（环境变量 ASMR_LITE）。
     //
     //   以前 Python 侧的 compute_type 只按【显存大小】决定（settings.py），
@@ -1665,6 +1681,29 @@ pub fn run_stage(
                     if tot > 0.0 {
                         if let Ok(mut f) = frac2.lock() {
                             *f = (cur / tot).clamp(0.0, 1.0);
+                        }
+                        // ★ v1.30.7：第 2/3 步也上报「段进度」。
+                        //
+                        //   原来只有第 4 步（识别）和兼容模式第 2/3 步会发
+                        //   `@@EV@@ segs|...`，全量模式跑第 2 步 VAD / 第 3 步
+                        //   分离时「进度」卡片只有「当前阶段 · 已用时间」，
+                        //   没有任何数字，用户以为卡住了（实测反馈）。
+                        //
+                        //   这两步本来就有 tqdm（第 3 步的 "it/s]" 就是
+                        //   ready_marker 用来判活的），直接在解析 tqdm 的
+                        //   地方顺手写进 segs 通道即可，不用改 Python。
+                        if stage == 2 || stage == 3 {
+                            let pct = (cur / tot) * 100.0;
+                            let txt = format!(
+                                "{} {:.0}/{} 项（{:.0}%）",
+                                if stage == 2 { "分析" } else { "分离" },
+                                cur,
+                                tot as u64,
+                                pct
+                            );
+                            if let Ok(mut v) = segs2.lock() {
+                                *v = txt;
+                            }
                         }
                     }
                 }

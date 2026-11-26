@@ -21,6 +21,7 @@ mod pipeline;
 mod srt;
 #[path = "../../app/src/softsub.rs"]
 mod softsub;
+mod proofread;
 mod cancel;
 mod subscan;
 mod updater;
@@ -70,6 +71,12 @@ struct FileRow {
     /// 被跳过的原因（`内封字幕 subrip（chi）` / `画面里压了硬字幕` / `已有外挂字幕`）。
     /// 只有 `state == "已有字幕"` 时才有值，界面上鼠标悬停能看到。
     note: Option<String>,
+    /// ★ v1.30.7：这个文件自己的字幕预览。
+    ///
+    /// 以前只有 `App.preview` 一份，`Ev::FileStart` 一来就清空 ——
+    /// 跑第二个文件时第一个的预览全丢，用户点文件列表也切不回来
+    /// （实测反馈 m21249）。改成每个文件各存一份。
+    preview: Vec<String>,
 }
 
 struct App {
@@ -136,6 +143,14 @@ struct App {
     files: Vec<FileRow>,
     logs: Vec<String>,
     preview: Vec<String>,
+    /// 用户在文件列表里点选的那个（None = 跟着正在跑的文件走）。
+    /// 点同一个文件第二次会取消，回到实时。
+    sel_idx: Option<usize>,
+
+    // ── 字幕校对（v1.30.7）──
+    /// 打开校对界面时的整套状态；None = 没打开。
+    /// 打包成一个结构是为了让渲染函数不用借 `self` 的其它字段（借用冲突）。
+    pf: Option<proofread::PfState>,
 
     // ── 真实后端接线 ──
     worker: Option<worker::Worker>,
@@ -221,6 +236,8 @@ struct App {
     // ── 进度 / 预估剩余（照抄 app/src/ui.rs 的算法，见各自的注释）──
     /// 每一步的实测耗时（按顺序 push，一个文件 4 条）—— ETA 自校准的样本
     stage_secs: Vec<u64>,
+    /// ★ v1.30.7：当前这个文件的完成度（0~1），进度卡片里单独显示。
+    file_prog: f64,
     /// 已处理完的每个文件的语音时长（秒）
     file_speech: Vec<f64>,
     /// 当前文件的语音时长（第 2 步日志 `VAD: N 段 / X.Xs` 里解析）
@@ -297,6 +314,8 @@ impl Default for App {
             files: Vec::new(),
             logs,
             preview: Vec::new(),
+            sel_idx: None,
+            pf: None,
             worker: None,
             device_rx: None,
             device_text: "正在检测设备…".into(),
@@ -335,6 +354,7 @@ impl Default for App {
             started_at: None,
             current_action: String::new(),
             stage_secs: Vec::new(),
+            file_prog: 0.0,
             file_speech: Vec::new(),
             cur_speech: 0.0,
             tqdm_ema: 0.0,
@@ -415,6 +435,7 @@ impl App {
                     name,
                     state: "排队中".into(),
                     note: None,
+                    preview: Vec::new(),
                 });
             }
         }
@@ -536,6 +557,7 @@ impl App {
                 name,
                 state: state.to_string(),
                 note: None,
+                preview: Vec::new(),
             });
         }
         self.cur_idx = idx;
@@ -903,6 +925,29 @@ impl App {
         );
         // ★ 测速弹窗的选择同步到后端（决定翻译脚本用不用 Vulkan）
         backend::set_force_cpu(self.force_cpu_device);
+        // ★ v1.30.7：开跑前清掉上一轮残留的过程文件（0pre / 1audio / 2vad）。
+        //
+        //   为什么放在这里而不是 start() 开头：start() 前面有一串早退分支
+        //   （环境缺失、显存不足、预检还在跑…），那些情况下用户根本没开跑，
+        //   不该动他的文件。到这一行才是真的要启动 worker。
+        //
+        //   为什么「正常跑完」不清理：`2vad\<stem>.json` 是校对界面
+        //   「识别原文」列的唯一来源，跑完就清掉的话用户再点「✎ 校对字幕」
+        //   就只剩中文列了。原来的 WinUI 版是跑完即清（不产生垃圾），
+        //   但那时还没有校对功能。
+        //
+        //   垃圾不会累积：下一轮点「开始处理」时这一句就把它清干净了。
+        {
+            let (n, bad) = pipeline::purge_process_files(true);
+            if n > 0 || bad > 0 {
+                self.push_log(format!(
+                    "[清理] 已删除上一轮残留 {n} 个过程文件（0pre/1audio/2vad，未进回收站；3asr 保留）"
+                ));
+                if bad > 0 {
+                    self.push_log(format!("[清理] 另有 {bad} 个被占用没能删掉"));
+                }
+            }
+        }
         self.worker = Some(worker::spawn(
             jobs,
             self.mode,
@@ -921,6 +966,24 @@ impl App {
         self.running = false;
         self.paused = false;
         self.push_log("[停止] 已请求停止，并强杀当前子进程");
+        // ★ v1.30.7：停止后立刻清过程文件。
+        //
+        //   和「正常跑完不清理」相反：任务被中断了，没有完整字幕可校对，
+        //   留着 0pre 的音视频副本 + 1audio 的人声 WAV 只是占地方。
+        //
+        //   include_pre = false：0pre 里可能是用户自己手动放进去的素材
+        //   （没勾文件、直接从目录跑的那种用法），删了等于删他的源文件。
+        {
+            let (n, bad) = pipeline::purge_process_files(false);
+            if n > 0 || bad > 0 {
+                self.push_log(format!(
+                    "[清理] 已删除 {n} 个过程文件（1audio/2vad，未进回收站；3asr 保留）"
+                ));
+                if bad > 0 {
+                    self.push_log(format!("[清理] 另有 {bad} 个被占用没能删掉"));
+                }
+            }
+        }
     }
 
     fn toggle_pause(&mut self) {
@@ -1122,7 +1185,33 @@ impl App {
             (stage_used / expected).clamp(0.0, 0.95)
         };
         file_prog += W[st - 1] * frac_eff;
-        let p = ((n_done + file_prog) / n_all * 100.0).clamp(0.0, 100.0);
+        self.file_prog = file_prog.clamp(0.0, 1.0);
+
+        // ★ v1.30.7：总进度按【耗时】加权，不再按文件个数均分。
+        //
+        //   原来 `(n_done + file_prog) / n_all`：2 个文件、第 1 个跑完，
+        //   第 2 个刚开始就是 53%（用户实测反馈 m21193「才刚启动第二个
+        //   任务，总进度就 50 了」）。文件时长差得远（3 分钟 vs 20 分钟），
+        //   按个数分完全不代表干了多少活。
+        //
+        //   现在：已完成文件按【实耗秒数】算，当前文件按【已用时】算，
+        //   还没跑的按「已完成文件的平均耗时」估。
+        //   一个文件都还没跑完时退回个数均分（没有样本可估）。
+        let done_secs: f64 = self
+            .stage_secs
+            .chunks(4)
+            .map(|c| c.iter().map(|v| *v as f64).sum::<f64>())
+            .sum();
+        let p = if done_secs > 1.0 && n_done >= 1.0 {
+            let avg = done_secs / n_done;
+            let cur_used = (self.elapsed as f64 - done_secs).max(0.0);
+            let cur_est = avg.max(1.0);
+            let rest = (n_all - n_done - 1.0).max(0.0);
+            let total_est = done_secs + cur_est + rest * avg;
+            ((done_secs + cur_used.min(cur_est)) / total_est * 100.0).clamp(0.0, 100.0)
+        } else {
+            ((n_done + file_prog) / n_all * 100.0).clamp(0.0, 100.0)
+        };
         if p > self.progress_value {
             self.progress_value = p;
         }
@@ -1231,6 +1320,51 @@ impl App {
                     "—".to_string()
                 }
             }
+        }
+    }
+
+    /// 打开字幕校对：载入「最后一个已完成」那个文件的字幕。
+    ///
+    /// 为什么挑「最后一个完成」而不是「当前选中」：校对发生在整批跑完之后，
+    /// 用户刚看完的就是最后一条。他能再点文件列表换，这里只是给个默认。
+    fn open_proofread(&mut self) {
+        let Some(f) = self.files.iter().rev().find(|f| f.state.contains("完成")) else {
+            self.push_log("[校对] 还没有已完成的文件");
+            return;
+        };
+        let src = std::path::PathBuf::from(&f.path);
+        let Some(stem) = src.file_stem().map(|s| s.to_string_lossy().to_string()) else {
+            return;
+        };
+        let Some(dir) = src.parent() else { return };
+
+        // 流水线收尾时 tidy_dir 会把 `3asr\<stem>.chs.srt` 改名成
+        // `<原文件名>.chs.srt` 挪到视频目录（这里就是源文件同目录）。
+        let srt = dir.join(format!("{stem}.chs.srt"));
+        if !srt.is_file() {
+            self.push_log(format!("[校对] 找不到字幕：{}", srt.display()));
+            return;
+        }
+
+        // 日文原文只有兼容模式有（`light_asr.py` 写进 2vad\<stem>.json）。
+        // 全量/精简走 whisper translate，日文在模型内部就没了。
+        let vad = if matches!(self.mode, pipeline::RunMode::Compat) {
+            let p = std::path::Path::new(&self.work_dir)
+                .join("2vad")
+                .join(format!("{stem}.json"));
+            if p.is_file() { Some(p) } else { None }
+        } else {
+            None
+        };
+
+        match proofread::load(&srt, vad.as_deref(), &src) {
+            Ok(l) => {
+                let n = l.rows.len();
+                let ja = if l.has_ja { "含日文原文" } else { "仅中文" };
+                self.push_log(format!("[校对] 载入 {n} 句（{ja}）"));
+                self.pf = Some(proofread::PfState::new(l));
+            }
+            Err(e) => self.push_log(format!("[校对] {e}")),
         }
     }
 
@@ -1533,9 +1667,28 @@ impl App {
                     // 累积而不是替换：一个文件可能分几步吐字幕（兼容模式第 3 步、
                     // 全量模式第 4 步），替换会把前一批冲掉。
                     // 去重：实时抓的那批和阶段结束时补的那批会重叠。
+                    let cur = self.cur_idx;
+                    // ★ v1.30.9：收到哨兵就先清空 —— 识别过程中按 whisper
+                    //   原始顺序出的那批时间戳会倒退（746s 后面跟 27s），
+                    //   定稿后 Python 重新按 merge+enforce_timeline 之后的
+                    //   顺序 print 一遍，这里清掉旧的再收新的。
+                    if lines.iter().any(|s| s == "__PF_CLEAR__") {
+                        self.preview.clear();
+                        if let Some(f) = self.files.get_mut(cur) {
+                            f.preview.clear();
+                        }
+                    }
                     for s in lines {
+                        if s == "__PF_CLEAR__" {
+                            continue;
+                        }
                         if !self.preview.contains(&s) {
-                            self.preview.push(s);
+                            self.preview.push(s.clone());
+                        }
+                        if let Some(f) = self.files.get_mut(cur) {
+                            if !f.preview.contains(&s) {
+                                f.preview.push(s);
+                            }
                         }
                     }
                 }
@@ -2108,6 +2261,49 @@ fn card_body<R>(
                 if let Some(t) = badge {
                     badge_pill(ui, t);
                 }
+            });
+            ui.add_space(10.0);
+            add(ui)
+        })
+        .inner
+}
+
+/// 带右上角动作按钮的卡片（字幕校对的入口就挂在这里）。
+///
+/// 和 `card_body` 的唯一区别是标题行右侧多一块区域：`add_action` 用
+/// `right_to_left` 布局画，所以按钮会贴右边缘。`add` 的内容从下一行开始，
+/// 不会被按钮挤下去。
+fn card_action<R>(
+    ui: &mut Ui,
+    title: &str,
+    add_action: impl FnOnce(&mut Ui),
+    add: impl FnOnce(&mut Ui) -> R,
+) -> R {
+    Frame::new()
+        .fill(CARD)
+        .corner_radius(12.0)
+        .inner_margin(Margin::same(14))
+        .stroke(Stroke::new(1.0, CARD_LINE))
+        .shadow(Shadow {
+            offset: [0, 2],
+            blur: 8,
+            spread: 0,
+            color: Color32::from_rgba_unmultiplied(0x1f, 0x1e, 0x1d, 20),
+        })
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(3.0, 15.0), Sense::hover());
+                ui.painter().rect_filled(rect, 1.5, ACCENT);
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(title)
+                        .font(FontId::new(15.0, FontFamily::Name("bold".into())))
+                        .color(INK),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    add_action(ui);
+                });
             });
             ui.add_space(10.0);
             add(ui)
@@ -3109,6 +3305,9 @@ impl eframe::App for App {
                                                 for (i, f) in self.files.iter().enumerate() {
                                                     let is_current = f.state == "处理中";
                                                     let is_sel = self.selected.contains(&i);
+                                                    // ★ v1.30.9：正在看哪个文件的预览。
+                                                    //   之前点了没有任何反馈，用户以为没生效（实测 m21322）。
+                                                    let is_view = self.sel_idx == Some(i);
                                                     let color = match f.state.as_str() {
                                                         "完成" => OK_GREEN,
                                                         "处理中" => ACCENT,
@@ -3129,6 +3328,9 @@ impl eframe::App for App {
                                                     // （正在处理给浅橙，选中给更中性的浅灰，一屏里不会看混）
                                                     let bg = if is_current {
                                                         ACCENT_SOFT
+                                                    } else if is_view {
+                                                        // 正在看这个文件的预览：淡橙，和「处理中」同一族的浅一档
+                                                        Color32::from_rgb(0xf7, 0xec, 0xe4)
                                                     } else if is_sel {
                                                         SEL_BG
                                                     } else {
@@ -3157,7 +3359,7 @@ impl eframe::App for App {
                                                                     Vec2::new(3.0, 14.0),
                                                                     Sense::hover(),
                                                                 );
-                                                                if is_sel {
+                                                                if is_sel || is_view {
                                                                     ui.painter().rect_filled(r, 1.5, ACCENT);
                                                                 }
                                                                 ui.label(
@@ -3213,17 +3415,35 @@ impl eframe::App for App {
                                                         row.response.rect,
                                                         ui.id().with(("file_row", i)),
                                                         Sense::click(),
-                                                    );
+                                                    )
+                                                    // ★ v1.30.9：Sense::click() 不自动给手型 ——
+                                                    //   行里全是 Label，继承了文本的 I-beam 光标，
+                                                    //   用户以为那是个输入框（实测 m21322）。
+                                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
                                                     if resp.clicked() {
                                                         if self.running {
                                                             // push_log 要 &mut self，而循环里还借着
                                                             // self.files 的不可变借用 —— 先记下来，
                                                             // 等循环结束再打日志。
                                                             blocked_click = true;
-                                                        } else if is_sel {
-                                                            self.selected.remove(&i);
+                                                        } else if ui.input(|inp| {
+                                                            inp.modifiers.ctrl
+                                                                || inp.modifiers.command
+                                                        }) {
+                                                            // ★ v1.30.7：Ctrl+点 = 多选（给「移除选中」）
+                                                            if is_sel {
+                                                                self.selected.remove(&i);
+                                                            } else {
+                                                                self.selected.insert(i);
+                                                            }
                                                         } else {
-                                                            self.selected.insert(i);
+                                                            // ★ v1.30.7：普通点 = 看这个文件自己的字幕
+                                                            //   再点同一次 = 取消，回到实时跟随
+                                                            self.sel_idx = if self.sel_idx == Some(i) {
+                                                                None
+                                                            } else {
+                                                                Some(i)
+                                                            };
                                                         }
                                                     }
                                                 }
@@ -3316,7 +3536,46 @@ impl eframe::App for App {
                             },
                         );
 
-                        card(&mut cols[1], "实时翻译预览", |ui| {
+                        // ★ v1.30.7：预览卡片右上角挂「校对字幕」入口。
+                        //   只在「没在跑 && 有文件已完成」时可点 —— 翻译没结束
+                        //   就校对，改完的字幕会被后续写入覆盖掉。
+                        let pf_ready = !self.running
+                            && self
+                                .files
+                                .iter()
+                                .any(|f| f.state.contains("完成"));
+                        let mut pf_clicked = false;
+
+                        card_action(
+                            &mut cols[1],
+                            "实时翻译预览",
+                            |ui| {
+                                ui.add_enabled_ui(pf_ready, |ui| {
+                                    let btn = egui::Button::new(
+                                        RichText::new("✎ 校对字幕").size(12.0).color(
+                                            if pf_ready { ACCENT } else { INK3 },
+                                        ),
+                                    )
+                                    .fill(if pf_ready {
+                                        Color32::from_rgb(0xfd, 0xf3, 0xed)
+                                    } else {
+                                        SUNK
+                                    })
+                                    .stroke(Stroke::new(
+                                        1.0,
+                                        if pf_ready {
+                                            Color32::from_rgb(0xf0, 0xd5, 0xc6)
+                                        } else {
+                                            CARD_LINE
+                                        },
+                                    ))
+                                    .corner_radius(8.0);
+                                    if ui.add(btn).clicked() {
+                                        pf_clicked = true;
+                                    }
+                                });
+                            },
+                            |ui| {
                             ui.set_min_height(body2);
                             if self.preview.is_empty() {
                                 inner_panel(ui, |ui| {
@@ -3345,14 +3604,36 @@ impl eframe::App for App {
                                         .auto_shrink([false, false])
                                         .stick_to_bottom(true)
                                         .show(ui, |ui| {
-                                            for s in &self.preview {
+                                            // ★ v1.30.7：点文件列表可以看别的任务
+                                            //   sel_idx = 正在看的那个（None = 跟随实时）
+                                            //   正在跑的那个仍用 self.preview（它还在长）
+                                            let hist: Option<&Vec<String>> = self
+                                                .sel_idx
+                                                .filter(|i| *i != self.cur_idx)
+                                                .and_then(|i| self.files.get(i))
+                                                .map(|f| &f.preview);
+                                            let lines: &Vec<String> =
+                                                hist.unwrap_or(&self.preview);
+                                            if hist.is_some() && lines.is_empty() {
+                                                ui.label(
+                                                    RichText::new("（这个任务没有留下字幕预览）")
+                                                        .size(12.0)
+                                                        .color(INK3),
+                                                );
+                                            }
+                                            for s in lines {
                                                 ui.label(RichText::new(s).size(12.5).color(INK2));
                                                 ui.add_space(2.0);
                                             }
                                         });
                                 });
                             }
-                        });
+                            },
+                        );
+
+                        if pf_clicked {
+                            self.open_proofread();
+                        }
                     });
 
                     ui.add_space(12.0);
@@ -3391,7 +3672,28 @@ impl eframe::App for App {
                             });
                         });
 
-                        card(&mut cols[1], "进度", |ui| {
+                        // ★ v1.30.7：运行时状态（显卡频率/占用/显存）画在「进度」标题行右侧。
+                        //   之前放在卡片内部第一行，占了纵向空间又把标题和内容隔开；
+                        //   并进标题行后，一眼能看到「在干活吗」而不用往下扫。
+                        let stat_now = if self.running {
+                            self.runtime_stat.clone()
+                        } else {
+                            String::new()
+                        };
+                        card_action(
+                            &mut cols[1],
+                            "进度",
+                            move |ui| {
+                                if !stat_now.is_empty() {
+                                    ui.add(
+                                        Label::new(
+                                            RichText::new(&stat_now).size(12.0).color(ACCENT_INK),
+                                        )
+                                        .truncate(),
+                                    );
+                                }
+                            },
+                            |ui| {
                             ui.set_min_height(body3);
                             ui.columns(2, |c| {
                                 c[0].vertical(|ui| {
@@ -3408,7 +3710,13 @@ impl eframe::App for App {
                                 });
                             });
                             ui.add_space(10.0);
-                            ui.columns(2, |c| {
+                            // ★ v1.30.7：加第三列「当前文件」。
+                            //
+                            //   总进度是按整批算的，批量里第 2 个文件跑到
+                            //   一半时总进度可能才 55%，看不出「这一个做到哪了」
+                            //   （用户实测反馈 m21194：应该增加一个当前任务进度）。
+                            let _cur_no = (self.cur_idx + 1).min(self.files.len());
+                            ui.columns(3, |c| {
                                 c[0].vertical(|ui| {
                                     ui.spacing_mut().item_spacing.y = 2.0;
                                     ui.label(RichText::new("已用时间").size(11.0).color(INK3));
@@ -3423,6 +3731,19 @@ impl eframe::App for App {
                                     );
                                 });
                                 c[1].vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 2.0;
+                                    ui.label(
+                                        RichText::new(format!("当前文件（{_cur_no}/{}）", self.files.len()))
+                                            .size(11.0)
+                                            .color(INK3),
+                                    );
+                                    ui.label(
+                                        RichText::new(format!("{:.0}%", self.file_prog * 100.0))
+                                            .size(13.5)
+                                            .color(INK),
+                                    );
+                                });
+                                c[2].vertical(|ui| {
                                     ui.spacing_mut().item_spacing.y = 2.0;
                                     ui.label(RichText::new("总进度").size(11.0).color(INK3));
                                     ui.label(
@@ -3450,7 +3771,19 @@ impl eframe::App for App {
                                 );
                                 ui.add_space(1.0);
                             }
-                            if !self.current_action.is_empty() {
+                            // ★ v1.30.7：挡掉和段进度重复的那行。
+                            //
+                            //   Python 侧除了发 @@EV@@ segs 事件，还会 print 一行
+                            //   「识别 15/77 段（19%）· 86.7 段/分 · 剩约 0 分」，
+                            //   pipeline 会把这行 stdout 当 current_action 收进来，
+                            //   结果界面上同一句话出现两遍（用户实测截图）。
+                            let _dup = !self.seg_progress.is_empty()
+                                && (self.current_action.starts_with("识别 ")
+                                    || self.current_action.starts_with("翻译 ")
+                                    || self.current_action.starts_with("处理 ")
+                                    || self.current_action.starts_with("分析 ")
+                                    || self.current_action.starts_with("分离 "));
+                            if !self.current_action.is_empty() && !_dup {
                                 ui.add(
                                     Label::new(
                                         RichText::new(&self.current_action).size(12.0).color(INK3),
@@ -3460,21 +3793,8 @@ impl eframe::App for App {
                             } else if self.running {
                                 ui.label(RichText::new("启动中…").size(12.0).color(INK3));
                             }
-                            // ★ v1.30.3：运行时状态（模型 tok/s · CPU 占用 · 频率）
-                            //   用户能据此判断「到底是卡住了还是在干活」。
-                            //   只在跑批且有数据时显示，空闲时不占地方。
-                            if self.running && !self.runtime_stat.is_empty() {
-                                ui.add_space(2.0);
-                                ui.add(
-                                    Label::new(
-                                        RichText::new(&self.runtime_stat)
-                                            .size(11.5)
-                                            .color(ACCENT_INK),
-                                    )
-                                    .truncate(),
-                                );
-                            }
-                        });
+                        },
+                        );
                     });
 
                     });
@@ -4191,6 +4511,18 @@ impl eframe::App for App {
                 self.show_cpu_warning = false;
             }
         }
+
+        // ★ v1.30.7：字幕校对窗口（模态层的近似 —— 盖在主界面上，关掉就回到主界面）
+        if self.pf.is_some() {
+            let ctx2 = ctx.clone();
+            let mut close = false;
+            if let Some(st) = self.pf.as_mut() {
+                close = proofread::ui(&ctx2, st);
+            }
+            if close {
+                self.pf = None;
+            }
+        }
     }
 }
 
@@ -4259,7 +4591,11 @@ fn main() -> eframe::Result<()> {
     }
     let mut viewport = egui::ViewportBuilder::default()
         .with_decorations(false)
-        .with_inner_size([1280.0, 1000.0])
+        // ★ v1.30.7：默认高度 1000 → 1120。
+        //   主界面是「标题 + 环境 + 行2(文件列表/预览) + 行3(日志/进度) + 底部按钮」
+        //   五段纵向堆叠，1000 差约 40~120 点装不下，行3 两张卡片底部会被裁掉
+        //   （用户实测截图）。1120 在 1080p@100% 和 @150% 的屏幕上都能完整显示。
+        .with_inner_size([1280.0, 1120.0])
         .with_min_inner_size([900.0, 600.0])
         // ★ 必须调 config::app_title()，不能在这里自己拼字符串。
         //

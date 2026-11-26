@@ -17,6 +17,8 @@ merge_segments 则专治 whisper 的**跨段重复输出**
 ⚠️ 这两个函数是纯逻辑，与模型无关，不改变音频内容。
 """
 from dataclasses import dataclass
+import os
+import re
 
 
 @dataclass
@@ -219,17 +221,250 @@ def collapse_repeats(text, min_repeat=5, min_share=0.5):
     return new, True
 
 
-def collapse_rows(rows, min_repeat=5):
-    """对 [(start, end, text)] 整批折叠，返回 (rows, 改动条数)。"""
+def collapse_rows(rows, min_repeat=5, drop_over=8):
+    """对 [(start, end, text)] 整批折叠，返回 (rows, 改动条数)。
+
+    ★ v1.30.7：`drop_over` 次以上的重复**整段丢弃**，不再折成 `（×N）` 保留。
+
+    起因（用户实测）：全量模式产出
+        `请把你的肉棒插到小穴深处 尽情地摩擦…（×11）`
+    时间窗 6 秒 —— 6 秒说 11 遍 = 每遍 0.55 秒，人说不出来。
+    这是 whisper 在静音/音效段的循环幻觉（novad 下没有「这窗有人声」的
+    约束），折叠成带计数的标注只是把一个错误包装得更像真的，用户点时间
+    播放就会发现内容对不上。
+
+    阈值 8：真实台词「喜欢 喜欢 喜欢」「老师 老师 老师」最多 5~6 次。
+    """
     out, n = [], 0
+    dropped = 0
     for a, b, t in rows:
         nt, hit = collapse_repeats(t, min_repeat=min_repeat)
         if hit:
+            # 从折叠结果里把次数抠出来（形如 `…（×11）`）
+            _k = 0
+            _p = nt.rfind("（×")
+            if _p >= 0:
+                _q = nt.find("）", _p)
+                if _q > _p:
+                    try:
+                        _k = int(nt[_p + 2:_q])
+                    except ValueError:
+                        _k = 0
+            if _k > drop_over:
+                dropped += 1
+                print(f"  [丢弃幻觉] {a:.1f}-{b:.1f}  ×{_k} 次重复，"
+                      f"整段丢弃：{t[:30]}")
+                continue
             n += 1
             print(f"  [折叠重复] {a:.1f}-{b:.1f}  {t[:36]} → {nt[:36]}")
         out.append((a, b, nt))
+    if dropped:
+        print(f"  [丢弃幻觉] 共 {dropped} 条（重复 >{drop_over} 次）")
     return out, n
 
+
+
+# ════════════════════════════════════════════════════════════════
+# 人声闸（v1.30.8）：用独立 ASR 复核「长时段少字」的段
+# ════════════════════════════════════════════════════════════════
+#
+# 为什么需要它
+# ────────────
+# novad（v1.30.6 起的默认）不再用 VAD 裁解码窗口，好处是不丢喘息、气声、
+# 耳语（覆盖率 71% → 87%），代价是 whisper 会拿到纯音效的窗口，在这种
+# 窗口里它经常顺着 initial_prompt 编出整句台词。
+#
+# 实测（04 号素材，144 段）—— 常规置信度手段全部失效：
+#   · no_speech_prob 70/70 段恒为 0.000（译中特化模型把这个头训坏了）；
+#   · avg_logprob / compression_ratio 是**窗口级**的值，相邻 5~7 段完全
+#     同值（-0.562/1.25 连 7 段），分不出同窗内的真假段；
+#   · 能量反向 —— 接吻声峰值 -5~-10 dB，耳语真语音帧 RMS 才 -40 dB；
+#   · ASMR VAD 有漏检：它对 272.6-274.3s 打 0.000，而 Haas-ja 在那里识出
+#     「私のおへそのあたりに」(conf 0.948)，是真语音。拿它当硬闸会删掉
+#     35 段真台词。
+#
+# 所以唯一可靠的信号是「换一个模型再听一遍」：
+#   · 独立 ASR 返回空串           → 铁证幻觉（1133.9-1145.9s 那句「约20秒
+#                                   的舌吻 结束」确实是编的）；
+#   · 返回的字全是极少数几种     → 那是拟声词/音效，不是台词。
+#
+# 成本：只有「字/秒 < min_cps」的段才会被送复核（同素材 28 段 46.4 秒），
+# 而且 Haas-ja 在 CPU 上跑，可以和 whisper 的 GPU 并行。
+#
+# 为什么还要 min_dur 这一层：`え私?`(conf 0.966) / `じゃあ` / `ほら` /
+# `いいわよ` / `出して?` 这些真语音的字/秒同样很低，字符种类也只有 2~4，
+# 但它们都在 4 秒以内 —— 只用「长 + 少」两个条件同时成立才丢，短句一个
+# 都不碰。
+# ════════════════════════════════════════════════════════════════
+_CJK_RE = re.compile(r"[\u3040-\u30ff\u4e00-\u9fff]")
+
+
+def cjk_count(t):
+    """数一行字幕里有多少个假名/汉字（标点、空格、数字不算）。"""
+    return len(_CJK_RE.findall(t or ""))
+
+
+# 纯拟声字表：一整行如果只由这些字组成，那它描述的是音效，不是台词。
+# 没有放「哈」「呼」「吸」「舔」「揉」—— 它们是真的台词用字
+# （「哈哈」「呼呼大睡」「吸出来」「舔舐」「揉揉」人工字幕里都有）。
+_ONO = set("叭啪啾滋咕咚噗咻吮啧嘟啵咂嘎咔嗒吭嘶咝嚓啪叽咕嘟")
+# whisper 的元描述幻觉：「约20秒的舌吻 结束」「约10秒的舌吻时间」——
+# 它不是在翻译台词，是在描述这段音频。
+_META_RE = re.compile(r"[约約]?\s*\d+\s*秒")
+_META_HINT = ("舌吻", "接吻", "吻", "时间", "口交", "舔", "结束", "开始")
+
+
+def drop_ono(rows, log=None):
+    """丢掉「整行只由拟声字组成」的段，以及「约N秒的X」这类元描述。
+
+    这是 novad 下第二大类假字幕（第一类是纯数字倒计时，见 drop_junk）。
+    whisper 拿到接吻/舔耳的音效窗口时，会老老实实把音效音写成中文
+    拟声词：`叭叭叭叭`、`滋滋滋`、`啪 啾啪`、`咕咚咕咚`、`亲 亲`。
+    这些不是台词，却会占掉一整条字幕的位置。
+
+    判据只看「整行去掉标点后是否全部由拟声字构成」，所以
+    `摸摸头 摸摸头`（真台词）、`揉揉揉`（「揉」不在表里）、`哈哈`
+    （「哈」不在表里）都不会被误删。
+
+    返回 (新 rows, 丢弃条数)。
+    """
+    if log is None:
+        log = print
+    out, n = [], 0
+    for (s, e, t) in rows:
+        txt = (t or "").strip()
+        core = re.sub(r"[\s\W_]+", "", txt)
+        if core and all(ch in _ONO for ch in core):
+            n += 1
+            log("  [拟声] 丢弃 %.1f-%.1f 秒纯音效行：%r" % (s, e, txt))
+            continue
+        if len(txt) <= 20 and _META_RE.search(txt) and any(
+                h in txt for h in _META_HINT):
+            n += 1
+            log("  [拟声] 丢弃 %.1f-%.1f 秒元描述幻觉：%r" % (s, e, txt))
+            continue
+        out.append((s, e, t))
+    return out, n
+
+
+def drop_junk(rows, max_len=4, log=None):
+    """丢掉「整行不含假名/汉字且很短」的段。
+
+    这是 whisper 最出名的一类幻觉：训练数据里有大量带倒计时的视频，
+    于是它在纯音效窗口里会老老实实输出 `10 9 8 7 6 5 4 3 2 1 0`。
+    实测 04 号素材（`H:/_probe_gate/3asr/04_16k.srt`，109 条）里有 11 条
+    是这样的纯数字，占 10%。它们不含任何假名/汉字，也没有任何信息量。
+
+    只删 max_len(4) 个字以内、且一个假名/汉字都没有的行，所以
+    `…` / `♡` / `！` 也会被清掉（这些本来就该由前一段带着走），
+    而 `啊` / `亲` / `嗅嗅` 这类带字的短句一个都不碰。
+
+    返回 (新 rows, 丢弃条数)。
+    """
+    if log is None:
+        log = print
+    out, n = [], 0
+    for (s, e, t) in rows:
+        txt = (t or "").strip()
+        if cjk_count(txt) == 0 and len(txt) <= max_len:
+            n += 1
+            log("  [杂讯] 丢弃 %.1f-%.1f 秒纯数字/符号：%r" % (s, e, txt))
+            continue
+        out.append((s, e, t))
+    return out, n
+
+
+def gate_suspect(rows, wav_path, asr_fn, min_cps=1.0, min_dur=6.0,
+                 max_uniq=4, tmpdir=None, log=None):
+    """复核「长时段少字」的段，把纯幻觉 / 纯拟声的整段丢掉。
+
+    rows     : [(start, end, text), ...]
+    wav_path : 16k 单声道 wav（生产第 4 步读的就是这个）
+    asr_fn   : callable(path) -> str，注入 Haas-ja；
+               本模块不 import asr_engine，保持「纯逻辑、无模型依赖」
+    返回     : (新 rows, 丢弃条数)
+    """
+    if not rows:
+        return rows, 0
+    if log is None:
+        log = print
+
+    try:
+        import wave
+        import tempfile
+        import numpy as np
+    except Exception as e:          # 缺库就整体跳过：宁可漏删，不能崩
+        log(f"  [人声闸] 跳过（缺依赖：{e}）")
+        return rows, 0
+
+    try:
+        with wave.open(wav_path, "rb") as w:
+            sr = w.getframerate()
+            ch = w.getnchannels()
+            sw = w.getsampwidth()
+            raw = w.readframes(w.getnframes())
+    except Exception as e:
+        log(f"  [人声闸] 跳过（读音频失败：{e}）")
+        return rows, 0
+    if sw != 2:
+        log("  [人声闸] 跳过（只支持 16bit PCM）")
+        return rows, 0
+
+    a = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    if ch > 1:
+        a = a.reshape(-1, ch).mean(axis=1)
+
+    own = tmpdir is None
+    if own:
+        tmpdir = tempfile.mkdtemp(prefix="speechgate_")
+
+    out, drop = [], 0
+    try:
+        for (s, e, t) in rows:
+            dur = float(e) - float(s)
+            n = cjk_count(t)
+            cps = (n / dur) if dur > 0 else 9.9
+            # 不够长、或者字够密 —— 都不动
+            if dur < min_dur or n == 0 or cps >= min_cps:
+                out.append((s, e, t))
+                continue
+
+            i0 = max(0, int(round(s * sr)))
+            i1 = min(len(a), int(round(e * sr)))
+            if i1 - i0 < sr // 4:
+                out.append((s, e, t))
+                continue
+
+            p = os.path.join(tmpdir, "g%04d.wav" % len(out))
+            try:
+                seg = np.clip(a[i0:i1] * 32767.0, -32768, 32767).astype(np.int16)
+                with wave.open(p, "wb") as o:
+                    o.setnchannels(1)
+                    o.setsampwidth(2)
+                    o.setframerate(sr)
+                    o.writeframes(seg.tobytes())
+                heard = (asr_fn(p) or "").strip()
+            except Exception:
+                out.append((s, e, t))      # 复核失败就原样保留
+                continue
+
+            u = len(set(_CJK_RE.findall(heard)))
+            if (not heard) or u <= max_uniq:
+                drop += 1
+                why = "一个字也没听到" if not heard else "只听出「%s」" % heard[:12]
+                log("  [人声闸] 丢弃 %.1f-%.1f 秒（%.0f 秒只有 %d 字，%s）：%s"
+                    % (s, e, dur, n, why, (t or "")[:24]))
+                continue
+
+            out.append((s, e, t))
+    finally:
+        if own:
+            try:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+
+    return out, drop
 
 if __name__ == "__main__":
     # 自检：构造三种典型情况

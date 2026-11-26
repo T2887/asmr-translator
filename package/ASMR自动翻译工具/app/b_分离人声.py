@@ -438,6 +438,43 @@ _skip = []  # VAD 0 段：纯 BGM / 全静音，没人声可分离
 _tmp_files = []
 
 emit("stage", "start", 3)
+
+# ★ v1.30.9：第 3 步（人声分离）也上报运行时状态。
+#
+#   BS-Roformer 是整条流水线里最慢的一步（几分钟到十几分钟），
+#   原来这一步只发 stage/file，界面「当前动作」一直是空的，
+#   用户完全看不出它是卡住了还是在跑。
+#
+#   separate() 是同步阻塞调用，只能在后台线程里定时采样。
+try:
+    from status_probe import StatusProbe as _StatusProbe3
+    _probe3 = _StatusProbe3(0, config["device"], os.getpid())
+    _STAT3 = True
+except Exception:
+    _probe3 = None
+    _STAT3 = False
+
+if _STAT3:
+    try:
+        _s3 = _probe3.poll()
+        if _s3:
+            emit("stat", _s3)
+    except Exception:
+        pass
+
+    import threading as _st_th3
+    _st_stop3 = _st_th3.Event()
+
+    def _st_loop3():
+        while not _st_stop3.wait(3.0):
+            try:
+                _s = _probe3.poll()
+                if _s:
+                    emit("stat", _s)
+            except Exception:
+                pass
+
+    _st_th3.Thread(target=_st_loop3, daemon=True).start()
 _total = len(audio_files)
 for _idx, flac in enumerate(audio_files, 1):
     emit("file", _idx, _total, os.path.basename(flac))
@@ -660,6 +697,11 @@ for t in _tmp_files:
     except Exception:
         pass
 
+try:
+    if _STAT3:
+        _st_stop3.set()
+except Exception:
+    pass
 emit("stage", "done", 3)
 print("\n" + "=" * 60)
 print(f"人声分离完成：成功 {len(_ok)} 个，失败 {len(_fail)} 个，"

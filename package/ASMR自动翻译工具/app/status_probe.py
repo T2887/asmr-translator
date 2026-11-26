@@ -54,6 +54,23 @@ class PROCESSOR_POWER_INFORMATION(ctypes.Structure):
     ]
 
 
+def cpu_percent():
+    """系统总 CPU 占用率（0~100）。psutil 缺失时返回 None。
+
+    为什么不用进程累计 CPU 秒数：第一次调用没有基线，只能返回
+    「不可用」，而状态行每 2~3 秒才刷新一次，用户第一眼就是空的。
+    """
+    try:
+        import psutil
+    except Exception:
+        return None
+    try:
+        v = psutil.cpu_percent(interval=None)   # 以上次调用为基线，非阻塞
+        return float(v) if 0.0 <= v <= 100.0 else None
+    except Exception:
+        return None
+
+
 def cpu_freqs():
     """→ [CurrentMhz, ...]。失败返回 []。"""
     try:
@@ -198,6 +215,8 @@ class StatusProbe:
         self._t_prev = 0.0
         self._cpu_prev = None
         self._cpu_t_prev = 0.0
+        # ★ v1.30.7：本进程最近一次算出的核数（没 pid 时为 None）。
+        self._cores = None
         self._freq_prev = []
         self._freq_t_prev = 0.0
 
@@ -256,10 +275,34 @@ class StatusProbe:
             #   · 显示 GPU 利用率（真实的核显负载）
             #   · 频率回落到 CPU 频率（核显与 CPU 同芯片，这是唯一能拿到的）
             #   明确标「核显」以免误读成独显。
+            #
+            #   ★ v1.30.7：核显计数器报 0 时要退回显示 CPU 占用。
+            #
+            #   用户实测（5070 + AMD 核显）：日志写 `纯 CPU 4500 ms/句 ·
+            #   核显 3910 ms/句`（核显更快，所以走了 Vulkan），但状态行
+            #   同时显示 `核显 占用 0%` —— Windows 的 GPU Engine 计数器在
+            #   AMD 核显上经常就是报 0，把「查不到」冒充成「没在干活」，
+            #   用户看到的全是假的。
+            #
+            #   判据用 < 1%：真在跑 Vulkan 时不会长期停在 0 点几。
             u = gpu_engine_util(self.llama_pid) if self.llama_pid else None
-            if u is not None:
+            shown = False
+            if u is not None and u >= 1.0:
                 parts.append(f"核显 占用 {u:.0f}%")
-            else:
+                shown = True
+            if not shown:
+                # 核显查不到 → 说明真正在算的是 CPU，报系统总 CPU 占用率。
+                #
+                #   为什么不用进程累计 CPU 秒数：proc_cpu_seconds 第一帧没有
+                #   基线（_cpu_prev is None），只能返回「不可用」，而状态行
+                #   每 2~3 秒才刷一次，用户第一眼看到的就是「不可用」。
+                #   psutil.cpu_percent(interval=None) 用上次调用做基线，
+                #   第一次返回 0 也无妨 —— 下一帧就是真实值。
+                uu = cpu_percent()
+                if uu is not None:
+                    parts.append(f"CPU 占用 {uu:.0f}%")
+                    shown = True
+            if not shown:
                 parts.append("核显 占用不可用")
             if now - self._freq_t_prev > 3.0:
                 fr = cpu_freqs()
@@ -277,10 +320,27 @@ class StatusProbe:
                 if cs is not None:
                     if self._cpu_prev is not None and now > self._cpu_t_prev:
                         dt = now - self._cpu_t_prev
-                        cores = (cs - self._cpu_prev) / dt
-                        if 0 <= cores < 64:
-                            parts.append(f"CPU {cores:.1f} 核")
+                        _c = (cs - self._cpu_prev) / dt
+                        if 0 <= _c < 64:
+                            self._cores = _c
                     self._cpu_prev, self._cpu_t_prev = cs, now
+            # ★ v1.30.7：占用率以系统总 CPU 为主（用户 m21020：应该显示
+            #   占用百分比）。原来只报「CPU 5.3 核」—— 那是本进程用掉的
+            #   核数，是工程量指标，不是「忙不忙」。
+            #
+            #   放在 pid 判断【外面】：占用率是整机计数器，llama-server
+            #   还没起来时也有意义（能看出测速/加载把 CPU 打满了）；
+            #   而「几核」必须有 pid 才算得出，留着括注。
+            # ★ v1.30.7：只显示占用百分比，不显示核数。
+            #   用户明确要求（m21112）。核数是工程量指标，不是「忙不忙」。
+            _uu = cpu_percent()
+            if _uu is not None:
+                parts.append(f"CPU 占用 {_uu:.0f}%")
+            else:
+                _cores = getattr(self, "_cores", None)
+                if _cores is not None:
+                    parts.append(f"CPU {_cores:.1f} 核")
+
             if now - self._freq_t_prev > 3.0:
                 fr = cpu_freqs()
                 if fr:

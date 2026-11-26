@@ -2,6 +2,11 @@
 name = "asmr_proto_egui"
 version = "0.1.0"
 edition = "2021"
+# 与仓库根的 LICENSE、app/Cargo.toml 保持一致（v1.40.0 补上）。
+# 之前只有 app/ 声明了，主 exe 实际是从这个 crate 编出来的，
+# cargo publish / cargo-deny / cargo-about 会把它当成「未声明许可证」。
+license = "MIT"
+authors = ["ASMR 自动翻译工具 contributors"]
 
 [dependencies]
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
@@ -12,12 +17,21 @@ rfd = "0.17"
 raw-window-handle = "0.6"
 # backend.rs 里用 GetModuleHandleA/GetProcAddress/OpenProcess 挂起恢复子进程；
 # Graphics_Dwm 用来给无边框窗口设 Win11 圆角
+# ★ v1.30.7：字幕校对里点时间戳试听那一段音频。
+#   选 rodio 不选系统播放器：后者每次点都要起一个新进程、还会弹窗打断校对。
+#   放在可选 feature 里 —— 拉不动依赖时关掉 audio feature 仍能编，
+#   试听退化成静音（见 proofread.rs 的 audio_thread）。
+rodio = { version = "0.19", optional = true }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
 ] }
+
+[features]
+default = ["audio"]
+audio = ["rodio"]
 
 [profile.release]
 opt-level = "s"

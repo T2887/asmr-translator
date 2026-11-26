@@ -167,6 +167,46 @@ _ok_files = []
 _fail_files = []
 
 emit("stage", "start", 2)
+
+# ★ v1.30.9：第 2 步（VAD）也上报运行时状态。
+#
+#   用户反馈「状态与进度那行不见了」——查下来根因是这一行只由
+#   第 4 步 d_语音识别.py 发，而界面停在第 2 步时那一步一个字都不发。
+#   VAD 阶段没有「段进度」可报（不知道会切出多少段），但显卡/CPU
+#   状态是随时可采的，用户至少能看出「它在干活、用的是 GPU」。
+#
+#   pyannote 的 VAD 是同步阻塞调用，只能在后台线程里定时采。
+try:
+    from status_probe import StatusProbe as _StatusProbe2
+    _probe2 = _StatusProbe2(0, config["device"], os.getpid())
+    _STAT2 = True
+except Exception:
+    _probe2 = None
+    _STAT2 = False
+
+if _STAT2:
+    # 先立刻发一次：VAD 对短音频可能几秒就跑完，只靠后台线程会一条都发不出。
+    try:
+        _s0 = _probe2.poll()
+        if _s0:
+            emit("stat", _s0)
+    except Exception:
+        pass
+
+    import threading as _st_th2
+    _st_stop2 = _st_th2.Event()
+
+    def _st_loop2():
+        while not _st_stop2.wait(2.0):
+            try:
+                _s = _probe2.poll()
+                if _s:
+                    emit("stat", _s)
+            except Exception:
+                pass
+
+    _st_th2.Thread(target=_st_loop2, daemon=True).start()
+
 _total = len(audio_files)
 for _idx, audio_path in enumerate(audio_files, 1):
     emit("file", _idx, _total, os.path.basename(audio_path))
@@ -211,6 +251,11 @@ for _idx, audio_path in enumerate(audio_files, 1):
         continue
 
 # 6. 汇总
+try:
+    if _STAT2:
+        _st_stop2.set()
+except Exception:
+    pass
 emit("stage", "done", 2)
 print("\n" + "=" * 60)
 print(f"VAD 处理完毕：成功 {len(_ok_files)} 个，失败 {len(_fail_files)} 个")

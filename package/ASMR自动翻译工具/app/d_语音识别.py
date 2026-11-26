@@ -77,7 +77,23 @@ from events import emit
 #
 # 想调就改这两行，改完建议用同一段素材对比，别只看单条。
 # ─────────────────────────────────────────────────────────────
-_INITIAL_PROMPT = "以下是日语成人向音声的中文翻译，口语化、句子短促，术语用肉棒、小穴、舒服、去了，保留语气词。"
+# ★ v1.30.8：把 prompt 砍短 —— 长 prompt 会「变成一条字幕」。
+#
+#   实测（04 号素材 140~260s，同参数只换 prompt）：
+#     · 旧 prompt（下面注释里那条）：
+#         140.0-147.0  以下是日语成人向音声的中文翻译化 句子短促语用肉棒 舒服 去了？保留
+#       140~147 秒这段音频里只有接吻声，whisper 没人声可译，就把 prompt
+#       本身当正文吐了出来 —— 这就是 v1.30.3 要加 _LEAK_KEYS 拦的那个泄漏。
+#     · 换成这条短的：同样位置变成「亲亲」，不再回显 prompt。
+#
+#   另外，旧 prompt 里那串术语（肉棒、小穴、舒服、去了）正是幻觉台词的
+#   词汇来源：接吻段被编成「让你尽情地射精 让你尽情地高潮」这种话，
+#   用的全是 prompt 给的词。术语本来就该由 fixes.txt / terms_fix 在
+#   整理阶段修，不该塞进 whisper 的上下文里当燃料。
+#
+#   旧值留档（要回滚直接换回来）：
+#     "以下是日语成人向音声的中文翻译，口语化、句子短促，术语用肉棒、小穴、舒服、去了，保留语气词。"
+_INITIAL_PROMPT = "口语化的中文翻译，句子短促，保留语气词。"
 # ★ v1.29：从全局热词里移除「秘书」「社长」这两个【角色词】。
 #
 #   这两个词原本是为了某个特定作品加的（那个作品里有「社长」角色），
@@ -758,7 +774,7 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
             "faster_whisper.transcribe.get_speech_timestamps",
             side_effect=get_custom_vad_patch
     ):
-        segments, _ = model.transcribe(
+        segments, _ti = model.transcribe(
             audio=audio_path,
             language="ja",
             task='translate',
@@ -811,6 +827,38 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
                 print(f"[状态] 采集不可用（{type(_e).__name__}）", flush=True)
         _st0 = time.time()
         _st_dur = max(0.1, float(len(wav16) if 'wav16' in dir() else 1))
+        # ★ v1.30.9：novad 模式下补回「whisper 结尾套话 + 同句刷屏」拦截。
+        #
+        #   背景（用户 2026-11-26 截图）：v1.30.6 跑 04 号文件时，实时预览里
+        #   630.00 / 660.00 / 690.00 秒**每 30 秒**各吐一条「感谢您的视听」。
+        #   那就是 whisper 的 decode 窗口长度，说明它在静音/音效段一遍遍
+        #   幻觉出训练数据里的 YouTube 结尾字幕。
+        #
+        #   为什么旧拦截没挡住：`if _use_clip and _clip_flat:` 那一整块
+        #   （短窗口长幻觉 / 短条过滤 / 结束词过滤）在 novad 下 _clip_flat
+        #   是空列表，整块被跳过 —— 等于 v1.30.3 加的那套防护全部失效。
+        #
+        #   这里补两刀，都可关（ASMR_NO_TAIL_FILTER=1）：
+        #     ① 结尾套话黑名单：这些句子在 ASMR 里绝不会真说，命中即丢。
+        #     ② 同句刷屏：同一句在【间隔 >10 秒】的地方出现第 3 次 → 丢掉。
+        #        真台词（「喜欢」「老师」）是连续出现的，间隔很短，不会命中。
+        _TAIL_HALLUC = (
+            "感谢您的视听", "感谢您的收看", "感谢您的观看", "感谢您的收听",
+            "感谢收看", "感谢观看", "感谢收听", "谢谢观看", "谢谢收看",
+            "请订阅", "订阅频道", "订阅我的频道", "点赞订阅", "记得订阅",
+            "字幕由", "字幕提供", "翻译：", "校对：", "时间轴：",
+            "amara.org", "subtitles by", "thanks for watching",
+            "ご視聴ありがとうございました", "チャンネル登録",
+        )
+        _NO_TAIL = os.environ.get("ASMR_NO_TAIL_FILTER", "").lower() in ("1", "on", "yes", "true")
+        _TAIL_SEEN = {}
+
+        # ★ v1.30.9：静音段幻觉的三个判据（见文件头注释）
+        _NO_CONF = os.environ.get("ASMR_NO_CONF_FILTER", "").lower() in ("1", "on", "yes", "true")
+        _CR_MAX = 2.4          # whisper 官方的 compression_ratio 幻觉阈值
+        _LP_MIN = -1.05        # 平均对数概率下限
+        _prev_zh = ""          # 上一条中文（判「后一条是前一条的子串」）
+        _prev_dur = 0.0
         for segment in segments:
             _seg_i += 1
             if _seg_i % _DIAG_PROGRESS_EVERY == 1:
@@ -851,6 +899,21 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
                                         f"（{_pct:.0f}%）"
                                         f" · {_rate:.1f} 段/分"
                                         f" · 剩约 {_left:.0f} 分")
+                    else:
+                        # ★ v1.30.9：novad 模式下没有解码窗口可数，改按音频时间轴。
+                        #   封顶 95% —— 音频末尾常有几十秒静音，字幕到不了那么远，
+                        #   不封顶就会永远停在 99%（v1.30.3 修过一次同样的毛病，
+                        #   当时给兼容模式换成「按语音段算」，这里没有段边界可用）。
+                        _dur_tot = float(getattr(_ti, "duration", 0.0) or 0.0)
+                        if _dur_tot > 0.0:
+                            _pct = min(95.0, float(segment.end) / _dur_tot * 100.0)
+                            _done = int(float(segment.end))
+                            _tot = int(_dur_tot)
+                            _rate = _done / _el * 60.0 if _el > 0 else 0.0
+                            _left = ((_tot - _done) / _rate) if _rate > 0 else 0.0
+                            _seg_txt = (f"识别 {_done}/{_tot} 秒"
+                                        f"（{_pct:.0f}%）"
+                                        f" · 剩约 {_left:.0f} 分")
                 except Exception:
                     pass
                 _parts = [p for p in (_seg_txt, _st) if p]
@@ -858,6 +921,22 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
                 if _el > 0 and segment.end > 0:
                     _parts.append(f"{segment.end / _el:.1f}x 实时")
                 print(f"  [状态] {' · '.join(_parts)}", flush=True)
+                # ★ v1.30.9：把状态行 / 段进度送给界面。
+                #
+                #   用户 2026-11-26 反馈「状态与进度那行不见了」：查 v1.30.3 的
+                #   源码，`emit("stat"/"segs")` 只写在 light_translate.py（兼容
+                #   模式），d_语音识别.py（全量/精简）从来没发过这两个事件 ——
+                #   Rust 侧 pipeline.rs 的解析是现成的，但收不到就永远空着，
+                #   界面上「当前动作」下面那一行一直是空的。
+                #   这里补上，两条通道都用（segs 必须独立，否则被 sub 刷掉）。
+                if _st:
+                    emit("stat", _st)
+                if _seg_txt:
+                    try:
+                        emit("segs", int(_done), int(_tot),
+                             round(_rate, 2), int(_left))
+                    except Exception:
+                        pass
             text = segment.text.strip()
             if not text:
                 continue
@@ -977,11 +1056,62 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
                 print(f"  [prompt泄漏] {_a:.2f}->{_b:.2f} 丢弃：{text[:40]}", flush=True)
                 continue
 
+            # ★ v1.30.9：结尾套话 + 同句刷屏（见循环前的长注释）
+            if not _NO_TAIL:
+                _tl = text.strip().replace(" ", "").replace("，", "").replace(",", "")
+                _hit_tail = next((w for w in _TAIL_HALLUC if w in _tl), None)
+                if _hit_tail is not None:
+                    print(f"  [结尾套话] {_a:.2f}->{_b:.2f} 丢弃：{text[:40]}", flush=True)
+                    continue
+                _prev = _TAIL_SEEN.get(_tl)
+                if _prev is None:
+                    _TAIL_SEEN[_tl] = [_a]
+                else:
+                    # 只有「间隔 >10 秒」才算刷屏；紧挨着的重复是真实台词
+                    if _a - _prev[-1] > 10.0:
+                        _prev.append(_a)
+                        if len(_prev) >= 3:
+                            print(f"  [同句刷屏] {_a:.2f}->{_b:.2f} 第 {len(_prev)} 次"
+                                  f"（间隔 {_a-_prev[-2]:.1f}s），丢弃：{text[:40]}", flush=True)
+                            continue
+                    else:
+                        _prev[-1] = _a
+
+            # ★ v1.30.9：静音段幻觉拦截（三个判据）
+            if not _NO_CONF:
+                _cr = float(getattr(segment, "compression_ratio", 0.0) or 0.0)
+                _lp = float(getattr(segment, "avg_logprob", 0.0) or 0.0)
+                if _cr > _CR_MAX:
+                    print(f"  [压缩比幻觉] {_a:.2f}->{_b:.2f} cr={_cr:.2f} 丢弃：{text[:40]}", flush=True)
+                    continue
+                if _lp < _LP_MIN:
+                    print(f"  [低置信度] {_a:.2f}->{_b:.2f} lp={_lp:.3f} 丢弃：{text[:40]}", flush=True)
+                    continue
+                # 后一条是前一条的子串（重复输出）—— 与间隔无关
+                _cz = text.strip().replace(" ", "").replace("，", "").replace(",", "")
+                if (len(_cz) >= 4 and len(_prev_zh) >= 4
+                        and _prev_dur >= 5.0 and _cz in _prev_zh):
+                    print(f"  [重复输出] {_a:.2f}->{_b:.2f} 是上一条的子串，丢弃：{text[:40]}", flush=True)
+                    continue
+                _prev_zh = _cz
+                _prev_dur = _b - _a
+
             raw_rows.append((_a, _b, text))
             print(f"[{_a:.2f}s -> {_b:.2f}s]: {text}")
-            # 结构化事件：和上面那行【同一份数据】，只是给 Rust 侧一个
-            # 不依赖文本格式的入口（正则继续兜底，两者等价）。
-            emit("sub", f"{_a:.2f}", f"{_b:.2f}", text)
+            # ★ v1.30.9：实时预览用 `subraw` —— 这是 whisper 的【原始顺序】，
+            #   后面还有 merge_segments + enforce_timeline 会重排，所以界面上
+            #   会出现时间戳倒退。Rust 侧会加「识别中，顺序可能乱」的标记，
+            #   定稿后再用 `sub` 重填一遍（见 write_srt 之前）。
+            emit("subraw", f"{_a:.2f}", f"{_b:.2f}", text)
+            # ★ v1.30.9：emit("sub") 不在这里发。
+            #
+            #   这里是 whisper 的【原始输出顺序】，后面还有 merge_segments
+            #   （去重合并）和 enforce_timeline（sorted by start —— whisper
+            #   偶尔吐倒退时间戳，那个函数就是为它写的）。
+            #
+            #   在这里发事件的结果是：**写出来的 SRT 是对的，但实时预览
+            #   里时间戳乱跳**（实测 m21294：746s 之后跟着 27s、49s）。
+            #   改到 asr_rows 定稿之后统一发，见 write_srt 之前那段。
 
         # ★ v1.28.8：clip_timestamps 模式下，segment 的 start/end 就是该解码
         #   窗口的真实语音区间，【不需要也不该】再做事后收缩/补长。
@@ -1083,6 +1213,99 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
                     print(f"  [折叠重复] 处理 {_nrep} 条内部刷屏")
             except Exception as _e:
                 print(f"  [折叠重复] 跳过（{type(_e).__name__}: {_e}）")
+
+        # ★ v1.30.11：纯数字/符号的段（whisper 的倒计时幻觉）。
+        #
+        #   实测 04 号素材 109 条里有 11 条是 `10 9 8 7 6 5 4 3 2 1 0` ——
+        #   训练数据里带倒计时的视频太多，它在纯音效窗口里就老老实实从
+        #   十数到零。这类行一个假名/汉字都没有，也没有任何信息量。
+        #   ASMR_NO_JUNK=1 可关闭。
+        if os.environ.get("ASMR_NO_JUNK", "").strip() != "1" and asr_rows:
+            try:
+                from whisper_split import drop_junk
+                asr_rows, _njunk = drop_junk(asr_rows)
+                if _njunk:
+                    print(f"  [杂讯] 丢弃 {_njunk} 条纯数字/符号")
+            except Exception as _e:
+                print(f"  [杂讯] 跳过（{type(_e).__name__}: {_e}）")
+
+        # ★ v1.30.12：拟声行 / 「约N秒的X」元描述。
+        #
+        #   novad 下第二大类假字幕。whisper 拿到接吻、舔耳的音效窗口时，
+        #   会把音效音老老实实写成中文拟声词（`叭叭叭叭`、`滋滋滋`、
+        #   `啪 啾啪`、`咕咚咕咚`、`亲 亲`），还爱输出
+        #   「约20秒的舌吻 结束」这种描述音频本身的元话语 —— 都不是台词。
+        #   ASMR_NO_ONO=1 可关闭。
+        if os.environ.get("ASMR_NO_ONO", "").strip() != "1" and asr_rows:
+            try:
+                from whisper_split import drop_ono
+                asr_rows, _nono = drop_ono(asr_rows)
+                if _nono:
+                    print(f"  [拟声] 丢弃 {_nono} 条纯音效/元描述行")
+            except Exception as _e:
+                print(f"  [拟声] 跳过（{type(_e).__name__}: {_e}）")
+
+        # ★ v1.30.10：人声闸 —— 用独立 ASR 复核「长时段少字」的段。
+        #
+        #   novad 让 whisper 也会拿到纯音效的窗口，它能顺着 initial_prompt
+        #   编出整句台词（实测 04 号素材：12 秒只有「亲亲」两个字；
+        #   1133.9-1145.9s 编出「约20秒的舌吻 结束」，那段音频完全无声）。
+        #
+        #   常规置信度手段在这个译中特化模型上全部失效——no_speech_prob
+        #   70/70 段恒为 0.000、avg_logprob 是窗口级的（相邻 5~7 段同值）、
+        #   能量还是反向的（接吻声 -5~-10 dB，耳语真语音 RMS -40 dB）；
+        #   ASMR VAD 又漏检（它对 272.6-274.3s 打 0.000，Haas-ja 在那里
+        #   识出「私のおへそのあたりに」conf 0.948）。
+        #
+        #   唯一可靠的信号是「换个模型再听一遍」：Haas-ja 一个字都听不出来，
+        #   或者只听出两三种假名（拟声词），那这段就是音效不是台词。
+        #
+        #   判据见 whisper_split.gate_suspect：时长 > 6 秒 **且**（空串 或
+        #   字符种类 ≤ 4）。短句一个都不碰 —— `え私?`(0.966)、`じゃあ`、
+        #   `ほら`、`いいわよ` 的字符种类同样只有 2~4，但都在 4 秒以内。
+        #
+        #   ASMR_SPEECH_GATE=0 可关闭。
+        if os.environ.get("ASMR_SPEECH_GATE", "").strip() != "0" and asr_rows:
+            try:
+                from whisper_split import gate_suspect
+                from asr_engine import load_engine
+                _ge, _gn = load_engine()          # 返回 (engine, note)
+                if _ge is None:
+                    print(f"  [人声闸] 跳过（{_gn}）")
+                else:
+                    def _hear(_p, _e=_ge):
+                        _r = _e.transcribe_ex(_p)   # 收文件路径，不是数组
+                        return (_r.get("text") or "")
+                    _n0 = len(asr_rows)
+                    # min_cps=4.0：只有「每秒 ≥4 个汉字」的段才免检。
+                    # 实测 04 号素材 538.1-546.0s 那条「用我的小穴让肉棒变得
+                    # 舒服起来 让肉棒变得硬邦邦的」密度 3.1 字/秒，被 1.0 的
+                    # 阈值放过了，而 Haas-ja 在同一段只听到「れろれろれろ」。
+                    asr_rows, _ngate = gate_suspect(asr_rows, audio_path, _hear,
+                                                    min_cps=4.0)
+                    if _ngate:
+                        print(f"  [人声闸] 丢弃 {_ngate} 段纯音效/幻觉：{_n0} → {len(asr_rows)} 条")
+            except Exception as _e:
+                print(f"  [人声闸] 跳过（{type(_e).__name__}: {_e}）")
+
+        # ★ v1.30.9：定稿之后再发预览事件。
+        #
+        #   此时 asr_rows 已经过 merge_segments（去重合并）+ enforce_timeline
+        #   （按 start 排序）+ collapse_rows（折叠/丢弃幻觉），与写进 SRT 的
+        #   内容**完全一致**。在循环里发的话是 whisper 的原始顺序，会出现
+        #   「746s 后面跟着 27s」这种倒退（实测 m21294）。
+        # ★ v1.30.9：定稿后重排。
+        #
+        #   识别过程中 `print` 出的那批是 whisper 的【原始顺序】，界面上
+        #   时间戳会倒退（实测 m21294：746s 后面跟着 27s、49s）。
+        #   asr_rows 到这里已经过 merge_segments + enforce_timeline（排序）
+        #   + collapse_rows，与写进 SRT 的内容完全一致。
+        #
+        #   先用一行哨兵让界面清空，再按同样格式重印一遍让它重新解析。
+        print("__PF_CLEAR__", flush=True)
+        for _ea, _eb, _et in asr_rows:
+            print(f"[{float(_ea):.2f}s -> {float(_eb):.2f}s]: {_et}", flush=True)
+            emit("sub", f"{float(_ea):.2f}", f"{float(_eb):.2f}", _et)
 
         # 一次性写盘（不要放在循环里逐条写）
         write_srt(asr_log_path, asr_rows)

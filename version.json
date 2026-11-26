@@ -1,8 +1,8 @@
 {
- "version": "1.30.6",
- "url": "https://github.com/T2887/asmr-translator/releases/download/v1.30.6/ASMR-Translator-Setup_v1.30.6.exe",
- "page": "https://github.com/T2887/asmr-translator/releases/tag/v1.30.6",
- "notes": "全量模式（快速模式）大幅重做，这是本版最实质的改动：\n过去它在识别阶段先用 VAD 切段，而 ASMR 里的喘息、耳语、气声会被 VAD 判成「没在说话」整段丢掉，实测人工字幕只覆盖到 71%、平均每条素材漏译近 1 分钟。本版改成不预切段、整段交给模型，覆盖率升到 87%、漏译降到 7 秒，相似度低于 0.4 的段落从 58% 降到 32%。\n代价是极少数段落的时间轴会略微漂移，以及纯音效段偶尔多出几个拟声字——净收益远大于代价。\n想恢复旧行为：设置环境变量 ASMR_FULL_NOVAD=0。\n\n另外三项：\n· 重复刷屏折叠：单条字幕里同一个词刷 5 次以上且占正文一半以上时，折成「高潮…（×29）」，不再整段刷屏（实测最长单条 112 字 → 15 字）。正常的「喜欢×5」「老师×4」不会被动。\n· 符号保留：原文有几个省略号、有没有爱心，译文缺的就补到句尾——模型自己学不会这些符号，但 ASMR 字幕里它们是语气的一部分。\n· 采样换 DRY：原来的重复惩罚参数对这种刷屏完全无效（实测反而更糟），换成 DRY 后同一句正常台词的输出逐字不变，刷屏则被压掉一个数量级。\n\n本次安装包约 130 MB，与上一版相当。",
+ "version": "1.40.0",
+ "url": "https://github.com/T2887/asmr-translator/releases/download/v1.40.0/ASMR-Translator-Setup_v1.40.0.exe",
+ "page": "https://github.com/T2887/asmr-translator/releases/tag/v1.40.0",
+ "notes": "新增「字幕校对」：翻译完成后可以打开逐句对照，双击修改文本、点时间戳试听、右侧 × 删除整句，保存直接写回字幕文件。\n\n全量模式大幅治理幻觉：倒计时、纯拟声、结尾套话、同句重复刷屏这类假字幕都会被丢弃，留下的是确实有人声的句子。\n\n进度显示改进：每一步都能看到设备状态，进度不再虚高。\n\n安装包约 130 MB。",
  "runtime_patch": {
   "version": "1.30.0",
   "url": "https://github.com/T2887/asmr-translator/releases/download/v1.30.0/ASMR-RuntimePatch_v1.30.0.exe",

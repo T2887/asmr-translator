@@ -241,6 +241,13 @@ fn run_all(
             {
                 let mut hit = Vec::new();
                 for l in &r.lines {
+                    // ★ v1.30.9：清空哨兵（Python 定稿前打的 `__PF_CLEAR__`）。
+                    //   fmt_sub 只认「[a -> b]: 文本」，放它原样过去，
+                    //   main.rs 收到就清空预览、再收后面重排好的那批。
+                    if l.trim() == "__PF_CLEAR__" {
+                        hit.push("__PF_CLEAR__".to_string());
+                        continue;
+                    }
                     if let Some(s) = fmt_sub(l) {
                         hit.push(s);
                     }
@@ -317,8 +324,19 @@ fn run_all(
                 embed_soft,
             ),
         );
-        // 中间产物在下一个文件开始前清掉：磁盘上永远只有一个文件的中间产物
-        let _ = pipeline::purge_process_files(true);
+        // ★ v1.30.7：这里【不再】清理中间产物。
+        //
+        //   原来是「每个文件跑完就 purge」，理由是「磁盘上永远只有一个
+        //   文件的中间产物」。但 `2vad\<stem>.json` 是校对界面「识别原文」
+        //   列的唯一来源 —— 跑完就清，用户点「✎ 校对字幕」就只剩中文列
+        //   （实测反馈就是这个症状）。
+        //
+        //   现在的语义（用户拍板）：
+        //     正常跑完 → 不清，留给校对用
+        //     失败/被停止 → 立刻清（见上面那个 failed 分支，没字幕可校对）
+        //     下一轮点「开始处理」→ 清上一轮（main.rs 的 start() 里）
+        //
+        //   这样磁盘上最多留最后一批的中间产物，不会越积越多。
         let _ = tx.send(Ev::FileDone { idx });
     }
 
