@@ -1185,7 +1185,15 @@ impl App {
             (stage_used / expected).clamp(0.0, 0.95)
         };
         file_prog += W[st - 1] * frac_eff;
-        self.file_prog = file_prog.clamp(0.0, 1.0);
+        // ★ v1.40.2：封顶 0.97，绝不提前报 100%。
+        //
+        //   第 4 步的 tqdm 只覆盖 whisper 转写；转写跑完（tqdm 100%）之后
+        //   还有 stabilize 要干：人声闸对每个可疑段单独调一次 Haas-ja，
+        //   几十段就是几十秒，之后才写 SRT、改名、清理。用户实测看到
+        //   「两个进度条都到 100，剩余时间早早地就剩 10 秒不动」（m23501）。
+        //
+        //   真正的 100% 只在 Ev::Done 里设（main.rs 的 progress_value = 100.0）。
+        self.file_prog = file_prog.min(0.97);
 
         // ★ v1.30.7：总进度按【耗时】加权，不再按文件个数均分。
         //
@@ -1251,6 +1259,12 @@ impl App {
         const TAIL: f64 = 10.0; // 字幕改名、清理
         let frac = self.stage_frac.clamp(0.0, 1.0);
         let frac_ok = frac > 0.001;
+        // ★ v1.40.2：第 4 步 tqdm 已满但进程还没退 = 正在 stabilize（人声闸逐段
+        //   调 Haas）+ 写盘 + 改名。这时候 tqdm_ema 已经被清零，硬算只会得到
+        //   「约 10 秒」这个永远不动的假数（m23501）。返回 None → 界面显示「—」。
+        if self.stage == 4 && frac >= 0.995 {
+            return None;
+        }
         let remain = match self.stage {
             1 => {
                 let left = (fixed_first_two * 0.4 - stage_used).max(0.0);
@@ -1328,6 +1342,11 @@ impl App {
     /// 为什么挑「最后一个完成」而不是「当前选中」：校对发生在整批跑完之后，
     /// 用户刚看完的就是最后一条。他能再点文件列表换，这里只是给个默认。
     fn open_proofread(&mut self) {
+        // 已经开着就别再载入一次：重复 load 会在 UI 线程里同步读文件 + 起音频线程，
+        // 一旦卡住整个界面就没反应（用户反馈 m23421 的现象之一）。
+        if self.pf.is_some() {
+            return;
+        }
         let Some(f) = self.files.iter().rev().find(|f| f.state.contains("完成")) else {
             self.push_log("[校对] 还没有已完成的文件");
             return;

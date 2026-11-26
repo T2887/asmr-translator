@@ -177,14 +177,18 @@ _REP_UNIT = None
 def collapse_repeats(text, min_repeat=5, min_share=0.5):
     """折叠单条字幕里的极端重复。返回 (新文本, 是否改动)。"""
     import re as _re
-    if not text or len(text) < 20:
+    # v1.40.2：门槛从 20 字降到 12 字、单元下限从 2 字降到 1 字。
+    #   实测漏网样本「亲 亲 亲 亲 亲 亲」（11 字）「呃 呃 呃 …」（23 字但
+    #   单元只有 1 个字）都是被这两个下限挡在外面，而它们恰恰是纯幻觉。
+    #   折叠只保留前两遍 + 计数标注，所以即便误判也不会丢信息。
+    if not text or len(text) < 10:
         return text, False
     core = _re.sub(r"[\s、。，．！？!?…♡♥♪~〜「」『』（）()]", "", text)
-    if len(core) < 20:
+    if len(core) < 5:
         return text, False
 
     best = None                              # (单元, 次数, 覆盖长度)
-    for unit_len in range(2, 13):
+    for unit_len in range(1, 13):
         i = 0
         n = len(core)
         while i + unit_len * 2 <= n:
@@ -221,10 +225,10 @@ def collapse_repeats(text, min_repeat=5, min_share=0.5):
     return new, True
 
 
-def collapse_rows(rows, min_repeat=5, drop_over=8):
+def collapse_rows(rows, min_repeat=5, drop_over=6):
     """对 [(start, end, text)] 整批折叠，返回 (rows, 改动条数)。
 
-    ★ v1.30.7：`drop_over` 次以上的重复**整段丢弃**，不再折成 `（×N）` 保留。
+    ★ v1.40.2：`drop_over` 次以上的重复**整段丢弃**（8 → 6，用户 m23735 拍板），不再折成 `（×N）` 保留。
 
     起因（用户实测）：全量模式产出
         `请把你的肉棒插到小穴深处 尽情地摩擦…（×11）`
@@ -250,7 +254,10 @@ def collapse_rows(rows, min_repeat=5, drop_over=8):
                         _k = int(nt[_p + 2:_q])
                     except ValueError:
                         _k = 0
-            if _k > drop_over:
+            # v1.40.2：> 改成 >= —— 用户截图那条「小穴高潮了…（×8）」正好 8 次，
+            #    判据放过了它（m23540「这不是还有吗」）。8 次重复在 ASMR
+            #   里也绝不可能是正常台词（每遍 0.6 秒）。
+            if _k >= drop_over:
                 dropped += 1
                 print(f"  [丢弃幻觉] {a:.1f}-{b:.1f}  ×{_k} 次重复，"
                       f"整段丢弃：{t[:30]}")
@@ -259,7 +266,7 @@ def collapse_rows(rows, min_repeat=5, drop_over=8):
             print(f"  [折叠重复] {a:.1f}-{b:.1f}  {t[:36]} → {nt[:36]}")
         out.append((a, b, nt))
     if dropped:
-        print(f"  [丢弃幻觉] 共 {dropped} 条（重复 >{drop_over} 次）")
+        print(f"  [丢弃幻觉] 共 {dropped} 条（重复 >={drop_over} 次）")
     return out, n
 
 
@@ -314,6 +321,39 @@ _META_RE = re.compile(r"[约約]?\s*\d+\s*秒")
 _META_HINT = ("舌吻", "接吻", "吻", "时间", "口交", "舔", "结束", "开始")
 
 
+_ASCII_JUNK_HEAD = re.compile(r"^[A-Za-z][A-Za-z'\-]{1,7}\s+")
+_ASCII_JUNK_TAIL = re.compile(r"\s+[A-Za-z][A-Za-z'\-]{0,7}$")
+
+
+def strip_ascii_junk(txt):
+    """去掉句首/句尾的拉丁字母垃圾。
+
+    whisper 在日语音频上偶尔会在句首吐一段拉丁字母，实测
+    RJ01426911 第一句是「hisp 仅限一周 和最喜欢的声优一起度过…」——
+    那个 'hisp' 是「ウィスプ」被听岔了，留下来只会拉低和人工字幕的相似度。
+
+    只删【句首】且【纯字母 2~8 个】且【后面还有中文】的片段；
+    句尾同理。'OK 好的'、'BGM 响起来了' 这种前面是常见词的保留 ——
+    所以这里额外要求：被删的片段不在白名单里。
+    """
+    if not txt:
+        return txt
+    _keep = {"ok", "bm", "bgm", "se", "cv", "as", "no", "yes", "hi", "hey", "oh"}
+    m = _ASCII_JUNK_HEAD.match(txt)
+    if m:
+        w = m.group(0).strip().lower()
+        rest = txt[m.end():]
+        if w not in _keep and cjk_count(rest) >= 2:
+            txt = rest
+    m = _ASCII_JUNK_TAIL.search(txt)
+    if m:
+        w = m.group(0).strip().lower()
+        rest = txt[:m.start()]
+        if w not in _keep and cjk_count(rest) >= 2:
+            txt = rest
+    return txt.strip()
+
+
 def drop_ono(rows, log=None):
     """丢掉「整行只由拟声字组成」的段，以及「约N秒的X」这类元描述。
 
@@ -343,6 +383,22 @@ def drop_ono(rows, log=None):
             n += 1
             log("  [拟声] 丢弃 %.1f-%.1f 秒元描述幻觉：%r" % (s, e, txt))
             continue
+        # 判据 C（排比复读）：长句 + 字符种类极少。
+        #
+        #   whisper 在静音段不只复读单个词，还会套模板排比：
+        #   「我会用手指摩擦你的屁股 用小穴摩擦你的肉棒 用小穴摩擦你的乳头
+        #     用小穴摩擦你的肉棒 用小穴摩擦你的屁股」
+        #   实测 47 个字只有 17 种字符，uniq 比 **0.36**；而正常台词实测
+        #   0.87~0.95（20 条样本：0.87/0.92/0.94/0.94/0.95）。
+        #
+        #   长度门槛 20 字是给真实台词留的：ASMR 里「喜欢 喜欢 喜欢 喜欢 喜欢」
+        #   （15 字，uniq 比 0.13）「老师 老师 老师 老师」（8 字）都是表演，
+        #   不能因为重复就删。折叠归 collapse_repeats 管，这里只管长句。
+        if len(core) >= 20 and len(set(core)) / len(core) < 0.55:
+            n += 1
+            log("  [拟声] 丢弃 %.1f-%.1f 秒排比复读：%r（%d 字仅 %d 种）"
+                % (s, e, txt, len(core), len(set(core))))
+            continue
         out.append((s, e, t))
     return out, n
 
@@ -370,11 +426,55 @@ def drop_junk(rows, max_len=4, log=None):
             n += 1
             log("  [杂讯] 丢弃 %.1f-%.1f 秒纯数字/符号：%r" % (s, e, txt))
             continue
+        # v1.40.2：不限长度的纯数字序列。
+        #   whisper 的倒计时幻觉不一定短：实测「10 9 8 7 6 5 4 3 2 1 0」
+        #   有 21 个字符，被上面那条 max_len=4 的门槛挡在外面（m23540 用户质疑）。
+        #   整条一个字都没有、只剩数字，绝不可能是台词。
+        _bare = re.sub(r"[\s\W_]+", "", txt)
+        if _bare and _bare.isdigit():
+            n += 1
+            log("  [杂讯] 丢弃 %.1f-%.1f 秒数字倒计时：%r" % (s, e, txt))
+            continue
         out.append((s, e, t))
     return out, n
 
 
-def gate_suspect(rows, wav_path, asr_fn, min_cps=1.0, min_dur=6.0,
+# 日文拟声/气声常用假名。用来判断 Haas-ja「听到的东西」是不是只有音效。
+#
+#   ★ 为什么需要这条：max_uniq(字符种类<=4) 抓得到 `れろれろ`，
+#     但抓不到 `ちゅっ、ん、れろれろ`（6 种字符）—— 后者同样是纯舔耳音效。
+#     实测 05 号素材 357.0-361.6 秒就是这样漏过去的。
+#   故意不放「あいうえお」这类能被真词用到的元音单字，避免误杀。
+_ONO_JA = set(
+    "れろちゅっんぁぃぅぇぉゃゅょゎー～〜"
+    "ぺぷぴぱぽぴゃぴゅぴょ"
+    "ぐじずぜぞだでどばびぶべぼ"
+    "ちゃちゅちょしゃしゅしょ"
+    "くかきこさすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわを"
+    "ぱぴぷぺぽげござ"
+)
+
+
+def _ono_only(heard):
+    """Haas 听到的内容去掉拟声假名后，还剩几个「实词」字符。
+
+    日文里的实词（名词/动词/形容词）一定有汉字或「非拟声」假名，
+    纯音效（れろれろ、ちゅっ、ん、ぺろぺろ）去掉拟声后基本不剩。
+    """
+    import re as _re
+    core = _re.sub(r"[\s\W_]+", "", heard or "")
+    if not core:
+        return True            # 一个字都没听到：交给「空串」那条判据
+    if len(core) < 5:
+        # 太短的句子不做拟声判断 —— すぐ / はい / じゃあ / 出して 这些
+        # 真台词本身就两三个字，去掉假名后几乎不剩东西，会全被误杀。
+        # 短句另有 uniq 判据兜着，不需要这条。
+        return False
+    rest = "".join(ch for ch in core if ch not in _ONO_JA)
+    return len(rest) <= 1
+
+
+def gate_suspect(rows, wav_path, asr_fn, min_cps=1.0, min_dur=3.5,
                  max_uniq=4, tmpdir=None, log=None, lowconf=None):
     """复核「长时段少字」的段，把纯幻觉 / 纯拟声的整段丢掉。
 
@@ -385,6 +485,12 @@ def gate_suspect(rows, wav_path, asr_fn, min_cps=1.0, min_dur=6.0,
     lowconf  : 可选 list；逃过闸门但复核文本仍然可疑的段会 append 进来。
                供 UI 标「低置信」用 —— 不删，只提示。
     返回     : (新 rows, 丢弃条数)
+
+    ★ min_dur 从 6.0 降到 3.5（v1.40.2）：
+      6.0 是拍脑袋定的，实测把大量 4~6 秒的幻觉挡在门外。巧可 05 号里
+      `小穴高潮了…（×8）`(5.4s) 和 `肉棒又在一抖一抖的了`(4.6s) 两条
+      纯音效假字幕就是这样漏出去的，用户反馈「播放的这段没有说话的」。
+      3.5 秒以下 Haas-ja 的识别置信度会明显下降，所以停在 3.5。
     """
     if not rows:
         return rows, 0
@@ -451,9 +557,15 @@ def gate_suspect(rows, wav_path, asr_fn, min_cps=1.0, min_dur=6.0,
                 continue
 
             u = len(set(_CJK_RE.findall(heard)))
-            if (not heard) or u <= max_uniq:
+            ono = _ono_only(heard)
+            if (not heard) or u <= max_uniq or ono:
                 drop += 1
-                why = "一个字也没听到" if not heard else "只听出「%s」" % heard[:12]
+                if not heard:
+                    why = "一个字也没听到"
+                elif ono:
+                    why = "只听出拟声「%s」" % heard[:12]
+                else:
+                    why = "只听出「%s」" % heard[:12]
                 log("  [人声闸] 丢弃 %.1f-%.1f 秒（%.0f 秒只有 %d 字，%s）：%s"
                     % (s, e, dur, n, why, (t or "")[:24]))
                 continue
@@ -509,6 +621,16 @@ def stabilize(rows, wav_path=None, asr_fn=None, lowconf=None, log=None):
     stats = {"rep": 0, "junk": 0, "ono": 0, "gate": 0, "lowconf": 0}
     if not rows:
         return rows, stats
+
+    # ⓪ 句首/句尾的拉丁字母垃圾（「hisp 仅限一周 …」里的 hisp）。
+    #    放在最前面：后面的折叠/拟声判据都是按「正文」算的，
+    #    留个 hisp 在前面会让 uniq 比虚高、该折的折不动。
+    _cleaned = []
+    for (a, b, t) in rows:
+        t2 = strip_ascii_junk(t)
+        if t2:
+            _cleaned.append((a, b, t2))
+    rows = _cleaned
 
     # ① 单条内部的极限重复。
     #    最早做，因为后面的 drop_ono 判「全由拟声字组成」时，刷屏行

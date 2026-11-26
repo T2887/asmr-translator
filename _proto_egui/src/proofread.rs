@@ -537,6 +537,18 @@ pub fn ui(ctx: &egui::Context, st: &mut PfState) -> bool {
     let screen = ctx.content_rect();
     let mut closed = false;
 
+    // Esc 关闭：万一遮罩/布局出问题，这是唯一的退出通道
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        closed = true;
+    }
+
+    // Area 内部的坐标系原点是 fixed_pos（= screen.left_top()），
+    // 画遮罩和登记点击都必须用它自己的局部坐标，不能直接传 screen。
+    // 之前传的就是 screen，只要 content_rect 不从 (0,0) 开始，
+    // 遮罩就会画偏、点击区域也会偏 —— 表现为「点校对窗口外面的界面
+    // 就整屏变暗、之后点什么都没反应」（用户反馈 m23421）。
+    let local = egui::Rect::from_min_size(egui::Pos2::ZERO, screen.size());
+
     // 卡片尺寸跟着屏幕走：宽 84%、高 88%，两头夹住，保证小窗也能用。
     let card_w = (screen.width() * 0.84).clamp(760.0, 1500.0);
     let card_h = (screen.height() * 0.88).clamp(460.0, 1020.0);
@@ -549,12 +561,15 @@ pub fn ui(ctx: &egui::Context, st: &mut PfState) -> bool {
         .fixed_pos(screen.left_top())
         .show(ctx, |ui| {
             ui.painter().rect_filled(
-                screen,
+                local,
                 0.0,
                 Color32::from_rgba_unmultiplied(0x1a, 0x14, 0x10, 0x55),
             );
-            // 吃掉整屏的点击，避免点穿到主界面
-            let _ = ui.allocate_rect(screen, Sense::click_and_drag());
+            // 吃掉整屏的点击（不许点穿到主界面），点空白处直接关窗。
+            let bg = ui.interact(local, egui::Id::new("pf_bg"), Sense::click_and_drag());
+            if bg.clicked() {
+                closed = true;
+            }
 
             egui::Area::new(egui::Id::new("pf_card"))
                 .order(egui::Order::Foreground)

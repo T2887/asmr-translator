@@ -1,8 +1,8 @@
 {
-  "version": "1.40.1",
-  "url": "https://gh-proxy.com/https://github.com/T2887/asmr-translator/releases/download/v1.40.1/ASMR-Translator-Setup_v1.40.1.exe",
-  "page": "https://github.com/T2887/asmr-translator/releases/tag/v1.40.1",
-  "notes": "修复：安装 1.40.0 后程序内仍显示旧版本号，导致反复提示升级。\n\n本次同时包含 1.40.0 的全部改动：\n- 新增字幕校对（逐句修改、点时间试听、删除整句、写回字幕）\n- 全量模式幻觉治理（倒计时、纯拟声、结尾套话、同句刷屏都会丢弃）\n- 低置信句子在校对界面标橙提示\n- 进度显示与设备状态改进\n\n安装包约 130 MB。",
+  "version": "1.40.2",
+  "url": "https://gh-proxy.com/https://github.com/T2887/asmr-translator/releases/download/v1.40.2/ASMR-Translator-Setup_v1.40.2.exe",
+  "page": "https://github.com/T2887/asmr-translator/releases/tag/v1.40.2",
+  "notes": "字幕校对界面修复：点击窗口外不再卡死，可用 Esc 或点遮罩关闭。\n\n进度显示修复：不再提前显示 100%，收尾阶段不再显示假的「约 10 秒」。\n\n全量模式幻觉治理加强：排比复读、数字倒计时、单字重复刷屏都会被清掉；句首偶发的拉丁字母垃圾一并去掉。\n\n安装包约 130 MB。",
   "runtime_patch": {
     "version": "1.30.0",
     "url": "https://github.com/T2887/asmr-translator/releases/download/v1.30.0/ASMR-RuntimePatch_v1.30.0.exe",
