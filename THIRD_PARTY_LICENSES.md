@@ -8,32 +8,60 @@
 
 ## 一、Rust 依赖
 
-全部通过 Cargo 引入。用 `cargo metadata` 统计，共 77 个 crate，许可证分布：
+全部通过 Cargo 引入。用 `cargo metadata` 统计（v1.40.0 界面的 `_proto_egui` crate），
+共 **287 个 crate**，许可证分布：
 
 | 许可证 | 数量 |
 |---|---|
-| MIT OR Apache-2.0 | 44 |
-| MIT | 14 |
-| MIT/Apache-2.0 | 3 |
-| Zlib OR Apache-2.0 OR MIT | 3 |
-| Apache-2.0 OR MIT | 3 |
-| Unlicense OR MIT | 2 |
-| Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | 2 |
+| MIT OR Apache-2.0 | 131 |
+| MIT | 53 |
+| Apache-2.0 OR MIT | 22 |
+| MIT/Apache-2.0 | 15 |
+| Apache-2.0 | 13 |
+| Zlib OR Apache-2.0 OR MIT | 7 |
+| Unlicense OR MIT | 5 |
+| Apache-2.0/MIT | 4 |
+| MIT OR Apache-2.0 OR Zlib | 4 |
+| Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | 4 |
+| MPL-2.0 | 4 |
+| Zlib | 3 |
+| BSD-3-Clause | 2 |
+| MIT OR Zlib OR Apache-2.0 | 2 |
+| BSD-3-Clause OR Apache-2.0 | 2 |
+| BSD-3-Clause OR MIT OR Apache-2.0 | 2 |
+| Unlicense/MIT | 2 |
+| BSD-2-Clause OR Apache-2.0 OR MIT | 2 |
+| 0BSD OR MIT OR Apache-2.0 | 1 |
+| MIT / Apache-2.0 | 1 |
+| Apache-2.0 AND MIT | 1 |
 | (Apache-2.0 OR MIT) AND BSD-3-Clause | 1 |
+| (MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0 | 1 |
 | ISC | 1 |
-| UNKNOWN | 1 |
+| BSD-2-Clause OR MIT OR Apache-2.0 | 1 |
+| MIT OR Apache-2.0 OR LGPL-2.1-or-later | 1 |
+| Apache-2.0 OR GPL-2.0-only | 1 |
+| (MIT OR Apache-2.0) AND Unicode-3.0 | 1 |
 
-直接依赖：
+直接依赖（7 个）：
 
-| crate | 版本 | 许可证 |
-|---|---|---|
-| `encoding_rs` | 0.8.42 | (Apache-2.0 OR MIT) AND BSD-3-Clause |
-| `regex` | 1.13.1 | MIT OR Apache-2.0 |
-| `rfd` | 0.17.2 | MIT |
-| `windows-reactor` | 0.100 | MIT OR Apache-2.0 |
-| `windows-sys` | 0.61.2 | MIT OR Apache-2.0 |
+| crate | 版本 | 许可证 | 用途 |
+|---|---|---|---|
+| `eframe` | 0.37.0 | MIT OR Apache-2.0 | 界面框架（egui 官方封装） |
+| `image` | 0.25.10 | MIT OR Apache-2.0 | 读窗口图标 |
+| `raw-window-handle` | 0.6.2 | MIT OR Apache-2.0 OR Zlib | 交给系统的窗口句柄 |
+| `regex` | 1.13.1 | MIT OR Apache-2.0 | 解析子进程输出 |
+| `rfd` | 0.17.2 | MIT | 系统文件选择框 |
+| `rodio` | 0.19.0 | MIT OR Apache-2.0 | 校对界面里试听音频 |
+| `windows-sys` | 0.61.2 | MIT OR Apache-2.0 | Win32 调用（DPI、窗口、显卡信息） |
 
 **这些许可证都允许在 MIT 项目中使用，且不要求本项目改为 copyleft。**
+
+三处需要说明的：
+
+- **MPL-2.0（4 个）** 是「文件级」弱 copyleft：只有当你修改了那几个 crate 的源码文件本身时才要求公开该文件，本项目只是链接使用，不触发。
+- **`MIT OR Apache-2.0 OR LGPL-2.1-or-later`（1 个）** 有 MIT 选项，按 MIT 处理即可。
+- **`Apache-2.0 OR GPL-2.0-only`（1 个）** 有 Apache-2.0 选项，同样不会引入 GPL。
+- **(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0（1 个）** 是 `eframe` 默认字体的来源，OFL 允许随软件分发，不需要额外署名。
 
 ---
 
