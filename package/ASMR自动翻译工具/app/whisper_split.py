@@ -403,6 +403,9 @@ def drop_ono(rows, log=None):
     return out, n
 
 
+_TITLE_RE = re.compile(r"第\s*\d+\s*[话話集回章]|^\s*(?:EP|Ep|ep|#)\s*\d+$")
+
+
 def drop_junk(rows, max_len=4, log=None):
     """丢掉「整行不含假名/汉字且很短」的段。
 
@@ -431,6 +434,24 @@ def drop_junk(rows, max_len=4, log=None):
         #   有 21 个字符，被上面那条 max_len=4 的门槛挡在外面（m23540 用户质疑）。
         #   整条一个字都没有、只剩数字，绝不可能是台词。
         _bare = re.sub(r"[\s\W_]+", "", txt)
+        # ★ v1.40.4：标题类幻觉。
+        #   whisper 的训练数据里有大量番剧字幕，开场安静段会吐「第10话」
+        #   「第3集」「EP12」这种东西，而且能拉满十几秒（实测用户截图
+        #   m23893：0.0-16.0 秒整条就三个字「第10话」）。它不是台词。
+        if _TITLE_RE.search(txt) and len(_bare) <= 8:
+            n += 1
+            log("  [杂讯] 丢弃 %.1f-%.1f 秒标题幻觉：%r" % (s, e, txt))
+            continue
+        # ★ v1.40.4：极低密度长段。
+        #   正常人说话不会「十几秒只吐两三个字」——实测真台词的密度最低也有
+        #   0.87 字/秒（calib_haas.py 抽 200 条量出来的）。而 whisper 在开场
+        #   安静段能给出「0.0-16.0 秒 / 第10话」这种 0.19 字/秒的鬼东西。
+        #   时长门槛 10 秒是给 ASMR 留的：喘息段里「啊……」确实可以拖十秒。
+        _dur = float(e) - float(s)
+        if _dur >= 10.0 and len(_bare) <= 6:
+            n += 1
+            log("  [杂讯] 丢弃 %.1f-%.1f 秒极低密度长段（%.0f 秒只有 %d 字）：%r" % (s, e, _dur, len(_bare), txt))
+            continue
         if _bare and _bare.isdigit():
             n += 1
             log("  [杂讯] 丢弃 %.1f-%.1f 秒数字倒计时：%r" % (s, e, txt))
