@@ -1,8 +1,8 @@
 {
-  "version": "1.40.3",
-  "url": "https://gh-proxy.com/https://github.com/T2887/asmr-translator/releases/download/v1.40.3/ASMR-Translator-Setup_v1.40.3.exe",
-  "page": "https://github.com/T2887/asmr-translator/releases/tag/v1.40.3",
-  "notes": "过长字幕自动拆分：超过 24 字的句子按标点切开，两段都至少 6 个字，时间按字数比例分配，不再出现一行占三行屏、读不完的情况。\n\n用中日对照作品实测，逐句相似度提升约 0.03，幻觉率不变。\n\n安装包约 130 MB。",
+  "version": "1.40.4",
+  "url": "https://gh-proxy.com/https://github.com/T2887/asmr-translator/releases/download/v1.40.4/ASMR-Translator-Setup_v1.40.4.exe",
+  "page": "https://github.com/T2887/asmr-translator/releases/tag/v1.40.4",
+  "notes": "时间轴修复：全量模式改用词级时间轴（DTW 对齐），不再出现内容对、位置标错一格的情况。\n\n幻觉治理新增四条：番剧标题、片尾词、极低密度长段、句首拉丁字母垃圾。\n\n校对界面：低置信句子标橙显示。\n\n安装包约 130 MB。",
   "runtime_patch": {
     "version": "1.30.0",
     "url": "https://github.com/T2887/asmr-translator/releases/download/v1.30.0/ASMR-RuntimePatch_v1.30.0.exe",

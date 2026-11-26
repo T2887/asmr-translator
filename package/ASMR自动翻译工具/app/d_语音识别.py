@@ -823,6 +823,25 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
             condition_on_previous_text=False,
             initial_prompt=_INITIAL_PROMPT,
             hotwords=_hw,
+            # ★ v1.40.5：词级时间戳（DTW 对齐）。
+            #
+            #   全量模式关掉 VAD 后（ASMR_FULL_NOVAD=1），whisper 是在整段音频
+            #   上解码的，它自己猜每句话从第几秒到第几秒 —— 内容听得对、位置
+            #   标错。实测 RJ01556415 Track-01：296 秒的台词被标到 306 秒，
+            #   连带后面三条整体错开一格（用户 m24008 截图）。
+            #
+            #   打开 word_timestamps 后 faster-whisper 会走一次 DTW，把解码
+            #   出来的 token 逐个对齐到音频帧上，segment 的 start/end 由词的
+            #   时间推出来。同一段实测：
+            #     没有 → 306.0-311.0 喂 你那是什么表情？都快哭出来了啊？
+            #     有   → 298.28 你那表情是什么意思？ / 300.42 都快要哭出来了呀
+            #   与 Haas-ja 听出的「ねえ、その顔なに?」「泣きそうになってるじゃん」
+            #   逐句对上。
+            #
+            #   代价：多了 DTW 这一步，整篇 618 秒素材从约 95 秒变成约 130 秒；
+            #   段数也会略多（93 → 104）—— 这是切分变细，对观众是好事。
+            #   ASMR_WORD_TS=0 可关（关掉退回旧的窗口猜法）。
+            word_timestamps=(os.environ.get("ASMR_WORD_TS", "1") != "0"),
             log_progress=True
         )
 
