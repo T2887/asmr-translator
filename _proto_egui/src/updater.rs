@@ -336,20 +336,65 @@ pub type ProgressFn<'a> = &'a mut dyn FnMut(u64, Option<u64>);
 ///
 /// 直接调 `curl.exe -o`，它能显示总长度，失败信息也清楚；
 /// 没有 curl 时退回 PowerShell。
-pub fn download_blocking(
+/// 从主 URL 派生候选下载地址。**主站优先，国内加速镜像兜底。**
+///
+/// 为什么需要它：`version.json` 里的 `url` 只能写一个地址。实测
+/// `ghproxy.net` 会下到 1.3 MB 就断流、`gh.llkk.cc` 直接超时，
+/// 单点一挂所有人就升不了级（1.40.0 就撞过这个）。
+///
+/// 派生规则：URL 里只要含 `https://github.com/`，就把这一段抠出来，
+/// 依次拼上各个加速前缀；最后再把直连 GitHub 放进去兜底
+/// （国内直连慢，但不是不能连，总比全失败强）。
+/// 不是 GitHub 的地址（网盘、自建服务器）不做派生，原样返回。
+fn candidate_urls(primary: &str) -> Vec<String> {
+    let primary = primary.trim();
+    if primary.is_empty() {
+        return Vec::new();
+    }
+    let raw = match primary.find("https://github.com/") {
+        Some(i) => &primary[i..],
+        None => primary,
+    };
+    let mut out = vec![primary.to_string()];
+    if raw.starts_with("https://github.com/") {
+        for host in [
+            "https://gh-proxy.com/",
+            "https://ghfast.top/",
+            "https://ghproxy.net/",
+        ] {
+            let u = format!("{host}{raw}");
+            if !out.iter().any(|x| x == &u) {
+                out.push(u);
+            }
+        }
+        if !out.iter().any(|x| x == raw) {
+            out.push(raw.to_string());
+        }
+    }
+    out
+}
+
+/// 取 URL 里的主机名，只用于错误信息（让用户知道是哪个源挂了）
+fn host_of(url: &str) -> String {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    rest.split('/').next().unwrap_or(rest).to_string()
+}
+
+/// 单源下载。`total` 是 HEAD 拿到的长度，拿不到就传 None（不做长度校验）。
+fn download_one(
     url: &str,
     dest: &Path,
-    mut on_progress: impl FnMut(u64, Option<u64>),
+    total: Option<u64>,
+    on_progress: &mut dyn FnMut(u64, Option<u64>),
     cancel: &dyn Fn() -> bool,
 ) -> Result<(), String> {
-    if let Some(parent) = dest.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
     let _ = std::fs::remove_file(dest);
 
     // 用 curl 的分块输出模式：-s 静默，但保留进度靠我们自己读 stdout 不行，
     // 所以先拿 Content-Length，再分块写文件。简单起见：整体下载 + 轮询文件大小。
-    let total: Option<u64> = http_head_length(url).ok();
 
     let mut child = Command::new("curl.exe")
         .args([
@@ -407,8 +452,61 @@ pub fn download_blocking(
         let _ = std::fs::remove_file(dest);
         return Err("下载下来的文件太小，可能不是安装包".into());
     }
+    // 长度不符也是失败：镜像中途断流时 curl 的退出码是 0，不作这个校验
+    // 会得到一个「能装但装一半」的坏包（ghproxy.net 实测断在 1.3 MB）。
+    if let Some(t) = total {
+        if t > 1024 && size != t {
+            let _ = std::fs::remove_file(dest);
+            return Err(format!("只下到 {size} / {t} 字节，连接中断"));
+        }
+    }
     on_progress(size, Some(size));
     Ok(())
+}
+
+/// 下载安装包到 `dest`。**后台线程调用**。
+///
+/// 依次尝试 `candidate_urls()` 派生出来的地址，任一成功即返回；
+/// 全部失败时把所有源的错误拼在一起返回，方便判断是「全挂了」还是「有源能通但文件不对」。
+pub fn download_blocking(
+    url: &str,
+    dest: &Path,
+    mut on_progress: impl FnMut(u64, Option<u64>),
+    cancel: &dyn Fn() -> bool,
+) -> Result<(), String> {
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::remove_file(dest);
+
+    let cands = candidate_urls(url);
+    if cands.is_empty() {
+        return Err("没有可用的下载地址".into());
+    }
+
+    let mut errs: Vec<String> = Vec::new();
+    for u in cands.iter() {
+        if cancel() {
+            return Err("已取消".into());
+        }
+        let total = http_head_length(u).ok();
+        match download_one(u, dest, total, &mut on_progress, cancel) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if e == "已取消" {
+                    let _ = std::fs::remove_file(dest);
+                    return Err(e);
+                }
+                errs.push(format!("{}：{}", host_of(u), e));
+            }
+        }
+    }
+    let _ = std::fs::remove_file(dest);
+    Err(format!(
+        "下载失败，已试过 {} 个源。{}",
+        cands.len(),
+        errs.join("；")
+    ))
 }
 
 /// 只取 Content-Length，拿不到就算了（进度条退化成「已下载 xx MB」）
