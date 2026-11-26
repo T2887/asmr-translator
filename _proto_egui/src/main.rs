@@ -1357,11 +1357,25 @@ impl App {
             None
         };
 
-        match proofread::load(&srt, vad.as_deref(), &src) {
+        // 低置信标记（v1.40.1）：第 4 步写出的 2vad\<stem>.lowconf.json。
+        // 不存在也正常（旧版本跑出来的字幕、或全部判定为高置信）。
+        let lowconf = {
+            let p = std::path::Path::new(&self.work_dir)
+                .join("2vad")
+                .join(format!("{stem}.lowconf.json"));
+            if p.is_file() { Some(p) } else { None }
+        };
+
+        match proofread::load(&srt, vad.as_deref(), &src, lowconf.as_deref()) {
             Ok(l) => {
                 let n = l.rows.len();
+                let nlc = l.rows.iter().filter(|r| r.lowconf).count();
                 let ja = if l.has_ja { "含日文原文" } else { "仅中文" };
-                self.push_log(format!("[校对] 载入 {n} 句（{ja}）"));
+                self.push_log(if nlc > 0 {
+                    format!("[校对] 载入 {n} 句（{ja}，其中 {nlc} 句低置信已标橙）")
+                } else {
+                    format!("[校对] 载入 {n} 句（{ja}）")
+                });
                 self.pf = Some(proofread::PfState::new(l));
             }
             Err(e) => self.push_log(format!("[校对] {e}")),

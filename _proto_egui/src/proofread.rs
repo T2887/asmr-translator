@@ -31,6 +31,9 @@ pub struct ProofRow {
     pub deleted: bool,
     /// 相对载入时的原始文本改过没有（用来标「已改」）。
     pub edited: bool,
+    /// 低置信行（v1.40.1）：Haas-ja 独立复核时听出的内容偏少，
+    /// 说明这句可能是吞字、半截音效或幻觉。界面标橙提示用户重点听。
+    pub lowconf: bool,
 }
 
 impl ProofRow {
@@ -55,7 +58,8 @@ pub struct Loaded {
 ///
 /// `vad_json` 只在兼容模式下有；不存在时 `has_ja = false`，
 /// 界面就不画「识别原文」那一列 —— 和全量模式的表现一致。
-pub fn load(srt_path: &Path, vad_json: Option<&Path>, media: &Path) -> Result<Loaded, String> {
+pub fn load(srt_path: &Path, vad_json: Option<&Path>, media: &Path,
+            lowconf_json: Option<&Path>) -> Result<Loaded, String> {
     let cues = srt::read_srt(srt_path)?;
     if cues.is_empty() {
         return Err(format!("{} 里没有字幕条目", srt_path.display()));
@@ -72,11 +76,25 @@ pub fn load(srt_path: &Path, vad_json: Option<&Path>, media: &Path) -> Result<Lo
     ja_rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     let has_ja = !ja_rows.is_empty();
 
+    // 低置信段（v1.40.1）：d_语音识别.py 写出的 [{start,end,text,heard}]，
+    // 内容是「逃过了人声闸、但 Haas-ja 复核只听到很少几种字」的段。
+    // 判据和日文对齐一致：cue 的时间中点落在低置信区间里就算。
+    let lowconf_spans: Vec<(f64, f64)> = match lowconf_json {
+        Some(p) if p.is_file() => parse_vad_json(p)
+            .map(|v| v.into_iter().map(|(a, b, _)| (a, b)).collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+
     let rows = cues
         .into_iter()
         .map(|c| ProofRow {
             start: c.start,
             end: c.end,
+            lowconf: {
+                let mid = (c.start + c.end) * 0.5;
+                lowconf_spans.iter().any(|(a, b)| mid >= *a && mid <= *b)
+            },
             ja: if has_ja {
                 pick_ja(&ja_rows, c.start, c.end)
             } else {
@@ -668,7 +686,7 @@ fn body(ui: &mut egui::Ui, st: &mut PfState) {
         .max_height(ui.available_height() - 46.0)
         .show(ui, |ui| {
             for i in 0..n {
-                let (start, end, ja, zh, deleted, edited, playing) = {
+                let (start, end, ja, zh, deleted, edited, playing, lowconf) = {
                     let r = &st.loaded.rows[i];
                     (
                         r.start,
@@ -678,6 +696,7 @@ fn body(ui: &mut egui::Ui, st: &mut PfState) {
                         r.deleted,
                         r.edited,
                         st.player.playing == Some(i),
+                        r.lowconf,
                     )
                 };
 
@@ -712,10 +731,10 @@ fn body(ui: &mut egui::Ui, st: &mut PfState) {
 
                             let (w_ja, w_zh) = cols(ui.available_width(), has_ja);
                             if has_ja {
-                                cell(ui, i, true, &ja, deleted, w_ja, edited, &mut do_edit, st);
+                                cell(ui, i, true, &ja, deleted, w_ja, edited, false, &mut do_edit, st);
                                 ui.add_space(COL_GAP);
                             }
-                            cell(ui, i, false, &zh, deleted, w_zh, edited, &mut do_edit, st);
+                            cell(ui, i, false, &zh, deleted, w_zh, edited, lowconf, &mut do_edit, st);
 
                             // 最右侧 ×
                             let sym = if deleted { "↺" } else { "×" };
@@ -836,6 +855,7 @@ fn cell(
     deleted: bool,
     width: f32,
     edited: bool,
+    lowconf: bool,
     do_edit: &mut Option<(usize, bool)>,
     st: &mut PfState,
 ) {
@@ -864,8 +884,12 @@ fn cell(
         return;
     }
 
+    // 低置信行（v1.40.1）文字标橙：人声闸的独立复核只听到很少几种字，
+    // 多半是吞字或半截音效。不删也不改，只是提示用户重点听这几句。
     let mut txt = RichText::new(text).size(13.0).color(if deleted {
         Color32::from_rgb(0xb8, 0xad, 0xa2)
+    } else if lowconf {
+        Color32::from_rgb(0xc4, 0x6a, 0x22)
     } else if is_ja {
         INK2
     } else {

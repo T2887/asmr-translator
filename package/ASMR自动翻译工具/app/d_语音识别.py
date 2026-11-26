@@ -248,8 +248,29 @@ def _load_extra_hotwords(stem):
     """
     words = []
     cwd = os.getcwd()
-    for name in ("hotwords.txt", f"hotwords_{stem}.txt"):
-        p = os.path.join(cwd, name)
+    files = [os.path.join(cwd, n) for n in ("hotwords.txt", f"hotwords_{stem}.txt")]
+
+    # ★ v1.40.1：hotwords.d/组名.txt —— 同一系列多个文件共用一组术语。
+    #
+    #   现有的 hotwords_<stem>.txt 是逐文件的：RJ277717 有 7 个音频就得复制
+    #   7 份。这里多支持一种“按模式匹配”：文件名就是模式，只要它出现在音频文件名里
+    #   就加载进来。例：hotwords.d/RJ277717.txt 对 RJ277717_01.wav、RJ277717-序章.wav 都生效。
+    #
+    #   为什么不用“目录级”（素材同目录放一份 hotwords.txt）：第 4 步拿到的
+    #   audio_path 已经是 1audio 里的 wav，原始素材目录在这里拿不到。
+    _hd = os.path.join(cwd, "hotwords.d")
+    if os.path.isdir(_hd):
+        try:
+            for _fn in sorted(os.listdir(_hd)):
+                if not _fn.lower().endswith(".txt"):
+                    continue
+                _pat = _fn[:-4].strip()
+                if _pat and _pat in stem:
+                    files.append(os.path.join(_hd, _fn))
+        except Exception:
+            pass
+
+    for p in files:
         if not os.path.isfile(p):
             continue
         try:
@@ -1194,80 +1215,23 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
             except Exception as _e:
                 print(f"  [去重] 跳过（{type(_e).__name__}: {_e}）")
 
-        # ★ v1.30.8：单条字幕内部的重复刷屏折叠。
+        # ★ v1.40.1：稳定化 —— 四道过滤收成一个总入口。
         #
-        #   `merge_segments` 只管「相邻段是不是同一句」，管不了单条内部的
-        #   极限重复。实测巧可 RJ277717 第 6 条：
-        #     00:01:51,000 --> 00:02:21,000
-        #     小穴 高潮 高潮 高潮 …（54 次，30 秒）
-        #   这是 novad 模式独有的：没有 VAD 约束时，长静音窗会被同一个词填满。
+        #   顺序与理由见 whisper_split.stabilize()：
+        #     ① 折叠单条内部的极限重复（小穴 高潮 高潮…×54）
+        #     ② 丢纯数字/符号（whisper 的倒计时幻觉 10 9 8 … 0）
+        #     ③ 丢纯拟声行 + 「约N秒的X」元描述
+        #     ④ 人声闸 —— 换 Haas-ja 再听一遍（最慢，放最后）
         #
-        #   判据严格（见 whisper_split.collapse_repeats）：重复 ≥5 次、
-        #   且占正文 50% 以上才折 —— ASMR 里「喜欢×5」「老师×4」是真实台词。
-        #   ASMR_NO_COLLAPSE=1 可关闭。
-        if os.environ.get("ASMR_NO_COLLAPSE", "").strip() != "1" and asr_rows:
+        #   每一步都能用 ASMR_NO_*、ASMR_SPEECH_GATE=0 单独关掉。
+        #
+        #   低置信标记：_hear 在这里建，因为它只有人声闸用；
+        #   把它传给 stabilize 的 lowconf 参数，就能收到
+        #   「留但可疑」的段，落盘给校对界面标橙。
+        _lowconf = []
+        _hear = None
+        if os.environ.get("ASMR_SPEECH_GATE", "").strip() != "0":
             try:
-                from whisper_split import collapse_rows
-                asr_rows, _nrep = collapse_rows(asr_rows)
-                if _nrep:
-                    print(f"  [折叠重复] 处理 {_nrep} 条内部刷屏")
-            except Exception as _e:
-                print(f"  [折叠重复] 跳过（{type(_e).__name__}: {_e}）")
-
-        # ★ v1.30.11：纯数字/符号的段（whisper 的倒计时幻觉）。
-        #
-        #   实测 04 号素材 109 条里有 11 条是 `10 9 8 7 6 5 4 3 2 1 0` ——
-        #   训练数据里带倒计时的视频太多，它在纯音效窗口里就老老实实从
-        #   十数到零。这类行一个假名/汉字都没有，也没有任何信息量。
-        #   ASMR_NO_JUNK=1 可关闭。
-        if os.environ.get("ASMR_NO_JUNK", "").strip() != "1" and asr_rows:
-            try:
-                from whisper_split import drop_junk
-                asr_rows, _njunk = drop_junk(asr_rows)
-                if _njunk:
-                    print(f"  [杂讯] 丢弃 {_njunk} 条纯数字/符号")
-            except Exception as _e:
-                print(f"  [杂讯] 跳过（{type(_e).__name__}: {_e}）")
-
-        # ★ v1.30.12：拟声行 / 「约N秒的X」元描述。
-        #
-        #   novad 下第二大类假字幕。whisper 拿到接吻、舔耳的音效窗口时，
-        #   会把音效音老老实实写成中文拟声词（`叭叭叭叭`、`滋滋滋`、
-        #   `啪 啾啪`、`咕咚咕咚`、`亲 亲`），还爱输出
-        #   「约20秒的舌吻 结束」这种描述音频本身的元话语 —— 都不是台词。
-        #   ASMR_NO_ONO=1 可关闭。
-        if os.environ.get("ASMR_NO_ONO", "").strip() != "1" and asr_rows:
-            try:
-                from whisper_split import drop_ono
-                asr_rows, _nono = drop_ono(asr_rows)
-                if _nono:
-                    print(f"  [拟声] 丢弃 {_nono} 条纯音效/元描述行")
-            except Exception as _e:
-                print(f"  [拟声] 跳过（{type(_e).__name__}: {_e}）")
-
-        # ★ v1.30.10：人声闸 —— 用独立 ASR 复核「长时段少字」的段。
-        #
-        #   novad 让 whisper 也会拿到纯音效的窗口，它能顺着 initial_prompt
-        #   编出整句台词（实测 04 号素材：12 秒只有「亲亲」两个字；
-        #   1133.9-1145.9s 编出「约20秒的舌吻 结束」，那段音频完全无声）。
-        #
-        #   常规置信度手段在这个译中特化模型上全部失效——no_speech_prob
-        #   70/70 段恒为 0.000、avg_logprob 是窗口级的（相邻 5~7 段同值）、
-        #   能量还是反向的（接吻声 -5~-10 dB，耳语真语音 RMS -40 dB）；
-        #   ASMR VAD 又漏检（它对 272.6-274.3s 打 0.000，Haas-ja 在那里
-        #   识出「私のおへそのあたりに」conf 0.948）。
-        #
-        #   唯一可靠的信号是「换个模型再听一遍」：Haas-ja 一个字都听不出来，
-        #   或者只听出两三种假名（拟声词），那这段就是音效不是台词。
-        #
-        #   判据见 whisper_split.gate_suspect：时长 > 6 秒 **且**（空串 或
-        #   字符种类 ≤ 4）。短句一个都不碰 —— `え私?`(0.966)、`じゃあ`、
-        #   `ほら`、`いいわよ` 的字符种类同样只有 2~4，但都在 4 秒以内。
-        #
-        #   ASMR_SPEECH_GATE=0 可关闭。
-        if os.environ.get("ASMR_SPEECH_GATE", "").strip() != "0" and asr_rows:
-            try:
-                from whisper_split import gate_suspect
                 from asr_engine import load_engine
                 _ge, _gn = load_engine()          # 返回 (engine, note)
                 if _ge is None:
@@ -1276,17 +1240,17 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
                     def _hear(_p, _e=_ge):
                         _r = _e.transcribe_ex(_p)   # 收文件路径，不是数组
                         return (_r.get("text") or "")
-                    _n0 = len(asr_rows)
-                    # min_cps=4.0：只有「每秒 ≥4 个汉字」的段才免检。
-                    # 实测 04 号素材 538.1-546.0s 那条「用我的小穴让肉棒变得
-                    # 舒服起来 让肉棒变得硬邦邦的」密度 3.1 字/秒，被 1.0 的
-                    # 阈值放过了，而 Haas-ja 在同一段只听到「れろれろれろ」。
-                    asr_rows, _ngate = gate_suspect(asr_rows, audio_path, _hear,
-                                                    min_cps=4.0)
-                    if _ngate:
-                        print(f"  [人声闸] 丢弃 {_ngate} 段纯音效/幻觉：{_n0} → {len(asr_rows)} 条")
             except Exception as _e:
                 print(f"  [人声闸] 跳过（{type(_e).__name__}: {_e}）")
+
+        if asr_rows:
+            try:
+                from whisper_split import stabilize
+                asr_rows, _st = stabilize(asr_rows,
+                                          audio_path if _hear else None,
+                                          _hear, lowconf=_lowconf)
+            except Exception as _e:
+                print(f"  [稳定化] 跳过（{type(_e).__name__}: {_e}）")
 
         # ★ v1.30.9：定稿之后再发预览事件。
         #
@@ -1308,6 +1272,23 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
             emit("sub", f"{float(_ea):.2f}", f"{float(_eb):.2f}", _et)
 
         # 一次性写盘（不要放在循环里逐条写）
+        # ★ v1.40.1：低置信行时间戳落盘，供校对界面标橙。
+        #   写在 2vad（会话内目录，正常跑完不清），与兼容模式的日文原文同级。
+        #   用户关掉程序或开新任务时随中间产物一起清，不留垃圾。
+        try:
+            import json as _json
+            _lc_path = os.path.join(os.path.dirname(config["path"]["asr"]), "2vad",
+                                    f"{raw_stem}.lowconf.json")
+            os.makedirs(os.path.dirname(_lc_path), exist_ok=True)
+            _json.dump([{"start": round(float(a), 3), "end": round(float(b), 3),
+                         "text": c, "heard": (d or "")}
+                        for (a, b, c, d) in _lowconf],
+                       open(_lc_path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+            if _lowconf:
+                print(f"  [低置信] 标记 {len(_lowconf)} 段，供校对界面提示")
+        except Exception as _e:
+            print(f"  [低置信] 写入跳过（{type(_e).__name__}: {_e}）")
+
         write_srt(asr_log_path, asr_rows)
         _diag(f"✓ 字幕已写盘 {asr_log_path}")
 

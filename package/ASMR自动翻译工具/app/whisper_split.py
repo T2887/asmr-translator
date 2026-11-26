@@ -375,13 +375,15 @@ def drop_junk(rows, max_len=4, log=None):
 
 
 def gate_suspect(rows, wav_path, asr_fn, min_cps=1.0, min_dur=6.0,
-                 max_uniq=4, tmpdir=None, log=None):
+                 max_uniq=4, tmpdir=None, log=None, lowconf=None):
     """复核「长时段少字」的段，把纯幻觉 / 纯拟声的整段丢掉。
 
     rows     : [(start, end, text), ...]
     wav_path : 16k 单声道 wav（生产第 4 步读的就是这个）
     asr_fn   : callable(path) -> str，注入 Haas-ja；
                本模块不 import asr_engine，保持「纯逻辑、无模型依赖」
+    lowconf  : 可选 list；逃过闸门但复核文本仍然可疑的段会 append 进来。
+               供 UI 标「低置信」用 —— 不删，只提示。
     返回     : (新 rows, 丢弃条数)
     """
     if not rows:
@@ -456,6 +458,16 @@ def gate_suspect(rows, wav_path, asr_fn, min_cps=1.0, min_dur=6.0,
                     % (s, e, dur, n, why, (t or "")[:24]))
                 continue
 
+            # 逃过了闸门，但 Haas-ja 听到的内容偏少（≤ 2×max_uniq = 8 种字符）。
+            #
+            #   阈值校准：`calib_gate.py` 抽 200 条 >6 秒真台词喂 Haas-ja，
+            #   uniq 分布 min=5 / p10=13 / 中位=22。取 8 会标到约 4% 的真台词
+            #   —— 但那几条恰好都是「6 秒只说 7 个字」这类信息量极低的段，
+            #   标橙让用户听一下是合理的（用户定调：宁可漏翻不可错翻）。
+            #   取 6 只标 1%，太保守；取 10 以上会误标正常长句。
+            if lowconf is not None and u <= max_uniq * 2:
+                lowconf.append((s, e, t, heard))
+
             out.append((s, e, t))
     finally:
         if own:
@@ -465,6 +477,88 @@ def gate_suspect(rows, wav_path, asr_fn, min_cps=1.0, min_dur=6.0,
                 pass
 
     return out, drop
+
+# ─────────────────────────────────────────────────────────────
+# 稳定化总入口（v1.40.1）
+#
+# 四个过滤原本散在 d_语音识别.py 的四处调用里，各自读环境变量、各自打印
+# 日志。功能是对的，但「想加一条新规则」时要翻整个文件找调用点，而且
+# 顺序一旦排错（比如先跑人声闸再折叠重复）结果会不一样。
+#
+# 这里把它们收成一个函数，顺序就是下面这个顺序，理由写在每一步上。
+# 每一步都可以用对应的 ASMR_NO_* 关掉，关掉后行为和以前完全一致。
+#
+# 参考：Finesub（github.com/caca2331/finesub，GPL-3.0，只读了它的文档）
+# 把「去噪、合并碎片、丢弃幻觉」单独叫「稳定化」一个阶段。我们这边做的是
+# 同样的事，只是更保守 —— 它用云端大模型判断，我们用 Haas-ja 的独立复核。
+# ─────────────────────────────────────────────────────────────
+def stabilize(rows, wav_path=None, asr_fn=None, lowconf=None, log=None):
+    """把一条 whisper 原始输出过一遍稳定化。返回 (rows, stats)。
+
+    rows     : [(start, end, text), ...]
+    wav_path : 数组化后的 16k wav；给 None 就跳过需要音频的步骤（人声闸）
+    asr_fn   : callable(path) -> str，人声闸用的独立 ASR（Haas-ja）。
+               给 None 人也声闸整步跳过。
+    lowconf  : 可选 list，收集「留但可疑」的段，给校对界面标橙
+    log      : 日志输出，默认 print
+    stats    : {"rep": 折了几条, "junk": 丢了几条, "ono": 丢了几条,
+                "gate": 丢了几段, "lowconf": 标了几段}
+    """
+    if log is None:
+        log = print
+    stats = {"rep": 0, "junk": 0, "ono": 0, "gate": 0, "lowconf": 0}
+    if not rows:
+        return rows, stats
+
+    # ① 单条内部的极限重复。
+    #    最早做，因为后面的 drop_ono 判「全由拟声字组成」时，刷屏行
+    #    （「高潮高潮高潮…×54」）会被误判成拟声而删掉 —— 删了也对，
+    #    但日志会说成「拟声」，排查时误导人。
+    if os.environ.get("ASMR_NO_COLLAPSE", "").strip() != "1":
+        try:
+            rows, stats["rep"] = collapse_rows(rows)
+            if stats["rep"]:
+                log(f"  [折叠重复] 处理 {stats['rep']} 条内部刷屏")
+        except Exception as e:
+            log(f"  [折叠重复] 跳过（{type(e).__name__}: {e}）")
+
+    # ② 纯数字/符号（whisper 的倒计时幻觉：10 9 8 7 … 0）。
+    if os.environ.get("ASMR_NO_JUNK", "").strip() != "1":
+        try:
+            rows, stats["junk"] = drop_junk(rows)
+            if stats["junk"]:
+                log(f"  [杂讯] 丢弃 {stats['junk']} 条纯数字/符号")
+        except Exception as e:
+            log(f"  [杂讯] 跳过（{type(e).__name__}: {e}）")
+
+    # ③ 纯拟声行 + 「约N秒的X」元描述。
+    if os.environ.get("ASMR_NO_ONO", "").strip() != "1":
+        try:
+            rows, stats["ono"] = drop_ono(rows)
+            if stats["ono"]:
+                log(f"  [拟声] 丢弃 {stats['ono']} 条纯音效/元描述行")
+        except Exception as e:
+            log(f"  [拟声] 跳过（{type(e).__name__}: {e}）")
+
+    # ④ 人声闸：换个模型（Haas-ja）再听一遍。
+    #    放最后，因为它最慢（整篇 1147 秒音频约 18 秒 CPU），
+    #    而且前三步已经把大部分假字幕清掉了，可疑段数量大幅减少。
+    if (os.environ.get("ASMR_SPEECH_GATE", "").strip() != "0"
+            and wav_path and asr_fn):
+        try:
+            n0 = len(rows)
+            rows, stats["gate"] = gate_suspect(
+                rows, wav_path, asr_fn, min_cps=4.0, lowconf=lowconf)
+            if stats["gate"]:
+                log(f"  [人声闸] 丢弃 {stats['gate']} 段纯音效/幻觉："
+                    f"{n0} → {len(rows)} 条")
+        except Exception as e:
+            log(f"  [人声闸] 跳过（{type(e).__name__}: {e}）")
+
+    if lowconf:
+        stats["lowconf"] = len(lowconf)
+    return rows, stats
+
 
 if __name__ == "__main__":
     # 自检：构造三种典型情况
