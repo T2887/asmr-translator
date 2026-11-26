@@ -1,8 +1,8 @@
 {
-  "version": "1.40.4",
-  "url": "https://gh-proxy.com/https://github.com/T2887/asmr-translator/releases/download/v1.40.4/ASMR-Translator-Setup_v1.40.4.exe",
-  "page": "https://github.com/T2887/asmr-translator/releases/tag/v1.40.4",
-  "notes": "时间轴修复：全量模式改用词级时间轴（DTW 对齐），不再出现内容对、位置标错一格的情况。\n\n幻觉治理新增四条：番剧标题、片尾词、极低密度长段、句首拉丁字母垃圾。\n\n校对界面：低置信句子标橙显示。\n\n安装包约 130 MB。",
+  "version": "1.40.6",
+  "url": "https://gh-proxy.com/https://github.com/T2887/asmr-translator/releases/download/v1.40.6/ASMR-Translator-Setup_v1.40.6.exe",
+  "page": "https://github.com/T2887/asmr-translator/releases/tag/v1.40.6",
+  "notes": "幻觉治理（六素材标定）：端到端误杀 0.58%，幻觉率从 6.2% 降到 1.7%。\n\n- 短音效段（1~3 秒）现在也会做人声复核，whisper 在纯舐耳、接吻声上编的中文会被清掉\n- 新增四条判据：字比失调、物理不可能字速、纯拟音、拟声双判\n- 修掉一个会大量误杀真台词的 bug（avg_logprob 是窗口级指标，被音效拉低）\n\n安装包约 130 MB。",
   "runtime_patch": {
     "version": "1.30.0",
     "url": "https://github.com/T2887/asmr-translator/releases/download/v1.30.0/ASMR-RuntimePatch_v1.30.0.exe",

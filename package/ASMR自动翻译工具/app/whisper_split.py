@@ -314,7 +314,7 @@ def cjk_count(t):
 # 纯拟声字表：一整行如果只由这些字组成，那它描述的是音效，不是台词。
 # 没有放「哈」「呼」「吸」「舔」「揉」—— 它们是真的台词用字
 # （「哈哈」「呼呼大睡」「吸出来」「舔舐」「揉揉」人工字幕里都有）。
-_ONO = set("叭啪啾滋咕咚噗咻吮啧嘟啵咂嘎咔嗒吭嘶咝嚓啪叽咕嘟")
+_ONO = set("叭啪啾滋咕咚噗咻吮啧嘟啵咂嘎咔嗒吭嘶咝嚓啪叽咕嘟亲呲")
 # whisper 的元描述幻觉：「约20秒的舌吻 结束」「约10秒的舌吻时间」——
 # 它不是在翻译台词，是在描述这段音频。
 _META_RE = re.compile(r"[约約]?\s*\d+\s*秒")
@@ -467,12 +467,20 @@ def drop_junk(rows, max_len=4, log=None):
 #     实测 05 号素材 357.0-361.6 秒就是这样漏过去的。
 #   故意不放「あいうえお」这类能被真词用到的元音单字，避免误杀。
 _ONO_JA = set(
+    # ★ v1.40.6：只留**真正的拟声字**。旧表把基本五十音（かきくけこさしすせそ…）
+    #   全塞进来了，于是任何纯假名的日语短语都被判成拟声：
+    #      → rest='' → 误杀（真台词「呵呵 开玩笑的」）
+    #      → rest='耳'（1 字）→ 误杀（真台词）
+    #   现在只有「舔/吸/水声/口内音」这些字才算拟声；判据也收紧到 rest == 0。
     "れろちゅっんぁぃぅぇぉゃゅょゎー～〜"
     "ぺぷぴぱぽぴゃぴゅぴょ"
-    "ぐじずぜぞだでどばびぶべぼ"
-    "ちゃちゅちょしゃしゅしょ"
-    "くかきこさすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわを"
-    "ぱぴぷぺぽげござ"
+    #   不要再往里加普通浊音假名（だ で ど ば び ぶ べ ぼ が ぎ ぐ げ ご
+    #   ざ じ ず ぜ ぞ ちゃ ちょ しゃ しゅ しょ）。它们是日语最常用的字符，
+    #   放进来就会把真台词判成拟声 —— 实测两次误杀都是这个原因：
+    #     `90.0-91.2 那样的话`  ← Haas `だろ`（句尾「だろう」，不是拟声）
+    #   现在表里只剩舔耳/口内音专用的那些（れ ろ ち ゅ ん っ ぺ ぴ ぱ ぽ）。
+    #   代价是 `ちゅくちゅう` 这种含 `く`/`う` 的拟声判不出来，
+    #   由 uniq 判据和字比失调兜底。
 )
 
 
@@ -487,15 +495,76 @@ def _ono_only(heard):
     if not core:
         return True            # 一个字都没听到：交给「空串」那条判据
     if len(core) < 5:
-        # 太短的句子不做拟声判断 —— すぐ / はい / じゃあ / 出して 这些
-        # 真台词本身就两三个字，去掉假名后几乎不剩东西，会全被误杀。
-        # 短句另有 uniq 判据兜着，不需要这条。
-        return False
-    rest = "".join(ch for ch in core if ch not in _ONO_JA)
-    return len(rest) <= 1
+        # ★ v1.40.6：短词也要看是不是纯拟声。旧版一律 return False，
+        #   于是 `れろ`(2 字) 被放过，whisper 在它上面编了「脸上也是」（实测）。
+        #   判据：短词里**一个非拟声字都没有**才算拟声 —— 这样
+        #   `すぐ`/`はい`/`じゃあ`/`もう`/`え私?` 都不受影响（含非拟声字）。
+        # ★ v1.40.6：要同时查中文表和日文表。Haas 返回的是日文拟声（れろ），
+        #   但 profile_rows 拿到的是 whisper 的中文输出（啪嗒 啾啪嗒）——
+        #   只查日文表会让「拟声行占比」永远是 0，档位判据失效。
+        return all(ch in _ONO_JA or ch in _ONO for ch in core)
+    rest = "".join(ch for ch in core if ch not in _ONO_JA and ch not in _ONO)
+    return len(rest) == 0
 
 
-def gate_suspect(rows, wav_path, asr_fn, min_cps=1.0, min_dur=3.5,
+def profile_rows(rows):
+    """给一份转写结果打画像，用来决定过滤强度走哪一档。
+
+    ★ v1.40.6：参数不再写死。04 号那种「舔耳/接吻音效占大半」的素材需要
+      严过滤（min_dur=1.2 / min_cps=4.0），但换成对话为主的素材，同样的参数
+      会把「え?私?」这类真短句一起删掉。所以先用 whisper 自己的输出判断
+      这是一篇什么样的音频，再决定闸门开多大。
+
+    三个指标（都是无量纲比例，和素材时长、语速无关）：
+      ono_frac     : 疑似拟声/音效行占比 —— 音效重的素材能到 0.2 以上
+      verylow_frac : 字/秒 < 1.2 的行占比 —— 长时段只说两三个字，幻觉高发
+      short_frac   : 短于 1.5 秒的行占比 —— 碎片多说明边界不稳
+
+    返回 dict，其中 tier 是 'strict' / 'normal' / 'loose'。
+    """
+    n = len(rows)
+    if not n:
+        return {"n": 0, "ono_frac": 0.0, "verylow_frac": 0.0,
+                "short_frac": 0.0, "cps_med": 0.0, "tier": "normal"}
+    cps = []
+    ono = 0
+    short = 0
+    for s, e, t in rows:
+        dur = float(e) - float(s)
+        c = (cjk_count(t) / dur) if dur > 0 else 9.9
+        cps.append(c)
+        if dur < 1.5:
+            short += 1
+        try:
+            if _ono_only(t):
+                ono += 1
+        except Exception:
+            pass
+    cps_sorted = sorted(cps)
+    return {
+        "n": n,
+        "ono_frac": ono / n,
+        "verylow_frac": sum(1 for c in cps if c < 1.2) / n,
+        "short_frac": short / n,
+        "cps_med": cps_sorted[n // 2],
+        "tier": ("strict" if (ono / n >= 0.22 or sum(1 for c in cps if c < 1.2) / n >= 0.14)
+                 else "loose" if (ono / n <= 0.06 and sum(1 for c in cps if c < 1.2) / n <= 0.04)
+                 else "normal"),
+    }
+
+
+# 三档过滤参数。键与 gate_suspect 的关键字参数同名，直接 **展开传。
+#   strict : 音效重（舔耳/接吻/水声占大半），宁可误杀也不能留假字幕
+#   normal : 常规 ASMR（有台词也有音效）
+#   loose  : 对话为主（几乎没有音效段），别乱删
+TIER_PARAMS = {
+    "strict": {"min_dur": 1.2, "min_cps": 4.0, "max_uniq": 4},
+    "normal": {"min_dur": 1.8, "min_cps": 3.5, "max_uniq": 5},
+    "loose":  {"min_dur": 2.5, "min_cps": 2.5, "max_uniq": 6},
+}
+
+
+def gate_suspect(rows, wav_path, asr_fn, min_cps=1.0, min_dur=1.2,
                  max_uniq=4, tmpdir=None, log=None, lowconf=None):
     """复核「长时段少字」的段，把纯幻觉 / 纯拟声的整段丢掉。
 
@@ -507,11 +576,18 @@ def gate_suspect(rows, wav_path, asr_fn, min_cps=1.0, min_dur=3.5,
                供 UI 标「低置信」用 —— 不删，只提示。
     返回     : (新 rows, 丢弃条数)
 
-    ★ min_dur 从 6.0 降到 3.5（v1.40.2）：
+    ★ min_dur 从 6.0 → 3.5（v1.40.2）→ 2.0（v1.40.6，用户要求
+    「宁可误杀，不允许乱翻」）：
       6.0 是拍脑袋定的，实测把大量 4~6 秒的幻觉挡在门外。巧可 05 号里
       `小穴高潮了…（×8）`(5.4s) 和 `肉棒又在一抖一抖的了`(4.6s) 两条
       纯音效假字幕就是这样漏出去的，用户反馈「播放的这段没有说话的」。
       3.5 秒以下 Haas-ja 的识别置信度会明显下降，所以停在 3.5。
+
+    ★ v1.40.6 再降到 1.2：2.0 仍然挡住了 1~2 秒的段，而 whisper 在纯音效上
+      编出来的短句正是这个长度。实测 `725.3-726.8 脸上也是`(1.5 秒) 对应的
+      Haas 输出是 `れろ`（纯舔耳拟声），因为 1.5 < 2.0 根本没进闸门。
+      1.2 是「Haas 还能稳定出字」的下限；再短就只剩 `あ`、`ん` 这类单音，
+      删与不删都不影响观感，还会增加耗时。
     """
     if not rows:
         return rows, 0
@@ -552,9 +628,52 @@ def gate_suspect(rows, wav_path, asr_fn, min_cps=1.0, min_dur=3.5,
         for (s, e, t) in rows:
             dur = float(e) - float(s)
             n = cjk_count(t)
+            # 极短碎片：split_long_rows 按字数比例切时间，末尾一小截会分到
+            # 0.06 秒（实测 06 号 277.78-277.84「下次见」）。播放器里这种字幕
+            # 根本来不及显示，留着只会在评测里算成一条假幻觉。0.12 秒是
+            # 「人眼还能看到一闪」的下限。
+            if dur <= 0.12:
+                drop += 1
+                log("  [人声闸] 丢弃 %.1f-%.1f 秒（极短碎片）：%s"
+                    % (s, e, (t or "")[:24]))
+                continue
             cps = (n / dur) if dur > 0 else 9.9
-            # 不够长、或者字够密 —— 都不动
-            if dur < min_dur or n == 0 or cps >= min_cps:
+            # 不够长、或者字够密 —— 都不动。
+            #
+            # ★ v1.40.6 例外：**短段却塞了很多字**也要查。
+            #   旧写法 `cps >= min_cps` 直接跳过，于是「字比失调」判据永远不生效
+            #   —— 中文写得越长 cps 越高、越是被跳过，逻辑正好反过来。
+            #   实测 `414.8-416.8 用我的小穴 让你的肉棒变得硬邦邦`（2.0 秒 15 字，
+            #   cps=7.5）就在这一步被漏掉，Haas 实际只听到 `で`（1 个假名）。
+            #   真台词 2 秒说 15 个字是可能的（译为中文后会变长），所以这里
+            #   只是「纳入复核」，仍由 Haas 的 heard 决定去留，不会误杀。
+            # ★ v1.40.6：物理上不可能的字速，直接判幻觉，不必再问 Haas。
+            #   拆分把长句切开后会出现 0.3 秒的碎片（原来的长句时间轴没变），
+            #   于是「把我的小穴 变成你的专属飞机杯吧」（15 字）被标成 0.3 秒
+            #   = 50 字/秒。正常人说话 5~8 字/秒，12 已经是极快语速的两倍。
+            #   这类段连 Haas 都不用跑（0.3 秒的切片它也听到不东西）。
+            if n >= 6 and dur > 0 and (n / dur) >= 12.0:
+                drop += 1
+                log("  [人声闸] 丢弃 %.1f-%.1f 秒（%.1f 秒塞了 %d 字 = %.0f 字/秒，"
+                    "物理不可能）：%s" % (s, e, dur, n, n / dur, (t or "")[:24]))
+                continue
+            # n == 0（没有汉字，比如 `biubiubiu`、`oh yeah`）以前一律跳过。
+            # 实测 `658.6-661.7 biubiubiu`(3.1 秒) 对应 Haas `んれろれろ`，
+            # 是纯舔耳音效上编出来的，应当删。所以只有**很短**的无汉字行才跳过
+            # （`a`、`oh`、`ok` 这类真正的语气词）。
+            _t_core = "".join(ch for ch in (t or "") if ch.isalnum())
+            if dur < min_dur or (n == 0 and len(_t_core) < 6):
+                out.append((s, e, t))
+                continue
+            # 门槛 10 → 6：`1146.0-1147.4 请大家多多关照哦 quzimingyue`（1.4 秒
+            # 8 个汉字，cps=5.7）原本被跳过 —— 那是 whisper 在片尾音乐上编的
+            # 署名幻觉（`quzimingyue` 这种拼音就是它的版权幻觉模板），
+            # Haas 一个字也没听到，本该删掉。6 字以上、3.5 秒以内的碎片一律复核。
+            # 上限 3.5 → 4.0：`468.5-472.2 国王大人 您的耳朵 碰到我的脖子了`
+            # （3.7 秒 16 字，cps=4.3）刚好超过 3.5 被漏掉，Haas 听到的是
+            # `れろれろれろ`（纯舔耳）。4 秒以内、6 字以上的碎片一律复核。
+            _dense_short = (dur <= 4.0 and n >= 6)
+            if cps >= min_cps and not _dense_short:
                 out.append((s, e, t))
                 continue
 
@@ -579,10 +698,63 @@ def gate_suspect(rows, wav_path, asr_fn, min_cps=1.0, min_dur=3.5,
 
             u = len(set(_CJK_RE.findall(heard)))
             ono = _ono_only(heard)
-            if (not heard) or u <= max_uniq or ono:
+            # ★ v1.40.6：u <= max_uniq 这条判据只在 dur >= 3.5 时才用。
+            #   min_dur 从 3.5 放到 2.0 之后，一批 2~3.5 秒的真短句被这条误杀：
+            #        （u=3）→ 真台词「诶？我吗？」
+            #     （u=6）→ 真台词「呵呵 开玩笑的」
+            #       （u=2）→ 真台词「地板上也是」
+            #   短句本来字符种类就少，uniq 判据在这个时候没有分辨力；
+            #   短段只信  和空串两条（实测无误杀）。
+            # ★ v1.40.6：门槛从 3.5 提到 6.0。实测 3.5 仍然误杀：
+            #   `118.8-123.9 真是的 诶？我吗？`（5 秒 6 字）对应 Haas `え?私?`，
+            #   字符种类只有 4 种 → 被 uniq 判据删掉，但内容其实完全对得上。
+            #   5 秒以内的句子，日文字符种类天然就少（`え?私?` 全是短音），
+            #   uniq 在这一档没有分辨力；6 秒以上还只有 4 种字符才真的可疑。
+            # ★ 6.0 → 8.0（六素材标定）：6~8 秒的真台词仍会被 uniq 判据误杀，
+            #   实测 `655.1-669.9 耳朵里面 轻轻地 轻轻地`（15 秒，Haas `すぅ。ああ`）、
+            #   `469.1-475.2 刚刚才吹进去的耳垢…`（6 秒，Haas `任せおかせ`）、
+            #   `758.0-765.1 呵呵 好可爱 啊`（7 秒，Haas `可愛いあー`）三条
+            #   真台词全在 6~15 秒这一档。8 秒以内只信「空串 / 拟声 / 字比失调」。
+            _short_ok = dur < 8.0
+            # ★ 06 号素材（`おまけ～朝も夜も子づくりH`）暴露的**主要误杀源**：
+            #   Haas 在这些段只听到 `ああ。` / `はあはあ。` / `あ`，于是
+            #   `u = 1 <= max_uniq` 命中，整段被删。但那几段中文是
+            #   `啊 舒服 啊 里面 里面 好舒服` —— 呻吟声确实存在，whisper 只是
+            #   把呻吟转成了字。**「Haas 只听到感叹词」不等于「这段是空的」**，
+            #   它恰恰证明有人在场。所以纯感叹一律不走 uniq 判据。
+            # ★ `す` 是呼吸声（实测 `655.1-669.9 耳朵里面 轻轻地 轻轻地` 的 Haas 输出
+            #   是 `すぅ。ああ`，`す` 不在表里就判不出「只有感叹词」，真台词被 uniq 误杀）。
+            _INTERJ = set("あっああんっんうんはあふうええおおさあまあやあわあいやはっふっはーあーむぅうーす")
+            _hset0 = set("".join(_CJK_RE.findall(heard or "")))
+            _interj_only = bool(_hset0) and _hset0 <= _INTERJ
+            # ★ v1.40.6：字比失调 —— 中文十几字，Haas 只听到一两个假名。
+            #   实测 `414.8-416.8 用我的小穴 让你的肉棒变得硬邦邦` 对应 Haas 只听到 `で`。
+            #   真台词不会出现这种比例（Haas 对真实语音的召回很全，见 calib_gate.py）。
+            _hcore = "".join(_CJK_RE.findall(heard or ""))
+            # 短段里的极端失调：`495.5-496.4 再一次射精吧`（0.9 秒 6 字）对应 Haas `む`，
+            # 0.9 秒低于 min_dur 根本没进闸门。中文 5 字以上而日语只剩 1 个假名，
+            # 说明 whisper 不是在翻译而是在编。`诶？`(2 字) / `射吧`(2 字) 这类不受影响。
+            # ★ 06 号素材（`おまけ～朝も夜も子づくりH`）暴露的误判：Haas 在这几段
+            #   只听到 `ああ。` / `あっ!` —— 那是**真语音的感叹**，不是"没人说话"。
+            #   06 号 4 条被删全是这类（13.8% 误杀），所以纯感叹词一律不算失调。
+            _lopsided = (not _interj_only) and (
+                # ★ 13 → 16（六素材标定）：13~15 字这一档有三条真台词被误杀
+                #   （`407.8-410.6 唉嘿 你怎么了？刚才 颤抖了一下对吧？` 15 字 ← `パチ`）。
+                #   代价是 `414.8-416.8 用我的小穴 让你的肉棒变得硬邦邦`（15 字 ← `で`）
+                #   会漏网，幻觉 6→7 = 3.6% 仍远低于 5% 红线。
+                (n >= 16 and len(_hcore) <= 3)
+                or (n >= 5 and len(_hcore) <= 1))
+            # `ono` 不要求中文也是拟声。试过收紧成「Haas 判拟声 且 中文也拟声」，
+            # 确实救回 `667.8-669.4 射出来`，但同时放过了
+            # `986.1-997.8 给你充分地清理干净`（11.7 秒，Haas 只有 `ちゅっ、れろぺろ`）
+            # 和 `1107.5-1108.7 诶？`（Haas 只有 `ん`）。
+            # 用户的标准是「宁可误杀不可乱翻」，所以这里按 Haas 判。
+            if (not heard) or (u <= max_uniq and not _short_ok and not _interj_only) or ono or _lopsided:
                 drop += 1
                 if not heard:
                     why = "一个字也没听到"
+                elif _lopsided:
+                    why = "字比失调（中文 %d 字 / 日语 %d 字）「%s」" % (n, len(_hcore), heard[:12])
                 elif ono:
                     why = "只听出拟声「%s」" % heard[:12]
                 else:
@@ -718,7 +890,8 @@ def drop_tail_words(rows, min_dur=2.0, log=None):
     return out, n
 
 
-def stabilize(rows, wav_path=None, asr_fn=None, lowconf=None, log=None):
+def stabilize(rows, wav_path=None, asr_fn=None, lowconf=None, log=None,
+              head_model=None, head_path=None, head_th=0.95):
     """把一条 whisper 原始输出过一遍稳定化。返回 (rows, stats)。
 
     rows     : [(start, end, text), ...]
@@ -750,6 +923,20 @@ def stabilize(rows, wav_path=None, asr_fn=None, lowconf=None, log=None):
     #    最早做，因为后面的 drop_ono 判「全由拟声字组成」时，刷屏行
     #    （「高潮高潮高潮…×54」）会被误判成拟声而删掉 —— 删了也对，
     #    但日志会说成「拟声」，排查时误导人。
+    # ⓿ 素材画像 —— 用 whisper 的原始输出判断这篇音频是什么类型，
+    #    再决定后面几道过滤开多大。参数不再写死（见 profile_rows 的注释）。
+    _prof = profile_rows(rows)
+    _tier = os.environ.get("ASMR_GATE_TIER", "").strip().lower() or _prof["tier"]
+    if _tier not in TIER_PARAMS:
+        _tier = "normal"
+    _tp = dict(TIER_PARAMS[_tier])
+    stats["tier"] = _tier
+    stats["profile"] = _prof
+    log("  [画像] %d 条 / 拟声行 %.0f%% / 超低密度 %.0f%% / 短碎片 %.0f%% "
+        "/ 中位密度 %.1f 字秒 → 档位 %s"
+        % (_prof["n"], _prof["ono_frac"] * 100, _prof["verylow_frac"] * 100,
+           _prof["short_frac"] * 100, _prof["cps_med"], _tier))
+
     if os.environ.get("ASMR_NO_COLLAPSE", "").strip() != "1":
         try:
             rows, stats["rep"] = collapse_rows(rows)
@@ -779,23 +966,14 @@ def stabilize(rows, wav_path=None, asr_fn=None, lowconf=None, log=None):
     # ④ 人声闸：换个模型（Haas-ja）再听一遍。
     #    放最后，因为它最慢（整篇 1147 秒音频约 18 秒 CPU），
     #    而且前三步已经把大部分假字幕清掉了，可疑段数量大幅减少。
-    if (os.environ.get("ASMR_SPEECH_GATE", "").strip() != "0"
-            and wav_path and asr_fn):
-        try:
-            n0 = len(rows)
-            rows, stats["gate"] = gate_suspect(
-                rows, wav_path, asr_fn, min_cps=4.0, lowconf=lowconf)
-            if stats["gate"]:
-                log(f"  [人声闸] 丢弃 {stats['gate']} 段纯音效/幻觉："
-                    f"{n0} → {len(rows)} 条")
-        except Exception as e:
-            log(f"  [人声闸] 跳过（{type(e).__name__}: {e}）")
-
-    if lowconf:
-        stats["lowconf"] = len(lowconf)
-    # ⑤ 过长的字幕按标点拆成两条。
-    #    放在最后：前面几步都在「删」，这一步在「切」，切完两半还要
-    #    各自满足字数下限，所以必须先删干净再切。
+    # ④ 过长的字幕先按标点拆成两条，**再**进人声闸。
+    #
+    #    ★ v1.40.6 顺序调整（原来是拆分的放在闸门之后）。实测踩到的坑：
+    #    `414.840-416.760 用我的小穴 让你的肉棒变得硬邦邦`（1.92 秒 15 字）
+    #    原本是某个 10 秒长段拆出来的碎片。闸门看的是**拆之前**的长段
+    #    （9.8 秒 30 字，cps=3.1），Haas 对整段能听到若干字，于是判「不是幻觉」
+    #    整段放行；随后拆分把那一句切出来，就成了一条没人复查的假字幕。
+    #    先拆后判，碎片会各自过闸（实测该段 Haas 只听到 `で`，被字比失调判据删掉）。
     if os.environ.get("ASMR_NO_SPLIT", "").strip() != "1":
         try:
             _before = len(rows)
@@ -806,6 +984,45 @@ def stabilize(rows, wav_path=None, asr_fn=None, lowconf=None, log=None):
         except Exception as e:
             log(f"  [拆分] 跳过（{type(e).__name__}: {e}）")
 
+    _gate_mode = os.environ.get("ASMR_SPEECH_GATE", "").strip()
+    if _gate_mode != "0" and wav_path:
+        # ★ v1.40.6：**默认走 Haas，不再用分类头**。理由（实测）：
+        #   分类头判的是「这段有没有人声」，而我们要判的是「whisper 翻得对不对」，
+        #   这是两个任务。17 条真幻觉里 16 条的 encoder p 高达 0.96~1.00 —— 因为
+        #   那些段**确实有人在说话**（只是 whisper 听岔了），所以「有人声」判据
+        #   对它们永远是高分，任何阈值都救不了。ASMR_SPEECH_GATE=3 才启用分类头，
+        #   仅供实验对比，不要在生产打开。
+        _by_head = False
+        if _gate_mode == "3" and head_model is not None and head_path:
+            try:
+                n0 = len(rows)
+                _r, _n = gate_by_head(rows, wav_path, head_model, head_path,
+                                      th=head_th, lowconf=lowconf, log=log)
+                if _r is not None:
+                    rows = _r
+                    stats["gate"] = _n
+                    _by_head = True
+                    if _n:
+                        log(f"  [人声闸] 丢弃 {_n} 段纯音效/幻觉："
+                            f"{n0} → {len(rows)} 条")
+            except Exception as e:
+                log(f"  [人声闸] 分类头不可用（{type(e).__name__}: {e}），退回 Haas")
+        if not _by_head and asr_fn is not None:
+            try:
+                n0 = len(rows)
+                # log 必须传进去：不传的话 gate_suspect 内部的
+                # 「丢弃 a-b 秒（原因）」全部被静默，生产日志里只剩一行汇总，
+                # 排查误杀时根本不知道是哪条判据干的（实测踩过）。
+                rows, stats["gate"] = gate_suspect(
+                    rows, wav_path, asr_fn, lowconf=lowconf, log=log, **_tp)
+                if stats["gate"]:
+                    log(f"  [人声闸] 丢弃 {stats['gate']} 段纯音效/幻觉："
+                        f"{n0} → {len(rows)} 条")
+            except Exception as e:
+                log(f"  [人声闸] 跳过（{type(e).__name__}: {e}）")
+
+    if lowconf:
+        stats["lowconf"] = len(lowconf)
     # ⑥ 片尾词幻觉（「结束」这类整条只有一个词的）。
     #    放在最后：拆分可能把一条长句拆出「结束」，所以要再查一次。
     try:
@@ -815,6 +1032,162 @@ def stabilize(rows, wav_path=None, asr_fn=None, lowconf=None, log=None):
         log(f"  [杂讯] 片尾词检查跳过（{type(e).__name__}: {e}）")
 
     return rows, stats
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# ★ v1.40.5：人声分类头（替代 Haas-ja 逐段复核）
+#
+#   训练：1500 条真台词（704 部作品）+ 327 条真音效难负样本
+#        （同段音频相邻台词之间 >=4.5 秒的间隙，Haas 复核只听到拟声）
+#   特征：CT2 encoder 输出 (301,1280) 沿时间轴取 std / max / min
+#   指标：GroupKFold(5, 按作品分组) AUC 0.9976
+#        th=0.95 → 召回 0.957 / 精确 0.997（327 条真音效只误报 13 条）
+#   权重：model/voice_head.npz，42 KB
+#
+#   为什么换掉 Haas：
+#   ① 快几百倍 —— encoder 在转写时本来就跑过，这里只是矩阵乘；
+#      Haas 每段要切 wav + 单独转写，22 分钟素材 +2 分钟。
+#   ② Haas 在 CPU 上，会和 GPU 上的 whisper 抢核。
+#   ③ 精度不输 —— Haas 的判据（空串 / 字符种类 <=4）本来也是间接信号。
+#
+#   ★ 特征必须和训练时完全一致：6 秒 16k 单声道 → fe() → encode() →
+#     取中心 6 秒，不能整段塞进去（训练样本全是 6 秒）。
+# ─────────────────────────────────────────────────────────────────────────
+
+_HEAD_CACHE = {}
+
+
+def load_voice_head(path):
+    """载入 voice_head.npz。失败返回 None。"""
+    if path in _HEAD_CACHE:
+        return _HEAD_CACHE[path]
+    try:
+        import numpy as np
+        d = np.load(path)
+        head = {
+            "coef": d["coef"].astype(np.float32),
+            "intercept": np.float32(d["intercept"]),
+            "mean": d["mean"].astype(np.float32),
+            "scale": d["scale"].astype(np.float32),
+        }
+    except Exception:
+        head = None
+    _HEAD_CACHE[path] = head
+    return head
+
+
+def _prob_one(fw_model, seg6, head):
+    """一个 6 秒 float32 片段的「有人声」概率。
+
+    fw_model 必须是 **faster_whisper.WhisperModel**（不是它内部的
+    ctranslate2.models.Whisper）—— feature_extractor 在 WhperModel 上，
+    encode() 在 fw_model.model 上，前者没有 encode、后者没有 fe。
+    """
+    import ctranslate2
+    import numpy as np
+    fe = fw_model.feature_extractor
+    ct2 = getattr(fw_model, "model", fw_model)
+    x = np.expand_dims(fe(seg6), 0).astype(np.float32)
+    hs = ct2.encode(ctranslate2.StorageView.from_array(x))
+    hs = hs.to_device(ctranslate2.Device.cpu)
+    arr = np.array(hs, dtype=np.float32)[0]
+    f = np.hstack([arr.std(0), arr.max(0), arr.min(0)]).astype(np.float32)
+    z = ((f - head["mean"]) / head["scale"]) @ head["coef"] + head["intercept"]
+    return float(1.0 / (1.0 + np.exp(-z)))
+
+
+def gate_by_head(rows, wav_path, fw_model, head_path, th=0.95,
+                 lowconf=None, log=None):
+    """用 encoder 特征分类头判断「这段到底有没有人声」。
+
+    与 gate_suspect 的差别：这个对**每一段**都算（一次矩阵乘而已），
+    不再用「字/秒 < min_cps」先挑可疑段。
+
+    时间窗：段长 >= 6 秒时取**中心 6 秒**（训练样本都是 6 秒）；
+    短于 6 秒 pad 到 6 秒。取中心而非开头，因为 ASMR 里台词经常
+    拖在长段末尾（实测 150.0-170.0 的真语音在 162.8-167.2）。
+    """
+    import wave
+    import numpy as np
+
+    head = load_voice_head(head_path)
+    if head is None:
+        return None, 0          # None = 头不可用，调用方退回 Haas
+
+    try:
+        with wave.open(wav_path, "rb") as w:
+            sr = w.getframerate()
+            raw = w.readframes(w.getnframes())
+    except Exception as e:
+        if log:
+            log("  [人声闸] 读不了 wav（%s），跳过" % e)
+        return None, 0
+
+    if sr != 16000:
+        return None, 0
+    audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    total = audio.shape[0]
+    WIN = 16000 * 6
+
+    out, dropped = [], 0
+    for s, e, txt in rows:
+        a = max(0, min(int(round(float(s) * 16000)), total))
+        b = max(a, min(int(round(float(e) * 16000)), total))
+        if b - a <= 0:
+            out.append((s, e, txt))
+            continue
+        # ★ 和训练窗口对齐（关键）。
+        #   训练样本是从「句对起点前 1 秒」切 6 秒（make_samples3.py 的
+        #   ss = start - 1.0），所以真实语音落在窗口的第 1 秒之后。
+        #   推理时若直接拿段本身当窗口，语音在开头，特征分布对不上 ——
+        #   实测阈值 0.95 会误杀大量真台词（p 只有 0.03~0.85）。
+        _pre = 16000 * 1
+        try:
+            if b - a >= WIN:
+                # 长段滑窗：每 2 秒起一个 6 秒窗，取最高分（语音可能在任一处）
+                _ps = []
+                _lo = a
+                while _lo + WIN <= b:
+                    _ps.append(_prob_one(fw_model, audio[_lo:_lo + WIN], head))
+                    _lo += 16000 * 2
+                if not _ps:
+                    _ps = [_prob_one(fw_model, np.pad(audio[a:b], (0, WIN - (b - a))), head)]
+                p = max(_ps)
+            else:
+                # 训练样本是从「句对起点前 1 秒」开始切 6 秒，那 1 秒是
+                # **真实音频**（静音或音效），不是零。所以这里要往前取
+                # 1 秒真实样本，不能补零 —— 补零会让 p 掉到 0.9 左右
+                # （实测：同一段纯切 6 秒 p=0.9999，前面补 1 秒零 → 0.92）。
+                _lo = a - _pre
+                _pad_head = 0
+                if _lo < 0:
+                    _pad_head = -_lo
+                    _lo = 0
+                _seg = audio[_lo:_lo + WIN]
+                if _pad_head:
+                    _seg = np.concatenate([np.zeros(_pad_head, dtype=np.float32), _seg])
+                if _seg.shape[0] < WIN:
+                    _seg = np.pad(_seg, (0, WIN - _seg.shape[0]))
+                else:
+                    _seg = _seg[:WIN]
+                p = _prob_one(fw_model, _seg, head)
+        except Exception as e:
+            if log:
+                log("  [人声闸] 特征失败（%s），本段保留" % e)
+            out.append((s, e, txt))
+            continue
+        if p >= th:
+            out.append((s, e, txt))
+            if lowconf is not None and p < th + 0.03:
+                lowconf.append((s, e, txt, "p=%.3f" % p))
+        else:
+            dropped += 1
+            if log:
+                log("  [人声闸] 丢弃 %.1f-%.1f 秒（有人声概率 %.3f < %.2f）：%r"
+                    % (s, e, p, th, txt))
+    if dropped and log:
+        log("  [人声闸] 共丢弃 %d 段（分类头 th=%.2f）" % (dropped, th))
+    return out, dropped
 
 
 if __name__ == "__main__":

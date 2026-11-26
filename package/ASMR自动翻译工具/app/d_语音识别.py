@@ -842,6 +842,18 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
             #   段数也会略多（93 → 104）—— 这是切分变细，对观众是好事。
             #   ASMR_WORD_TS=0 可关（关掉退回旧的窗口猜法）。
             word_timestamps=(os.environ.get("ASMR_WORD_TS", "1") != "0"),
+            # ★ v1.40.6：max_initial_timestamp 实测「不能设大」。
+            #
+            #   TransWithAI/Faster-Whisper-TransWithAI-ChickenRice 的
+            #   generation_config.json5 里写着 "max_initial_timestamp": 30，
+            #   但本机实测（RJ01556415 Track-01，618 秒，只改这一个参数）：
+            #     30 → 95 条，最后一条停在 580.56 秒（漏掉末尾 38 秒）
+            #      1 → 103 条，最后一条 615.42 秒（完整到结尾）
+            #   而且 292~312 秒那几条的时间戳两版几乎一样（298.24 vs 298.32），
+            #   说明这一项在 word_timestamps=True 下会被 DTW 对齐覆盖，
+            #   治不了时间轴，却会吃掉尾部内容。所以保持 faster-whisper 默认 1.0。
+            #   ASMR_MAX_INIT_TS 留作以后实验用。
+            max_initial_timestamp=float(os.environ.get("ASMR_MAX_INIT_TS", "1")),
             log_progress=True
         )
 
@@ -896,7 +908,21 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
         # ★ v1.30.9：静音段幻觉的三个判据（见文件头注释）
         _NO_CONF = os.environ.get("ASMR_NO_CONF_FILTER", "").lower() in ("1", "on", "yes", "true")
         _CR_MAX = 2.4          # whisper 官方的 compression_ratio 幻觉阈值
-        _LP_MIN = -1.05        # 平均对数概率下限
+        # ★ v1.40.6：avg_logprob 下限从 -1.05 放到 -2.5（等于基本关闭这条）。
+        #
+        #   原因：whisper 的 avg_logprob 是**窗口级**指标，不是段级。实测同一批
+        #   相邻 5~7 段的 lp 完全同值（`-0.562` 连 7 段、`-0.505` 连 5 段），
+        #   拿它判单条去留等于用整窗的置信度给每一句打分。
+        #
+        #   实测误杀（04 号 v9 那次）：
+        #     `725.44-728.00 lp=-2.036 丢弃：爱的忍耐汁 从我们那里流出来的 纯白色的 淫靡的果汁`
+        #   —— 这句话语义连贯、和上下文完全接得上，是真台词，只因为那 30 秒窗里
+        #   有很重的舔耳音效把窗口均值拉低了。
+        #
+        #   「不许乱翻」这条约束已经由 stabilize() 的人声闸（Haas 独立复核）承担，
+        #   那边是段级证据，不是窗口均值。保留这个变量的意义是：真要激进过滤时
+        #   可以 ASMR_LP_MIN 覆盖回去。
+        _LP_MIN = float(os.environ.get("ASMR_LP_MIN", "-2.5"))
         _prev_zh = ""          # 上一条中文（判「后一条是前一条的子串」）
         _prev_dur = 0.0
         for segment in segments:
@@ -1265,9 +1291,22 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
         if asr_rows:
             try:
                 from whisper_split import stabilize
+                # ★ v1.40.5：人声闸优先走 encoder 分类头（model/voice_head.npz）。
+                #   拿不到 CT2 模型或权重的机器自动退回 _hear（Haas）。
+                _hm, _hp = None, None
+                if os.environ.get("ASMR_SPEECH_GATE", "").strip() != "2":
+                    try:
+                        _hm = model    # faster_whisper.WhisperModel（fe 在它身上，encode 在 .model 上）
+                        _hp = os.path.join(str(config["path"]["model"]), "voice_head.npz")
+                        if not os.path.isfile(_hp):
+                            _hm, _hp = None, None
+                    except Exception:
+                        _hm, _hp = None, None
                 asr_rows, _st = stabilize(asr_rows,
-                                          audio_path if _hear else None,
-                                          _hear, lowconf=_lowconf)
+                                          audio_path,
+                                          _hear, lowconf=_lowconf,
+                                          head_model=_hm, head_path=_hp,
+                                          head_th=float(os.environ.get("ASMR_HEAD_TH", "0.30")))
             except Exception as _e:
                 print(f"  [稳定化] 跳过（{type(_e).__name__}: {_e}）")
 
