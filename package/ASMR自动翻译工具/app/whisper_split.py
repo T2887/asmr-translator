@@ -604,6 +604,73 @@ def gate_suspect(rows, wav_path, asr_fn, min_cps=1.0, min_dur=3.5,
 # 把「去噪、合并碎片、丢弃幻觉」单独叫「稳定化」一个阶段。我们这边做的是
 # 同样的事，只是更保守 —— 它用云端大模型判断，我们用 Haas-ja 的独立复核。
 # ─────────────────────────────────────────────────────────────
+_SPLIT_PUNCT = "，。！？、；：…"
+
+
+def _split_once(r, max_len):
+    """拆一次；拆不开返回 None。"""
+    txt = (r[2] or "").strip()
+    if len(txt) < max_len:
+        return None
+    mid = len(txt) // 2
+    cut = -1
+    for i, ch in enumerate(txt):
+        if ch in _SPLIT_PUNCT and 6 <= i + 1 <= len(txt) - 6:
+            if cut < 0 or abs(i + 1 - mid) < abs(cut - mid):
+                cut = i + 1
+    if cut < 0:
+        best = -1
+        for i, ch in enumerate(txt):
+            if ch == " " and 6 <= i <= len(txt) - 6:
+                if best < 0 or abs(i - mid) < abs(best - mid):
+                    best = i
+        cut = best
+    if cut < 0:
+        return None
+    a, b = txt[:cut].strip(), txt[cut:].strip()
+    if len(a) < 6 or len(b) < 6:
+        return None
+    s0, e0 = float(r[0]), float(r[1])
+    span = max(e0 - s0, 0.1)
+    t = s0 + span * len(a) / max(len(a) + len(b), 1)
+    return (s0, round(t, 2), a), (round(t, 2), e0, b)
+
+
+def split_long_rows(rows, max_len=24, log=None):
+    """把过长的字幕按标点拆成两条。
+
+    实测（lib02 RJ01426911，广播剧风格）：我们 83 条 / 人工 110 条，
+    最长 57 字。内容本身对（Haas-ja 复核 0% 幻觉），但一行 40~50 个
+    汉字在播放器里要占三行，读不完就切走了。
+
+    拆法：找【最靠近中点】的标点；没有标点就找最靠近中点的空格；
+    两半都至少 6 个字才拆（防止「啊，」被单独拆出来）；时间按
+    【两半的字数比例】分而不是对半。
+
+    最多拆 3 轮：38 字按中点拆开两半可能还是 20+ 字，但再拆就成
+    一句一屏，播放器跳得比听得还快。
+    """
+    out = list(rows)
+    n = 0
+    for _ in range(3):
+        changed = False
+        nxt = []
+        for r in out:
+            pair = _split_once(r, max_len)
+            if pair is None:
+                nxt.append(r)
+            else:
+                nxt.extend(pair)
+                changed = True
+                n += 1
+        out = nxt
+        if not changed:
+            break
+    if n and log:
+        log("  [拆分] 共拆开 %d 条过长字幕" % n)
+    return out
+
+
 def stabilize(rows, wav_path=None, asr_fn=None, lowconf=None, log=None):
     """把一条 whisper 原始输出过一遍稳定化。返回 (rows, stats)。
 
@@ -618,7 +685,7 @@ def stabilize(rows, wav_path=None, asr_fn=None, lowconf=None, log=None):
     """
     if log is None:
         log = print
-    stats = {"rep": 0, "junk": 0, "ono": 0, "gate": 0, "lowconf": 0}
+    stats = {"rep": 0, "junk": 0, "ono": 0, "gate": 0, "lowconf": 0, "split": 0}
     if not rows:
         return rows, stats
 
@@ -679,6 +746,19 @@ def stabilize(rows, wav_path=None, asr_fn=None, lowconf=None, log=None):
 
     if lowconf:
         stats["lowconf"] = len(lowconf)
+    # ⑤ 过长的字幕按标点拆成两条。
+    #    放在最后：前面几步都在「删」，这一步在「切」，切完两半还要
+    #    各自满足字数下限，所以必须先删干净再切。
+    if os.environ.get("ASMR_NO_SPLIT", "").strip() != "1":
+        try:
+            _before = len(rows)
+            rows = split_long_rows(rows, max_len=24, log=None)
+            if len(rows) != _before:
+                stats["split"] = len(rows) - _before
+                log(f"  [拆分] {_before} 条 → {len(rows)} 条（超 24 字的切开）")
+        except Exception as e:
+            log(f"  [拆分] 跳过（{type(e).__name__}: {e}）")
+
     return rows, stats
 
 
