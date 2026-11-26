@@ -692,6 +692,32 @@ def split_long_rows(rows, max_len=24, log=None):
     return out
 
 
+_TAIL_WORDS = ("结束", "完毕", "谢谢观看", "谢谢收看", "全剧终", "完", "终")
+
+
+def drop_tail_words(rows, min_dur=2.0, log=None):
+    """丢掉「整条恰好是片尾词」的段。
+
+    whisper 的训练数据里有大量视频结尾，音频末尾它会吐「结束」这种字。
+    实测用户截图 m23939：RJ01556415 Track-01 最后一条是 00:10:07 的
+    「结束」，Haas-ja 在那段一个字都没听到。
+
+    只对【整条完全等于】那些词、且【时长 >= min_dur】的段生效 ——
+    「结束了」「结束了吗」都是正常台词，一律不碰。
+    """
+    if log is None:
+        log = print
+    out, n = [], 0
+    for (s0, e0, t) in rows:
+        txt = (t or "").strip().strip("。.!！?？")
+        if txt in _TAIL_WORDS and (float(e0) - float(s0)) >= min_dur:
+            n += 1
+            log("  [杂讯] 丢弃 %.1f-%.1f 秒片尾词幻觉：%r" % (s0, e0, t))
+            continue
+        out.append((s0, e0, t))
+    return out, n
+
+
 def stabilize(rows, wav_path=None, asr_fn=None, lowconf=None, log=None):
     """把一条 whisper 原始输出过一遍稳定化。返回 (rows, stats)。
 
@@ -706,7 +732,7 @@ def stabilize(rows, wav_path=None, asr_fn=None, lowconf=None, log=None):
     """
     if log is None:
         log = print
-    stats = {"rep": 0, "junk": 0, "ono": 0, "gate": 0, "lowconf": 0, "split": 0}
+    stats = {"rep": 0, "junk": 0, "ono": 0, "gate": 0, "lowconf": 0, "split": 0, "tail": 0}
     if not rows:
         return rows, stats
 
@@ -779,6 +805,14 @@ def stabilize(rows, wav_path=None, asr_fn=None, lowconf=None, log=None):
                 log(f"  [拆分] {_before} 条 → {len(rows)} 条（超 24 字的切开）")
         except Exception as e:
             log(f"  [拆分] 跳过（{type(e).__name__}: {e}）")
+
+    # ⑥ 片尾词幻觉（「结束」这类整条只有一个词的）。
+    #    放在最后：拆分可能把一条长句拆出「结束」，所以要再查一次。
+    try:
+        rows, _n_tail = drop_tail_words(rows)
+        stats["tail"] = _n_tail
+    except Exception as e:
+        log(f"  [杂讯] 片尾词检查跳过（{type(e).__name__}: {e}）")
 
     return rows, stats
 
