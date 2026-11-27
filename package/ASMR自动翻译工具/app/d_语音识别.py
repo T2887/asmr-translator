@@ -1283,8 +1283,9 @@ for _task_idx, (audio_path, vad_log_path, asr_log_path) in enumerate(audio_tasks
                     print(f"  [人声闸] 跳过（{_gn}）")
                 else:
                     def _hear(_p, _e=_ge):
-                        _r = _e.transcribe_ex(_p)   # 收文件路径，不是数组
-                        return (_r.get("text") or "")
+                        # ★ v1.40.7：返回整个 dict（含 conf），人声闸用 conf 判「弱证据」。
+                        #   旧的「只返回字符串」也兼容：gate_suspect 拿不到 conf 时按 1.0 处理。
+                        return _e.transcribe_ex(_p)   # 收文件路径，不是数组
             except Exception as _e:
                 print(f"  [人声闸] 跳过（{type(_e).__name__}: {_e}）")
 

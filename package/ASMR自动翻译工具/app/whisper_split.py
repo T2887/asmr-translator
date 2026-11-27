@@ -425,7 +425,10 @@ def drop_junk(rows, max_len=4, log=None):
     out, n = [], 0
     for (s, e, t) in rows:
         txt = (t or "").strip()
-        if cjk_count(txt) == 0 and len(txt) <= max_len:
+        # ★ v1.40.7：纯字母不算杂讯。实测 c04 号 `136.6-138.8 OKOK` 被这条删了，
+        #   而 Haas 在同一段听到的就是 `okok` —— 它是一条正确的字幕。
+        #   只删「一个字母都没有」的纯数字/符号行。
+        if cjk_count(txt) == 0 and len(txt) <= max_len and not re.search(r"[A-Za-z]", txt):
             n += 1
             log("  [杂讯] 丢弃 %.1f-%.1f 秒纯数字/符号：%r" % (s, e, txt))
             continue
@@ -624,6 +627,69 @@ def gate_suspect(rows, wav_path, asr_fn, min_cps=1.0, min_dur=1.2,
         tmpdir = tempfile.mkdtemp(prefix="speechgate_")
 
     out, drop = [], 0
+
+    # ★ v1.40.6：Haas 并行预取。
+    #   实测（12 段 2.5 秒音频，16 逻辑核 / 8 物理核）：
+    #     内层 num_threads=4 + 外层串行        6.77 秒   ← 改动前
+    #     内层 num_threads=4 + 外层 8 线程    3.49 秒   ← 1.94x
+    #   另外实测「内存直喂」（不写临时 wav、直接喂 numpy）**零收益**
+    #   （4.295 → 4.304 秒），瓶颈纯在 sherpa-onnx 推理，所以这里只做并行，
+    #   不改 wav 读写方式。sherpa-onnx 的 C++ 推理会释放 GIL，才吃得到这个加速。
+    #
+    #   做法：先把所有可能进闸门的段并行跑一遍 Haas，结果按 (start, end) 存进
+    #   _hcache；主循环逻辑一行不改，只在调用点优先取缓存。多跑几段（比如本该
+    #   被 _dense_short 豁免的）只是浪费一点 CPU，不影响正确性。
+    #   ASMR_ASR_WORKERS=1 可退回串行。
+    _hcache = {}
+    try:
+        import time as _time
+    except Exception:
+        _time = None
+    try:
+        _W = int(os.environ.get("ASMR_ASR_WORKERS", "8"))
+    except Exception:
+        _W = 8
+    if asr_fn is not None and _W > 1:
+        _cands = [(s, e) for (s, e, t) in rows if (e - s) >= min_dur]
+        if len(_cands) > 1:
+            try:
+                import concurrent.futures as _cf
+
+                def _pf(_item):
+                    _s, _e = _item
+                    _key = (round(_s, 3), round(_e, 3))
+                    _i0 = max(0, int(round(_s * sr)))
+                    _i1 = min(len(a), int(round(_e * sr)))
+                    if _i1 - _i0 < sr // 4:
+                        return (_key, "")
+                    _pp = os.path.join(
+                        tmpdir, "c_%d_%d.wav" % (int(_s * 1000), int(_e * 1000)))
+                    try:
+                        _seg = np.clip(a[_i0:_i1] * 32767.0, -32768, 32767).astype(np.int16)
+                        with wave.open(_pp, "wb") as _o:
+                            _o.setnchannels(1)
+                            _o.setsampwidth(2)
+                            _o.setframerate(sr)
+                            _o.writeframes(_seg.tobytes())
+                        _rr = asr_fn(_pp)
+                        if isinstance(_rr, dict):
+                            return (_key, ((_rr.get("text") or "").strip(),
+                                           float(_rr.get("conf") or 1.0)))
+                        return (_key, ((_rr or "").strip(), 1.0))
+                    except Exception:
+                        return (_key, None)
+
+                _t0 = _time.time() if _time else 0.0
+                with _cf.ThreadPoolExecutor(max_workers=_W) as _ex:
+                    for _k, _v in _ex.map(_pf, _cands):
+                        if _v is not None:
+                            _hcache[_k] = _v
+                if _time:
+                    log("  [人声闸] 并行预取 %d 段（%d 线程）耗时 %.1f 秒"
+                        % (len(_cands), _W, _time.time() - _t0))
+            except Exception as _e:
+                log("  [人声闸] 并行预取失败（退回串行：%s）" % _e)
+                _hcache = {}
     try:
         for (s, e, t) in rows:
             dur = float(e) - float(s)
@@ -652,7 +718,14 @@ def gate_suspect(rows, wav_path, asr_fn, min_cps=1.0, min_dur=1.2,
             #   于是「把我的小穴 变成你的专属飞机杯吧」（15 字）被标成 0.3 秒
             #   = 50 字/秒。正常人说话 5~8 字/秒，12 已经是极快语速的两倍。
             #   这类段连 Haas 都不用跑（0.3 秒的切片它也听到不东西）。
-            if n >= 6 and dur > 0 and (n / dur) >= 12.0:
+            # ★ v1.40.7：门槛从 12 提到 30。扩测 8 素材时 12 误杀了 3 条真台词：
+            #   `30.0-30.7 所以才会一直在外面巡视`（11 字 / 0.7 秒 = 15.7）、
+            #   `2.4-2.8 本作品由以下为纪录而生`（11 字 / 0.4 秒 = 27.5）、
+            #   `176.7-177.4 因为我没有避孕药啊`（10 字 / 0.7 秒 = 14.3）。
+            #   `split_long_rows` 会按字数比例切时间，片头声明那种长句会被压成 0.4 秒，
+            #   所以 12 字/秒 在真实产物里是能出现的。真正不可能的是那个
+            #   `15 字 / 0.3 秒 = 50 字/秒` 的碎片（whisper 拆出来的空段）。
+            if n >= 6 and dur > 0 and (n / dur) >= 30.0:
                 drop += 1
                 log("  [人声闸] 丢弃 %.1f-%.1f 秒（%.1f 秒塞了 %d 字 = %.0f 字/秒，"
                     "物理不可能）：%s" % (s, e, dur, n, n / dur, (t or "")[:24]))
@@ -691,7 +764,21 @@ def gate_suspect(rows, wav_path, asr_fn, min_cps=1.0, min_dur=1.2,
                     o.setsampwidth(2)
                     o.setframerate(sr)
                     o.writeframes(seg.tobytes())
-                heard = (asr_fn(p) or "").strip()
+                # ★ v1.40.6：优先用预取缓存（并行跑 Haas，实测 1.94x 加速）。
+                #   未命中才同步调一次，保证功能不退化。
+                _hk = (round(s, 3), round(e, 3))
+                if _hk in _hcache:
+                    _hv = _hcache[_hk]
+                    heard, _hconf = (_hv[0], _hv[1]) if isinstance(_hv, tuple) else ((_hv or "").strip(), 1.0)
+                    heard = (heard or "").strip()
+                else:
+                    _rr = asr_fn(p)
+                    if isinstance(_rr, dict):
+                        heard = (_rr.get("text") or "").strip()
+                        _hconf = float(_rr.get("conf") or 1.0)
+                    else:
+                        heard = (_rr or "").strip()
+                        _hconf = 1.0
             except Exception:
                 out.append((s, e, t))      # 复核失败就原样保留
                 continue
@@ -749,10 +836,18 @@ def gate_suspect(rows, wav_path, asr_fn, min_cps=1.0, min_dur=1.2,
             # `986.1-997.8 给你充分地清理干净`（11.7 秒，Haas 只有 `ちゅっ、れろぺろ`）
             # 和 `1107.5-1108.7 诶？`（Haas 只有 `ん`）。
             # 用户的标准是「宁可误杀不可乱翻」，所以这里按 Haas 判。
-            if (not heard) or (u <= max_uniq and not _short_ok and not _interj_only) or ono or _lopsided:
+            # ★ v1.40.7：Haas 只吐一两个字且置信度低 = 它在硬凑音，不是听到了台词。
+            #   368 条实测：`len(_hcore) <= 1 且 conf < 0.70` 抓到 7/23 幻觉、
+            #   误杀 0 条（唯一命中 truth=1 的那条「哔哟…（×5）」本身是拟声幻觉）。
+            #   conf 来自 asr_fn 返回的 dict；只返回字符串的旧接口一律给 1.0，
+            #   也就是这条判据在那种情况下自动失效，不会凭空多删。
+            _weak = (len(_hcore) <= 1 and _hconf < 0.70)
+            if (not heard) or _weak or (u <= max_uniq and not _short_ok and not _interj_only) or ono or _lopsided:
                 drop += 1
                 if not heard:
                     why = "一个字也没听到"
+                elif _weak:
+                    why = "只听出一个字且置信度低（%.2f）「%s」" % (_hconf, heard[:12])
                 elif _lopsided:
                     why = "字比失调（中文 %d 字 / 日语 %d 字）「%s」" % (n, len(_hcore), heard[:12])
                 elif ono:
@@ -770,7 +865,7 @@ def gate_suspect(rows, wav_path, asr_fn, min_cps=1.0, min_dur=1.2,
             #   —— 但那几条恰好都是「6 秒只说 7 个字」这类信息量极低的段，
             #   标橙让用户听一下是合理的（用户定调：宁可漏翻不可错翻）。
             #   取 6 只标 1%，太保守；取 10 以上会误标正常长句。
-            if lowconf is not None and u <= max_uniq * 2:
+            if lowconf is not None and (u <= max_uniq * 2 or _hconf < 0.72):
                 lowconf.append((s, e, t, heard))
 
             out.append((s, e, t))

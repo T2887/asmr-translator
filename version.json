@@ -1,8 +1,8 @@
 {
-  "version": "1.40.6",
-  "url": "https://gh-proxy.com/https://github.com/T2887/asmr-translator/releases/download/v1.40.6/ASMR-Translator-Setup_v1.40.6.exe",
-  "page": "https://github.com/T2887/asmr-translator/releases/tag/v1.40.6",
-  "notes": "幻觉治理（六素材标定）：端到端误杀 0.58%，幻觉率从 6.2% 降到 1.7%。\n\n- 短音效段（1~3 秒）现在也会做人声复核，whisper 在纯舐耳、接吻声上编的中文会被清掉\n- 新增四条判据：字比失调、物理不可能字速、纯拟音、拟声双判\n- 修掉一个会大量误杀真台词的 bug（avg_logprob 是窗口级指标，被音效拉低）\n\n安装包约 130 MB。",
+  "version": "1.40.7",
+  "url": "https://gh-proxy.com/https://github.com/T2887/asmr-translator/releases/download/v1.40.7/ASMR-Translator-Setup_v1.40.7.exe",
+  "page": "https://github.com/T2887/asmr-translator/releases/tag/v1.40.7",
+  "notes": "全量模式的假字幕再压一轮：舔耳、接吻、呼吸这些没人说话的地方，模型凭空编出来的字幕会被清掉。\n\n- 字幕复核改成并行，长音频的处理时间少一半\n- 1~2 秒的短段也纳入复核，之前这类最容易漏\n- 复核引擎自己没把握时，直接判为幻觉\n\n安装包约 130 MB。",
   "runtime_patch": {
     "version": "1.30.0",
     "url": "https://github.com/T2887/asmr-translator/releases/download/v1.30.0/ASMR-RuntimePatch_v1.30.0.exe",
